@@ -1,0 +1,1674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>POOL RADAR — DeFi Liquidity Intelligence</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<style>
+  :root {
+    --bg:       #080b0f;
+    --surface:  #0d1117;
+    --card:     #111820;
+    --border:   #1e2d3d;
+    --accent:   #00e5ff;
+    --green:    #00ff88;
+    --orange:   #ff8c00;
+    --red:      #ff3355;
+    --dim:      #3a5068;
+    --text:     #c8d8e8;
+    --muted:    #4a6480;
+    --uni3:     #ff007a;
+    --uni2:     #f0b90b;
+    --sushi:    #fa52a0;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'JetBrains Mono', monospace;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Grid noise overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,229,255,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,229,255,0.02) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Scanline */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.03) 2px,
+      rgba(0,0,0,0.03) 4px
+    );
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ── Header ── */
+  header {
+    position: relative;
+    z-index: 10;
+    padding: 28px 40px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: linear-gradient(180deg, rgba(0,229,255,0.04) 0%, transparent 100%);
+  }
+
+  .logo {
+    font-family: 'Syne', sans-serif;
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: 4px;
+    color: var(--accent);
+    text-shadow: 0 0 20px rgba(0,229,255,0.4);
+  }
+
+  .logo span { color: var(--muted); font-weight: 400; }
+
+  .header-stats {
+    display: flex;
+    gap: 32px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+
+  .header-stat strong {
+    display: block;
+    font-size: 14px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .live-dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    background: var(--green);
+    border-radius: 50%;
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 2s infinite;
+    margin-right: 6px;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(0.8); }
+  }
+
+  /* ── Main layout ── */
+  main {
+    position: relative;
+    z-index: 1;
+    padding: 32px 40px;
+    max-width: 1600px;
+    margin: 0 auto;
+  }
+
+  /* ── Stat cards row ── */
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+
+  .stat-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: var(--accent);
+    opacity: 0.6;
+  }
+
+  .stat-card:hover { border-color: var(--accent); }
+
+  .stat-label {
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+
+  .stat-value {
+    font-family: 'Syne', sans-serif;
+    font-size: 26px;
+    font-weight: 800;
+    color: var(--accent);
+    line-height: 1;
+  }
+
+  .stat-sub {
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 6px;
+  }
+
+  /* ── Charts row ── */
+  .charts-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px;
+  }
+
+  .chart-title {
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+
+  .chart-wrap {
+    height: 180px;
+    position: relative;
+  }
+
+  /* ── Controls ── */
+  .controls {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .search-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 240px;
+  }
+
+  .search-icon {
+    position: absolute;
+    left: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  input[type="text"] {
+    width: 100%;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 12px 10px 34px;
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  input[type="text"]:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(0,229,255,0.1);
+  }
+
+  input[type="text"]::placeholder { color: var(--muted); }
+
+  select {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 12px;
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    outline: none;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+
+  select:focus { border-color: var(--accent); }
+
+  .filter-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px 14px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s;
+    letter-spacing: 1px;
+  }
+
+  .filter-btn:hover, .filter-btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: rgba(0,229,255,0.06);
+  }
+
+  /* ── Table ── */
+  .table-wrap {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  .table-header-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(0,229,255,0.03);
+  }
+
+  .table-title {
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+
+  .pool-count {
+    font-size: 11px;
+    color: var(--accent);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  thead th {
+    padding: 12px 16px;
+    text-align: left;
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: var(--muted);
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }
+
+  thead th:hover { color: var(--accent); }
+
+  thead th.sorted-asc::after { content: ' ↑'; color: var(--accent); }
+  thead th.sorted-desc::after { content: ' ↓'; color: var(--accent); }
+
+  tbody tr {
+    border-bottom: 1px solid rgba(30,45,61,0.5);
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  tbody tr:hover { background: rgba(0,229,255,0.04); }
+  tbody tr:last-child { border-bottom: none; }
+
+  td { padding: 12px 16px; white-space: nowrap; }
+
+  .pair-cell {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .token-icons {
+    display: flex;
+  }
+
+  .token-icon {
+    width: 24px; height: 24px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 8px;
+    font-weight: 700;
+    color: #fff;
+    border: 2px solid var(--bg);
+  }
+
+  .token-icon:nth-child(2) { margin-left: -8px; }
+
+  .pair-name {
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .pair-addr {
+    font-size: 9px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  .dex-badge {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 3px;
+    font-size: 9px;
+    letter-spacing: 1px;
+    font-weight: 600;
+  }
+
+  .dex-UniswapV3  { background: rgba(255,0,122,0.15); color: var(--uni3); border: 1px solid rgba(255,0,122,0.3); }
+  .dex-UniswapV2  { background: rgba(240,185,11,0.12); color: var(--uni2); border: 1px solid rgba(240,185,11,0.25); }
+  .dex-SushiswapV2 { background: rgba(250,82,160,0.12); color: var(--sushi); border: 1px solid rgba(250,82,160,0.25); }
+
+  .fee-tag {
+    background: rgba(0,229,255,0.08);
+    color: var(--accent);
+    border: 1px solid rgba(0,229,255,0.2);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+  }
+
+  .tvl-bar-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .tvl-bar {
+    width: 60px;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .tvl-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--green));
+    border-radius: 2px;
+    transition: width 0.3s;
+  }
+
+  .vol-cell { color: var(--orange); }
+  .no-vol { color: var(--muted); }
+
+  .updated-cell { color: var(--muted); font-size: 10px; }
+
+  /* ── Pagination ── */
+  .pagination {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    padding: 20px;
+    border-top: 1px solid var(--border);
+  }
+
+  .page-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 7px 12px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .page-btn:hover:not(:disabled), .page-btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: rgba(0,229,255,0.06);
+  }
+
+  .page-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  .page-info { font-size: 11px; color: var(--muted); }
+
+  /* ── Modal ── */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(8,11,15,0.85);
+    backdrop-filter: blur(4px);
+    z-index: 100;
+    display: none;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .modal-overlay.open { display: flex; }
+
+  .modal {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    width: 560px;
+    max-width: 95vw;
+    max-height: 85vh;
+    overflow-y: auto;
+    position: relative;
+    animation: slideUp 0.2s ease;
+  }
+
+  @keyframes slideUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .modal-header {
+    padding: 24px 28px 18px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    position: sticky;
+    top: 0;
+    background: var(--card);
+    z-index: 1;
+  }
+
+  .modal-pair {
+    font-family: 'Syne', sans-serif;
+    font-size: 22px;
+    font-weight: 800;
+    color: var(--text);
+  }
+
+  .modal-close {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    width: 32px; height: 32px;
+    color: var(--muted);
+    font-size: 16px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s;
+  }
+
+  .modal-close:hover { border-color: var(--red); color: var(--red); }
+
+  .modal-body { padding: 24px 28px; }
+
+  .detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  .detail-item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 14px;
+  }
+
+  .detail-label {
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .detail-value {
+    font-size: 14px;
+    color: var(--text);
+    font-weight: 600;
+    word-break: break-all;
+  }
+
+  .detail-value.accent { color: var(--accent); }
+  .detail-value.green  { color: var(--green);  }
+  .detail-value.orange { color: var(--orange); }
+
+  .addr-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    gap: 12px;
+  }
+
+  .addr-label {
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: var(--muted);
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  .addr-val {
+    font-size: 11px;
+    color: var(--text);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .copy-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 4px 8px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s;
+  }
+
+  .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .copy-btn.copied { border-color: var(--green); color: var(--green); }
+
+  /* ── Tabs ── */
+  .tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 0;
+    border-bottom: 1px solid var(--border);
+    margin: 0 0 32px;
+  }
+
+  .tab-btn {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 12px 24px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.2s;
+    margin-bottom: -1px;
+  }
+
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* ── Network graph ── */
+  #network-wrap {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  #network-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(0,229,255,0.03);
+    flex-wrap: wrap;
+  }
+
+  #network-toolbar .chart-title { margin-bottom: 0; }
+
+  #network-svg-wrap {
+    width: 100%;
+    height: 680px;
+    position: relative;
+    background: radial-gradient(ellipse at center, #0d1520 0%, #080b0f 70%);
+    cursor: grab;
+  }
+
+  #network-svg-wrap:active { cursor: grabbing; }
+
+  #network-svg {
+    width: 100%;
+    height: 100%;
+  }
+
+  .node-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    fill: var(--text);
+    pointer-events: none;
+    text-anchor: middle;
+    dominant-baseline: middle;
+  }
+
+  .node-label-bg {
+    fill: rgba(8,11,15,0.75);
+    rx: 2;
+  }
+
+  #graph-tooltip {
+    position: absolute;
+    background: var(--card);
+    border: 1px solid var(--accent);
+    border-radius: 5px;
+    padding: 12px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text);
+    pointer-events: none;
+    display: none;
+    z-index: 50;
+    max-width: 220px;
+    box-shadow: 0 0 20px rgba(0,229,255,0.15);
+  }
+
+  #graph-tooltip .tt-title {
+    font-size: 13px;
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: 8px;
+  }
+
+  #graph-tooltip .tt-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 4px;
+    font-size: 10px;
+  }
+
+  #graph-tooltip .tt-label { color: var(--muted); }
+  #graph-tooltip .tt-val { color: var(--text); font-weight: 600; }
+
+  .net-legend {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+  }
+
+  .net-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 1px;
+  }
+
+  .net-legend-dot {
+    width: 10px; height: 3px;
+    border-radius: 2px;
+  }
+
+  #net-search {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    outline: none;
+    width: 160px;
+    transition: border-color 0.2s;
+  }
+
+  #net-search:focus { border-color: var(--accent); }
+  #net-search::placeholder { color: var(--muted); }
+
+  .net-controls {
+    display: flex;
+    gap: 8px;
+    margin-left: auto;
+  }
+
+  .net-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    color: var(--muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    cursor: pointer;
+    transition: all 0.2s;
+    letter-spacing: 1px;
+  }
+
+  .net-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  #graph-loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    background: rgba(8,11,15,0.9);
+    z-index: 20;
+  }
+
+  #graph-loading-text {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 3px;
+  }
+  #loading {
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    gap: 24px;
+  }
+
+  .loading-logo {
+    font-family: 'Syne', sans-serif;
+    font-size: 32px;
+    font-weight: 800;
+    color: var(--accent);
+    letter-spacing: 6px;
+    text-shadow: 0 0 30px rgba(0,229,255,0.5);
+    animation: glow 1.5s ease-in-out infinite alternate;
+  }
+
+  @keyframes glow {
+    from { text-shadow: 0 0 20px rgba(0,229,255,0.3); }
+    to   { text-shadow: 0 0 40px rgba(0,229,255,0.7), 0 0 80px rgba(0,229,255,0.2); }
+  }
+
+  .loading-bar-wrap {
+    width: 300px;
+    height: 2px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .loading-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--green));
+    animation: loadBar 1.2s ease-in-out infinite;
+    border-radius: 2px;
+  }
+
+  @keyframes loadBar {
+    0%   { width: 0%; margin-left: 0%; }
+    50%  { width: 60%; margin-left: 20%; }
+    100% { width: 0%; margin-left: 100%; }
+  }
+
+  .loading-text {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 3px;
+    animation: blink 1s step-end infinite;
+  }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+
+  @media (max-width: 1100px) {
+    .stat-row { grid-template-columns: repeat(3, 1fr); }
+    .charts-row { grid-template-columns: 1fr 1fr; }
+    header { padding: 20px; }
+    main { padding: 20px; }
+  }
+
+  @media (max-width: 700px) {
+    .stat-row { grid-template-columns: 1fr 1fr; }
+    .charts-row { grid-template-columns: 1fr; }
+    .header-stats { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <div class="loading-logo">POOL RADAR</div>
+  <div class="loading-bar-wrap"><div class="loading-bar"></div></div>
+  <div class="loading-text">PARSING LIQUIDITY DATA...</div>
+</div>
+
+<header>
+  <div class="logo">POOL<span> / </span>RADAR</div>
+  <div class="header-stats">
+    <div class="header-stat">
+      <span class="live-dot"></span><strong id="h-block">—</strong>LAST BLOCK
+    </div>
+    <div class="header-stat"><strong id="h-total">—</strong>TOTAL POOLS</div>
+    <div class="header-stat"><strong id="h-active">—</strong>ACTIVE POOLS</div>
+    <div class="header-stat"><strong id="h-chain">ETH</strong>CHAIN</div>
+  </div>
+</header>
+
+<main>
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="dashboard">◈ Dashboard</button>
+    <button class="tab-btn" data-tab="network">⬡ Token Network</button>
+    <button class="tab-btn" data-tab="pools">≡ Pool Table</button>
+  </div>
+
+  <!-- DASHBOARD TAB -->
+  <div class="tab-panel active" id="tab-dashboard">
+  <div class="stat-row">
+    <div class="stat-card">
+      <div class="stat-label">Total TVL</div>
+      <div class="stat-value" id="s-tvl">—</div>
+      <div class="stat-sub">active pools only</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">UniswapV3 Pools</div>
+      <div class="stat-value" id="s-uni3">—</div>
+      <div class="stat-sub" id="s-uni3-tvl">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">UniswapV2 Pools</div>
+      <div class="stat-value" id="s-uni2">—</div>
+      <div class="stat-sub" id="s-uni2-tvl">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Sushiswap Pools</div>
+      <div class="stat-value" id="s-sushi">—</div>
+      <div class="stat-sub" id="s-sushi-tvl">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Pools w/ Volume</div>
+      <div class="stat-value" id="s-vol">—</div>
+      <div class="stat-sub" id="s-vol-sub">tracked</div>
+    </div>
+  </div>
+
+  <div class="charts-row">
+    <div class="chart-card">
+      <div class="chart-title">TVL by DEX</div>
+      <div class="chart-wrap"><canvas id="chart-dex-tvl"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Pool Count by DEX</div>
+      <div class="chart-wrap"><canvas id="chart-dex-count"></canvas></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-title">Fee Tier Distribution</div>
+      <div class="chart-wrap"><canvas id="chart-fees"></canvas></div>
+    </div>
+  </div>
+
+  </div><!-- end tab-dashboard -->
+
+  <!-- NETWORK TAB -->
+  <div class="tab-panel" id="tab-network">
+    <div id="network-wrap">
+      <div id="network-toolbar">
+        <div class="chart-title">Token liquidity network — nodes = tokens, edges = pools</div>
+        <div class="net-legend">
+          <div class="net-legend-item"><div class="net-legend-dot" style="background:#ff007a"></div>UniswapV3</div>
+          <div class="net-legend-item"><div class="net-legend-dot" style="background:#f0b90b"></div>UniswapV2</div>
+          <div class="net-legend-item"><div class="net-legend-dot" style="background:#fa52a0"></div>Sushiswap</div>
+        </div>
+        <div class="net-controls">
+          <input type="text" id="net-search" placeholder="Find token...">
+          <button class="net-btn" id="net-reset">Reset zoom</button>
+          <button class="net-btn" id="net-toggle-labels">Labels off</button>
+        </div>
+      </div>
+      <div id="network-svg-wrap">
+        <div id="graph-loading">
+          <div class="loading-bar-wrap" style="width:200px"><div class="loading-bar"></div></div>
+          <div id="graph-loading-text">BUILDING NETWORK...</div>
+        </div>
+        <svg id="network-svg"></svg>
+        <div id="graph-tooltip">
+          <div class="tt-title" id="tt-title"></div>
+          <div id="tt-body"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- POOLS TAB -->
+  <div class="tab-panel" id="tab-pools">
+    <div class="controls">
+    <div class="search-wrap">
+      <span class="search-icon">⌕</span>
+      <input type="text" id="search" placeholder="Search pair, token, address...">
+    </div>
+    <select id="filter-dex">
+      <option value="">All DEXes</option>
+      <option value="UniswapV3">UniswapV3</option>
+      <option value="UniswapV2">UniswapV2</option>
+      <option value="SushiswapV2">SushiswapV2</option>
+    </select>
+    <select id="filter-fee">
+      <option value="">All Fees</option>
+      <option value="1">0.01%</option>
+      <option value="5">0.05%</option>
+      <option value="25">0.25%</option>
+      <option value="30">0.30%</option>
+      <option value="100">1.00%</option>
+    </select>
+    <button class="filter-btn active" data-sort="tvl">TVL ↓</button>
+    <button class="filter-btn" data-sort="vol">Volume ↓</button>
+    <button class="filter-btn" id="btn-v3only">V3 Only</button>
+    <button class="filter-btn" id="btn-withvol">Has Volume</button>
+  </div>
+
+  <div class="table-wrap">
+    <div class="table-header-bar">
+      <div class="table-title">Liquidity Pools</div>
+      <div class="pool-count" id="pool-count">— pools</div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th data-col="pair">PAIR</th>
+          <th data-col="dex">DEX</th>
+          <th data-col="fee_bps">FEE</th>
+          <th data-col="tvl_usd" class="sorted-desc">TVL</th>
+          <th data-col="volume_usd">24H VOL</th>
+          <th data-col="last_updated">UPDATED</th>
+        </tr>
+      </thead>
+      <tbody id="pool-table-body"></tbody>
+    </table>
+    <div class="pagination" id="pagination"></div>
+  </div>
+  </div><!-- end tab-pools -->
+</main>
+
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal">
+    <div class="modal-header">
+      <div>
+        <div class="modal-pair" id="modal-pair">—/—</div>
+        <div style="margin-top:6px; display:flex; gap:8px; align-items:center" id="modal-badges"></div>
+      </div>
+      <button class="modal-close" id="modal-close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="detail-grid" id="modal-detail-grid"></div>
+      <div id="modal-addresses"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let allPools = [];
+let filtered = [];
+let currentPage = 1;
+const PAGE_SIZE = 50;
+let sortCol = 'tvl_usd';
+let sortDir = -1; // -1 desc, 1 asc
+let filterDex = '';
+let filterFee = '';
+let filterSearch = '';
+let filterV3Only = false;
+let filterHasVol = false;
+let meta = {};
+
+// ── Utils ──────────────────────────────────────────────────────────────────
+const fmt = n => {
+  if (n >= 1e9) return '$' + (n/1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return '$' + (n/1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return '$' + (n/1e3).toFixed(1) + 'K';
+  return '$' + n.toFixed(0);
+};
+
+const fmtNum = n => {
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(0) + 'K';
+  return n.toString();
+};
+
+const timeAgo = ts => {
+  const s = Date.now()/1000 - ts;
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+};
+
+const addrShort = a => a.slice(0,6) + '…' + a.slice(-4);
+
+const tokenColor = sym => {
+  const colors = {
+    'WETH':'#627eea','ETH':'#627eea','USDC':'#2775ca','USDT':'#26a17b',
+    'DAI':'#f5ac37','WBTC':'#f7931a','BTC':'#f7931a','UNI':'#ff007a',
+    'LINK':'#2a5ada','AAVE':'#b6509e','SUSHI':'#fa52a0','MKR':'#1aab9b',
+    'COMP':'#00d395','SNX':'#5fcdf5','CRV':'#3a3a3a',
+  };
+  return colors[sym] || '#' + Math.abs(sym.split('').reduce((a,c)=>a*31+c.charCodeAt(0),0)).toString(16).slice(0,6).padStart(6,'4');
+};
+
+// ── Load data ──────────────────────────────────────────────────────────────
+async function loadData() {
+  try {
+    const resp = await fetch('pools_viz.json');
+    const data = await resp.json();
+    meta = data.meta;
+    allPools = data.pools;
+    init();
+  } catch(e) {
+    // Fallback: show error
+    document.getElementById('loading').innerHTML = `
+      <div style="text-align:center;color:var(--red)">
+        <div style="font-size:18px;margin-bottom:12px">⚠ pools_viz.json not found</div>
+        <div style="font-size:12px;color:var(--muted)">Place pools_viz.json in the same directory as this HTML file.</div>
+      </div>`;
+  }
+}
+
+function init() {
+  // Hide loader
+  document.getElementById('loading').style.display = 'none';
+
+  // Header stats
+  document.getElementById('h-block').textContent = meta.last_synced_block?.toLocaleString() || '—';
+  document.getElementById('h-total').textContent = meta.total_pools?.toLocaleString() || '—';
+  document.getElementById('h-active').textContent = meta.active_pools?.toLocaleString() || '—';
+
+  // Stat cards
+  const dexTvl = meta.dex_tvl || {};
+  const dexCount = meta.dex_count || {};
+  const totalTvl = Object.values(dexTvl).reduce((a,b)=>a+b,0);
+  document.getElementById('s-tvl').textContent = fmt(totalTvl);
+  document.getElementById('s-uni3').textContent = (dexCount['UniswapV3']||0).toLocaleString();
+  document.getElementById('s-uni3-tvl').textContent = fmt(dexTvl['UniswapV3']||0) + ' TVL';
+  document.getElementById('s-uni2').textContent = (dexCount['UniswapV2']||0).toLocaleString();
+  document.getElementById('s-uni2-tvl').textContent = fmt(dexTvl['UniswapV2']||0) + ' TVL';
+  document.getElementById('s-sushi').textContent = (dexCount['SushiswapV2']||0).toLocaleString();
+  document.getElementById('s-sushi-tvl').textContent = fmt(dexTvl['SushiswapV2']||0) + ' TVL';
+  const withVol = allPools.filter(p=>p.volume_usd>0).length;
+  document.getElementById('s-vol').textContent = withVol.toLocaleString();
+
+  buildCharts();
+  bindEvents();
+  applyFilters();
+}
+
+// ── Charts ─────────────────────────────────────────────────────────────────
+function buildCharts() {
+  const chartDefaults = {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { labels: { color: '#4a6480', font: { family: 'JetBrains Mono', size: 10 }, boxWidth: 12 } } }
+  };
+
+  // TVL by DEX — donut
+  const dexTvl = meta.dex_tvl || {};
+  new Chart(document.getElementById('chart-dex-tvl'), {
+    type: 'doughnut',
+    data: {
+      labels: Object.keys(dexTvl),
+      datasets: [{
+        data: Object.values(dexTvl),
+        backgroundColor: ['rgba(255,0,122,0.7)','rgba(240,185,11,0.7)','rgba(250,82,160,0.7)'],
+        borderColor: ['#ff007a','#f0b90b','#fa52a0'],
+        borderWidth: 1.5,
+      }]
+    },
+    options: {
+      ...chartDefaults,
+      cutout: '65%',
+      plugins: {
+        ...chartDefaults.plugins,
+        tooltip: { callbacks: { label: ctx => ' ' + fmt(ctx.raw) } }
+      }
+    }
+  });
+
+  // Pool count by DEX — bar
+  const dexCount = meta.dex_count || {};
+  new Chart(document.getElementById('chart-dex-count'), {
+    type: 'bar',
+    data: {
+      labels: Object.keys(dexCount),
+      datasets: [{
+        data: Object.values(dexCount),
+        backgroundColor: ['rgba(255,0,122,0.5)','rgba(240,185,11,0.5)','rgba(250,82,160,0.5)'],
+        borderColor: ['#ff007a','#f0b90b','#fa52a0'],
+        borderWidth: 1.5,
+        borderRadius: 3,
+      }]
+    },
+    options: {
+      ...chartDefaults,
+      scales: {
+        x: { ticks: { color:'#4a6480', font:{family:'JetBrains Mono',size:9} }, grid: { color:'rgba(30,45,61,0.5)' } },
+        y: { ticks: { color:'#4a6480', font:{family:'JetBrains Mono',size:9} }, grid: { color:'rgba(30,45,61,0.5)' } }
+      },
+      plugins: { ...chartDefaults.plugins, legend: { display: false } }
+    }
+  });
+
+  // Fee distribution — bar
+  const feeDist = meta.fee_distribution || {};
+  const feeLabels = Object.keys(feeDist).map(f => f+'bps');
+  new Chart(document.getElementById('chart-fees'), {
+    type: 'bar',
+    data: {
+      labels: feeLabels,
+      datasets: [{
+        data: Object.values(feeDist),
+        backgroundColor: 'rgba(0,229,255,0.3)',
+        borderColor: '#00e5ff',
+        borderWidth: 1.5,
+        borderRadius: 3,
+      }]
+    },
+    options: {
+      ...chartDefaults,
+      scales: {
+        x: { ticks: { color:'#4a6480', font:{family:'JetBrains Mono',size:9} }, grid: { color:'rgba(30,45,61,0.5)' } },
+        y: { ticks: { color:'#4a6480', font:{family:'JetBrains Mono',size:9} }, grid: { color:'rgba(30,45,61,0.5)' } }
+      },
+      plugins: { ...chartDefaults.plugins, legend: { display: false } }
+    }
+  });
+}
+
+// ── Filter & Sort ──────────────────────────────────────────────────────────
+function applyFilters() {
+  const q = filterSearch.toLowerCase();
+  filtered = allPools.filter(p => {
+    if (filterDex && p.dex !== filterDex) return false;
+    if (filterFee && p.fee_bps != filterFee) return false;
+    if (filterV3Only && p.version !== 3) return false;
+    if (filterHasVol && p.volume_usd <= 0) return false;
+    if (q) {
+      const hay = (p.sym0 + p.sym1 + p.address + p.token0 + p.token1).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  filtered.sort((a, b) => {
+    let av = a[sortCol], bv = b[sortCol];
+    if (typeof av === 'string') return sortDir * av.localeCompare(bv);
+    return sortDir * (av - bv);
+  });
+
+  currentPage = 1;
+  renderTable();
+  renderPagination();
+  document.getElementById('pool-count').textContent = filtered.length.toLocaleString() + ' pools';
+}
+
+// ── Table render ───────────────────────────────────────────────────────────
+const maxTvl = () => Math.max(...allPools.map(p => p.tvl_usd));
+
+function renderTable() {
+  const tbody = document.getElementById('pool-table-body');
+  const start = (currentPage - 1) * PAGE_SIZE;
+  const page = filtered.slice(start, start + PAGE_SIZE);
+  const maxT = maxTvl();
+
+  tbody.innerHTML = page.map((p, i) => {
+    const rank = start + i + 1;
+    const tvlPct = Math.min(100, (p.tvl_usd / maxT) * 100);
+    const c0 = tokenColor(p.sym0), c1 = tokenColor(p.sym1);
+    const volStr = p.volume_usd > 0
+      ? `<span class="vol-cell">${fmt(p.volume_usd)}</span>`
+      : `<span class="no-vol">—</span>`;
+    const feePct = (p.fee_bps / 100).toFixed(2) + '%';
+
+    return `
+    <tr data-idx="${allPools.indexOf(p)}">
+      <td style="color:var(--muted);font-size:10px">${rank}</td>
+      <td>
+        <div class="pair-cell">
+          <div class="token-icons">
+            <div class="token-icon" style="background:${c0}">${p.sym0.slice(0,2)}</div>
+            <div class="token-icon" style="background:${c1}">${p.sym1.slice(0,2)}</div>
+          </div>
+          <div>
+            <div class="pair-name">${p.sym0}/${p.sym1}</div>
+            <div class="pair-addr">${addrShort(p.address)}</div>
+          </div>
+        </div>
+      </td>
+      <td><span class="dex-badge dex-${p.dex}">${p.dex.replace('swap','').replace('V','v')}</span></td>
+      <td><span class="fee-tag">${feePct}</span></td>
+      <td>
+        <div class="tvl-bar-wrap">
+          <span style="color:var(--text);min-width:70px">${fmt(p.tvl_usd)}</span>
+          <div class="tvl-bar"><div class="tvl-bar-fill" style="width:${tvlPct}%"></div></div>
+        </div>
+      </td>
+      <td>${volStr}</td>
+      <td class="updated-cell">${timeAgo(p.last_updated)}</td>
+    </tr>`;
+  }).join('');
+
+  // Row click → modal
+  tbody.querySelectorAll('tr').forEach(row => {
+    row.addEventListener('click', () => openModal(allPools[+row.dataset.idx]));
+  });
+}
+
+// ── Pagination ─────────────────────────────────────────────────────────────
+function renderPagination() {
+  const total = Math.ceil(filtered.length / PAGE_SIZE);
+  const el = document.getElementById('pagination');
+  if (total <= 1) { el.innerHTML = ''; return; }
+
+  let pages = [];
+  pages.push(`<button class="page-btn" id="pg-prev" ${currentPage===1?'disabled':''}>‹ Prev</button>`);
+
+  const range = [];
+  for (let i = Math.max(1,currentPage-2); i <= Math.min(total,currentPage+2); i++) range.push(i);
+  if (range[0] > 1) { pages.push(`<button class="page-btn" data-pg="1">1</button>`); if(range[0]>2) pages.push(`<span class="page-info">…</span>`); }
+  range.forEach(n => pages.push(`<button class="page-btn ${n===currentPage?'active':''}" data-pg="${n}">${n}</button>`));
+  if (range[range.length-1] < total) { if(range[range.length-1]<total-1) pages.push(`<span class="page-info">…</span>`); pages.push(`<button class="page-btn" data-pg="${total}">${total}</button>`); }
+
+  pages.push(`<button class="page-btn" id="pg-next" ${currentPage===total?'disabled':''}>Next ›</button>`);
+  pages.push(`<span class="page-info">${((currentPage-1)*PAGE_SIZE)+1}–${Math.min(currentPage*PAGE_SIZE,filtered.length)} of ${filtered.length}</span>`);
+
+  el.innerHTML = pages.join('');
+
+  el.querySelectorAll('[data-pg]').forEach(btn => {
+    btn.addEventListener('click', () => { currentPage = +btn.dataset.pg; renderTable(); renderPagination(); });
+  });
+  el.querySelector('#pg-prev')?.addEventListener('click', () => { currentPage--; renderTable(); renderPagination(); });
+  el.querySelector('#pg-next')?.addEventListener('click', () => { currentPage++; renderTable(); renderPagination(); });
+}
+
+// ── Modal ──────────────────────────────────────────────────────────────────
+function openModal(p) {
+  document.getElementById('modal-pair').textContent = `${p.sym0} / ${p.sym1}`;
+
+  const badges = document.getElementById('modal-badges');
+  badges.innerHTML = `
+    <span class="dex-badge dex-${p.dex}">${p.dex}</span>
+    <span class="fee-tag">${(p.fee_bps/100).toFixed(2)}% fee · V${p.version}</span>
+  `;
+
+  const grid = document.getElementById('modal-detail-grid');
+  grid.innerHTML = `
+    <div class="detail-item">
+      <div class="detail-label">TVL</div>
+      <div class="detail-value accent">${fmt(p.tvl_usd)}</div>
+    </div>
+    <div class="detail-item">
+      <div class="detail-label">Volume (reported)</div>
+      <div class="detail-value orange">${p.volume_usd > 0 ? fmt(p.volume_usd) : 'No data'}</div>
+    </div>
+    <div class="detail-item">
+      <div class="detail-label">Liquidity</div>
+      <div class="detail-value">${p.liquidity > 0 ? fmtNum(p.liquidity) : '—'}</div>
+    </div>
+    <div class="detail-item">
+      <div class="detail-label">Last Updated</div>
+      <div class="detail-value">${timeAgo(p.last_updated)}</div>
+    </div>
+    <div class="detail-item">
+      <div class="detail-label">Discovered</div>
+      <div class="detail-value">${timeAgo(p.discovered_at)}</div>
+    </div>
+    <div class="detail-item">
+      <div class="detail-label">Version</div>
+      <div class="detail-value green">V${p.version} · ${p.dex}</div>
+    </div>
+  `;
+
+  const addrs = document.getElementById('modal-addresses');
+  const rows = [
+    ['Pool', p.address],
+    ['Token 0', p.token0 + (p.sym0 && !p.sym0.startsWith('0x') ? ` (${p.sym0})` : '')],
+    ['Token 1', p.token1 + (p.sym1 && !p.sym1.startsWith('0x') ? ` (${p.sym1})` : '')],
+  ];
+  addrs.innerHTML = rows.map(([label, val]) => `
+    <div class="addr-row">
+      <div class="addr-label">${label}</div>
+      <div class="addr-val">${val}</div>
+      <button class="copy-btn" data-copy="${val.split(' ')[0]}">COPY</button>
+    </div>
+  `).join('');
+
+  addrs.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(btn.dataset.copy).then(() => {
+        btn.textContent = 'COPIED'; btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'COPY'; btn.classList.remove('copied'); }, 1500);
+      });
+    });
+  });
+
+  document.getElementById('modal-overlay').classList.add('open');
+}
+
+// ── Events ─────────────────────────────────────────────────────────────────
+function bindEvents() {
+  // Search
+  let searchTimer;
+  document.getElementById('search').addEventListener('input', e => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { filterSearch = e.target.value; applyFilters(); }, 200);
+  });
+
+  // Selects
+  document.getElementById('filter-dex').addEventListener('change', e => { filterDex = e.target.value; applyFilters(); });
+  document.getElementById('filter-fee').addEventListener('change', e => { filterFee = e.target.value; applyFilters(); });
+
+  // Sort buttons
+  document.querySelectorAll('[data-sort]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('[data-sort]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      sortCol = btn.dataset.sort === 'tvl' ? 'tvl_usd' : 'volume_usd';
+      sortDir = -1;
+      applyFilters();
+    });
+  });
+
+  // Filter buttons
+  document.getElementById('btn-v3only').addEventListener('click', function() {
+    filterV3Only = !filterV3Only;
+    this.classList.toggle('active', filterV3Only);
+    applyFilters();
+  });
+
+  document.getElementById('btn-withvol').addEventListener('click', function() {
+    filterHasVol = !filterHasVol;
+    this.classList.toggle('active', filterHasVol);
+    applyFilters();
+  });
+
+  // Column sort
+  document.querySelectorAll('thead th[data-col]').forEach(th => {
+    th.addEventListener('click', () => {
+      const col = th.dataset.col;
+      if (sortCol === col) { sortDir *= -1; }
+      else { sortCol = col; sortDir = -1; }
+      document.querySelectorAll('thead th').forEach(t => t.classList.remove('sorted-asc','sorted-desc'));
+      th.classList.add(sortDir === -1 ? 'sorted-desc' : 'sorted-asc');
+      applyFilters();
+    });
+  });
+
+  // Modal close
+  document.getElementById('modal-close').addEventListener('click', () => {
+    document.getElementById('modal-overlay').classList.remove('open');
+  });
+  document.getElementById('modal-overlay').addEventListener('click', e => {
+    if (e.target === e.currentTarget) document.getElementById('modal-overlay').classList.remove('open');
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') document.getElementById('modal-overlay').classList.remove('open');
+  });
+}
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+loadData();
+
+// ── Tab switching ──────────────────────────────────────────────────────────
+let networkLoaded = false;
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    const target = btn.dataset.tab;
+    document.getElementById('tab-' + target).classList.add('active');
+    if (target === 'network' && !networkLoaded) {
+      networkLoaded = true;
+      loadNetwork();
+    }
+  });
+});
+
+// ── D3 Force Network ───────────────────────────────────────────────────────
+async function loadNetwork() {
+  let gdata;
+  try {
+    const r = await fetch('graph_data.json');
+    gdata = await r.json();
+  } catch(e) {
+    document.getElementById('graph-loading-text').textContent = 'graph_data.json not found';
+    return;
+  }
+  document.getElementById('graph-loading-text').textContent = 'RENDERING ' + gdata.nodes.length + ' TOKENS...';
+  setTimeout(() => buildNetwork(gdata), 50);
+}
+
+function buildNetwork(gdata) {
+  const wrap = document.getElementById('network-svg-wrap');
+  const W = wrap.clientWidth, H = wrap.clientHeight;
+  const svg = d3.select('#network-svg');
+  svg.attr('viewBox', `0 0 ${W} ${H}`);
+
+  const dexColor = {
+    'UniswapV3': '#ff007a',
+    'UniswapV2': '#f0b90b',
+    'SushiswapV2': '#fa52a0',
+  };
+
+  // Node radius by pool count (log scale)
+  const maxPools = d3.max(gdata.nodes, d => d.pools);
+  const rScale = d3.scaleSqrt().domain([1, maxPools]).range([4, 28]);
+
+  // Edge width by TVL (log scale)
+  const maxTvl = d3.max(gdata.edges, e => e.tvl_usd);
+  const wScale = d3.scaleLog().domain([1, maxTvl]).range([0.3, 3.5]).clamp(true);
+
+  // Build node lookup
+  const nodeById = {};
+  gdata.nodes.forEach(n => { nodeById[n.id] = n; });
+
+  // Filter edges to those with valid nodes
+  const edges = gdata.edges.filter(e => nodeById[e.source] && nodeById[e.target]);
+
+  // Zoom
+  const zoom = d3.zoom()
+    .scaleExtent([0.1, 8])
+    .on('zoom', e => g.attr('transform', e.transform));
+  svg.call(zoom);
+
+  const g = svg.append('g');
+
+  // Edge (link) layer
+  const linkG = g.append('g').attr('class', 'links');
+  const link = linkG.selectAll('line')
+    .data(edges)
+    .join('line')
+    .attr('stroke', d => dexColor[d.dex] || '#3a5068')
+    .attr('stroke-opacity', 0.35)
+    .attr('stroke-width', d => wScale(Math.max(1, d.tvl_usd)));
+
+  // Node layer
+  const nodeG = g.append('g').attr('class', 'nodes');
+  const node = nodeG.selectAll('g')
+    .data(gdata.nodes)
+    .join('g')
+    .attr('class', 'node-group')
+    .style('cursor', 'pointer')
+    .call(d3.drag()
+      .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag',  (e, d) => { d.fx = e.x; d.fy = e.y; })
+      .on('end',   (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+    );
+
+  // Node circles
+  node.append('circle')
+    .attr('r', d => rScale(d.pools))
+    .attr('fill', d => {
+      const sym = d.symbol.toUpperCase();
+      const colors = {
+        WETH:'#627eea', ETH:'#627eea', USDC:'#2775ca', USDT:'#26a17b',
+        DAI:'#f5ac37', WBTC:'#f7931a', BTC:'#f7931a', WBTC:'#f7931a',
+      };
+      return colors[sym] || '#1a3a5c';
+    })
+    .attr('stroke', d => {
+      const sym = d.symbol.toUpperCase();
+      const strokes = {
+        WETH:'#8fa8ea', ETH:'#8fa8ea', USDC:'#5599de', USDT:'#5dcc9a',
+        DAI:'#f9cc77', WBTC:'#faa940', BTC:'#faa940',
+      };
+      return strokes[sym] || '#00e5ff';
+    })
+    .attr('stroke-width', d => d.pools > 100 ? 2 : 1)
+    .attr('stroke-opacity', 0.7);
+
+  // Labels layer (initially visible, can toggle)
+  let labelsVisible = true;
+  const labelG = g.append('g').attr('class', 'labels');
+  const label = labelG.selectAll('text')
+    .data(gdata.nodes)
+    .join('text')
+    .attr('class', 'node-label')
+    .attr('fill', '#c8d8e8')
+    .attr('font-family', 'JetBrains Mono, monospace')
+    .attr('font-size', d => d.pools > 50 ? 11 : 9)
+    .attr('font-weight', d => d.pools > 100 ? '600' : '400')
+    .attr('text-anchor', 'middle')
+    .attr('dy', d => rScale(d.pools) + 11)
+    .attr('pointer-events', 'none')
+    .text(d => d.symbol.length > 10 ? d.symbol.slice(0,8)+'…' : d.symbol)
+    .attr('opacity', d => d.pools > 5 ? 1 : 0.4);
+
+  // Simulation
+  const sim = d3.forceSimulation(gdata.nodes)
+    .force('link', d3.forceLink(edges)
+      .id(d => d.id)
+      .distance(d => 60 + 80 / Math.sqrt(d.tvl_usd / 1e6 + 1))
+      .strength(0.3))
+    .force('charge', d3.forceManyBody()
+      .strength(d => -80 - rScale(d.pools) * 8))
+    .force('center', d3.forceCenter(W/2, H/2))
+    .force('collision', d3.forceCollide().radius(d => rScale(d.pools) + 4))
+    .on('tick', () => {
+      link
+        .attr('x1', d => d.source.x)
+        .attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x)
+        .attr('y2', d => d.target.y);
+      node.attr('transform', d => `translate(${d.x},${d.y})`);
+      label.attr('transform', d => `translate(${d.x},${d.y})`);
+    })
+    .on('end', () => {
+      document.getElementById('graph-loading').style.display = 'none';
+    });
+
+  // Tooltip
+  const tt = document.getElementById('graph-tooltip');
+  node.on('mouseenter', (e, d) => {
+    const r = wrap.getBoundingClientRect();
+    const x = e.clientX - r.left + 12;
+    const y = e.clientY - r.top + 12;
+    document.getElementById('tt-title').textContent = d.symbol;
+    document.getElementById('tt-body').innerHTML = `
+      <div class="tt-row"><span class="tt-label">POOLS</span><span class="tt-val">${d.pools.toLocaleString()}</span></div>
+      <div class="tt-row"><span class="tt-label">TVL</span><span class="tt-val">${fmt(d.tvl)}</span></div>
+      <div class="tt-row"><span class="tt-label">ADDR</span><span class="tt-val">${d.id.slice(0,8)}…</span></div>
+    `;
+    tt.style.left = Math.min(x, wrap.clientWidth - 230) + 'px';
+    tt.style.top  = Math.min(y, wrap.clientHeight - 130) + 'px';
+    tt.style.display = 'block';
+
+    // Highlight connected links
+    link.attr('stroke-opacity', l =>
+      l.source.id === d.id || l.target.id === d.id ? 0.9 : 0.08);
+    node.select('circle').attr('opacity', n =>
+      n.id === d.id ? 1 : 0.3);
+  })
+  .on('mouseleave', () => {
+    tt.style.display = 'none';
+    link.attr('stroke-opacity', 0.35);
+    node.select('circle').attr('opacity', 1);
+  });
+
+  // Edge tooltip
+  link.on('mouseenter', (e, d) => {
+    const r = wrap.getBoundingClientRect();
+    document.getElementById('tt-title').textContent = d.sym0 + ' / ' + d.sym1;
+    document.getElementById('tt-body').innerHTML = `
+      <div class="tt-row"><span class="tt-label">DEX</span><span class="tt-val">${d.dex}</span></div>
+      <div class="tt-row"><span class="tt-label">FEE</span><span class="tt-val">${(d.fee_bps/100).toFixed(2)}%</span></div>
+      <div class="tt-row"><span class="tt-label">TVL</span><span class="tt-val">${fmt(d.tvl_usd)}</span></div>
+      ${d.volume_usd > 0 ? `<div class="tt-row"><span class="tt-label">VOL</span><span class="tt-val">${fmt(d.volume_usd)}</span></div>` : ''}
+    `;
+    tt.style.left = Math.min(e.clientX - r.left + 12, wrap.clientWidth - 230) + 'px';
+    tt.style.top  = Math.min(e.clientY - r.top + 12, wrap.clientHeight - 130) + 'px';
+    tt.style.display = 'block';
+  })
+  .on('mouseleave', () => { tt.style.display = 'none'; });
+
+  // Controls
+  document.getElementById('net-reset').addEventListener('click', () => {
+    svg.transition().duration(600).call(zoom.transform, d3.zoomIdentity);
+  });
+
+  document.getElementById('net-toggle-labels').addEventListener('click', function() {
+    labelsVisible = !labelsVisible;
+    labelG.attr('opacity', labelsVisible ? 1 : 0);
+    this.textContent = labelsVisible ? 'Labels off' : 'Labels on';
+  });
+
+  // Token search — highlight matching node
+  document.getElementById('net-search').addEventListener('input', function() {
+    const q = this.value.toLowerCase();
+    if (!q) {
+      node.select('circle').attr('opacity', 1).attr('r', d => rScale(d.pools));
+      link.attr('stroke-opacity', 0.35);
+      return;
+    }
+    node.select('circle')
+      .attr('opacity', d => d.symbol.toLowerCase().includes(q) || d.id.includes(q) ? 1 : 0.1)
+      .attr('r', d => d.symbol.toLowerCase().includes(q) ? rScale(d.pools) * 1.8 : rScale(d.pools));
+    link.attr('stroke-opacity', l =>
+      l.sym0.toLowerCase().includes(q) || l.sym1.toLowerCase().includes(q) ? 0.8 : 0.05);
+  });
+}
+</script>
+</body>
+</html>

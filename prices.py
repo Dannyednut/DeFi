@@ -51,6 +51,11 @@ _NATIVE_BINANCE_IDS: dict[int, str] = {
     324: "ethusdt",
 }
 
+_STABLES: dict[int, str] = {
+    1: "0xdac17f958d2ee523a2206206994597c13d831ec7", 
+    56: "0xe9e7cea3dedca5984780bafc599bd69add087d56",
+}
+
 _BASE_URL_CG = "https://api.coingecko.com/api/v3"
 _BASE_URL_BINANCE = "https://api.binance.com/api/v3"
 
@@ -105,11 +110,15 @@ class PriceOracle:
     
     def __init__(
         self,
+        w3,
+        graph,
         chain_id: int,
         native_price_usd: float,
         wrapped_native: str,
         stablecoins: list[str],
     ):
+        self._w3 = w3
+        self._graph = graph
         self._chain_id = chain_id
         self._platform = _PLATFORM_IDS.get(chain_id, "ethereum")
         self._native_usd = native_price_usd
@@ -147,12 +156,44 @@ class PriceOracle:
         
         # Fetch native price on init
         self._fetch_native_price_sync()
+        self.oracleContract = None
+        if w3:
+            offChainOracleAddress = "0x00000000000D6FFc74A8feb35aF5827bf57f6786"
+            OffChainOracleAbi =[
+                {
+                    "inputs":[
+                        {"internalType":"contract IERC20","name":"srcToken","type":"address"},
+                        {"internalType":"contract IERC20","name":"dstToken","type":"address"},
+                        {"internalType":"bool","name":"useWrappers","type":"bool"}
+                    ],"name":"getRate","outputs":[
+                        {"internalType":"uint256","name":"weightedRate","type":"uint256"}
+                    ],"stateMutability":"view","type":"function"
+                },
+                {
+                    "inputs":[
+                        {"internalType":"contract IERC20","name":"srcToken","type":"address"},
+                        {"internalType":"bool","name":"useSrcWrappers","type":"bool"}
+                    ],"name":"getRateToEth","outputs":[
+                        {"internalType":"uint256","name":"weightedRate","type":"uint256"}
+                    ],"stateMutability":"view","type":"function"
+                }
+            ]
+
+            self.oracleContract = self._w3.eth.contract(address=offChainOracleAddress, abi=OffChainOracleAbi)
     
     # ══════════════════════════════════════════════════════════════════════════════
     # PUBLIC API
     # ══════════════════════════════════════════════════════════════════════════════
+    def aggregatorPrice(self, srcToken, decimal, to_native=False):
+        if self.oracleContract is None:
+            raise ValueError("Oracle contract not initialized")
+        srcToken = self._w3.to_checksum_address(srcToken)
+        dstToken = self._w3.to_checksum_address(self._wrapped_native if to_native else _STABLES.get(self._chain_id))
+        if to_native:
+            return self.oracleContract.functions.getRateToEth(srcToken, True).call() / 10**(18 if decimal == 18 else (18 + decimal * 2))
+        return self.oracleContract.functions.getRate(srcToken, dstToken, True).call() / 10**(18 if decimal == 18 else (18 - decimal * 2))
     
-    def get_price(self, addr: str) -> Optional[float]:
+    def get_price(self, addr: str, dec: int = 18) -> Optional[float]:
         """Get cached USD price for a token."""
         entry = self._cache.get(addr.lower())
         if entry is None:
@@ -201,8 +242,9 @@ class PriceOracle:
     def _get_source_weight(self, source: str) -> float:
         """Get weight for a price source."""
         weights = {
-            "binance": 0.5,
-            "dex": 0.3,
+            "binance": 0.45,
+            "aggregator": 0.25,
+            "dex": 0.2,
             "coingecko": 0.15,
             "config": 0.05,
         }
@@ -250,13 +292,15 @@ class PriceOracle:
         if not unique:
             return
         
-        # Fetch from all sources in parallel
+        # Fetch from Binance and CoinGecko first, then use on-chain aggregator for any tokens
+        # that are not present in those external feeds.
         tasks = [
             self._refresh_from_binance(unique),
             self._refresh_from_coingecko(unique),
         ]
-        
         await asyncio.gather(*tasks, return_exceptions=True)
+        if self._chain_id != 11155111:
+            await self._refresh_from_aggregator(unique)
     
     async def refresh_pending(self) -> None:
         """Refresh all pending addresses."""
@@ -425,6 +469,45 @@ class PriceOracle:
         if elapsed < _MIN_CALL_GAP_BINANCE:
             await asyncio.sleep(_MIN_CALL_GAP_BINANCE - elapsed)
     
+    async def _refresh_from_aggregator(self, addresses: list[str]) -> None:
+        """Fetch prices from the on-chain aggregator for tokens missing external prices."""
+        if self.oracleContract is None or self._w3 is None:
+            return
+
+        addresses_to_fetch = [addr for addr in addresses if self._needs_aggregator(addr)]
+        if not addresses_to_fetch:
+            return
+
+        now = time.time()
+        native_usd = self.get_native_price()
+        for addr in addresses_to_fetch:
+            try:
+                decimals = self._get_token_decimals(addr)
+                rate_native = self.aggregatorPrice(addr, decimals, to_native=True)
+                if rate_native and rate_native > 0:
+                    price = rate_native * native_usd
+                    self._update_price(addr, price, "aggregator", now)
+            except Exception as e:
+                log.debug(f"Aggregator price error for {addr}: {e}")
+
+    def _needs_aggregator(self, addr: str) -> bool:
+        """Return True when token price is not available from Binance or CoinGecko."""
+        entry = self._cache.get(addr.lower())
+        if entry is None:
+            return True
+        _, _, sources = entry
+        return not any(src in sources for src in ("binance", "coingecko"))
+
+    def _get_token_decimals(self, addr: str) -> int:
+        """Read token decimals from chain, fallback to 18."""
+        if addr.lower() == self._wrapped_native:
+            return 18
+        if self._graph is not None:
+            meta = self._graph.token_metadata.get(addr.lower())
+            if meta and meta.get("decimals"):
+                return int(meta["decimals"])
+        return 18
+
     async def _refresh_native_price(self) -> None:
         """Refresh native price from Binance (faster than CG)."""
         symbol = _NATIVE_BINANCE_IDS.get(self._chain_id)

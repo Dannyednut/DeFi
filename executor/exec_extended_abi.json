@@ -1,0 +1,485 @@
+[
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "name": "amountIn",
+            "type": "uint256"
+          },
+          {
+            "name": "minProfit",
+            "type": "uint256"
+          },
+          {
+            "name": "tokens",
+            "type": "address[]"
+          },
+          {
+            "name": "pools",
+            "type": "address[]"
+          },
+          {
+            "name": "fees",
+            "type": "uint24[]"
+          },
+          {
+            "name": "tokenIn",
+            "type": "address"
+          },
+          {
+            "name": "mode",
+            "type": "uint8"
+          }
+        ],
+        "internalType": "struct ArbData",
+        "name": "arb",
+        "type": "tuple"
+      }
+    ],
+    "name": "yieldOut",
+    "outputs": [
+      {
+        "components": [
+          {
+            "name": "amountIn",
+            "type": "uint256"
+          },
+          {
+            "name": "minProfit",
+            "type": "uint256"
+          },
+          {
+            "name": "tokens",
+            "type": "address[]"
+          },
+          {
+            "name": "pools",
+            "type": "address[]"
+          },
+          {
+            "name": "fees",
+            "type": "uint24[]"
+          },
+          {
+            "name": "tokenIn",
+            "type": "address"
+          },
+          {
+            "name": "mode",
+            "type": "uint8"
+          }
+        ],
+        "internalType": "uint256",
+        "name": "ad",
+        "type": "tuple"
+      },
+      {
+        "name": "profit",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "name": "amountIn",
+            "type": "uint256"
+          },
+          {
+            "name": "minProfit",
+            "type": "uint256"
+          },
+          {
+            "name": "tokens",
+            "type": "address[]"
+          },
+          {
+            "name": "pools",
+            "type": "address[]"
+          },
+          {
+            "name": "fees",
+            "type": "uint24[]"
+          },
+          {
+            "name": "tokenIn",
+            "type": "address"
+          },
+          {
+            "name": "mode",
+            "type": "uint8"
+          }
+        ],
+        "internalType": "struct ArbData",
+        "name": "arb",
+        "type": "tuple"
+      },
+      {
+        "internalType": "bool",
+        "name": "lender",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint256",
+        "name": "builderFeeBps",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "validUntilBlock",
+        "type": "uint256"
+      }
+    ],
+    "name": "swap",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          {
+            "name": "amountIn",
+            "type": "uint256"
+          },
+          {
+            "name": "minProfit",
+            "type": "uint256"
+          },
+          {
+            "name": "tokens",
+            "type": "address[]"
+          },
+          {
+            "name": "pools",
+            "type": "address[]"
+          },
+          {
+            "name": "fees",
+            "type": "uint24[]"
+          },
+          {
+            "name": "tokenIn",
+            "type": "address"
+          },
+          {
+            "name": "mode",
+            "type": "uint8"
+          }
+        ],
+        "internalType": "struct ArbData",
+        "name": "arb",
+        "type": "tuple"
+      },
+      {
+        "internalType": "bool",
+        "name": "lender",
+        "type": "bool"
+      },
+      {
+        "internalType": "uint256",
+        "name": "builderFeeBps",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "validUntilBlock",
+        "type": "uint256"
+      }
+    ],
+    "name": "swapFast",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "bytes[]",
+        "name": "calls",
+        "type": "bytes[]"
+      }
+    ],
+    "name": "multiCall",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "successful",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "failed",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "successful",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "failed",
+        "type": "uint256"
+      }
+    ],
+    "name": "BATCH",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "amt",
+        "type": "uint256"
+      }
+    ],
+    "name": "DONE",
+    "type": "event"
+  },
+  {
+    "inputs": [
+      {
+        "name": "routeId",
+        "type": "bytes32"
+      },
+      {
+        "name": "profitToken",
+        "type": "address"
+      },
+      {
+        "name": "minProfit",
+        "type": "uint256"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "validUntilBlock",
+        "type": "uint256"
+      },
+      {
+        "components": [
+          {
+            "name": "target",
+            "type": "address"
+          },
+          {
+            "name": "value",
+            "type": "uint256"
+          },
+          {
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "calls",
+        "type": "tuple[]"
+      }
+    ],
+    "name": "executeAtomic",
+    "outputs": [
+      {
+        "name": "profit",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "name": "calls",
+        "type": "bytes[]"
+      }
+    ],
+    "name": "multiCallAtomic",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "name": "asset",
+        "type": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256"
+      },
+      {
+        "name": "routeId",
+        "type": "bytes32"
+      },
+      {
+        "name": "profitToken",
+        "type": "address"
+      },
+      {
+        "name": "minProfit",
+        "type": "uint256"
+      },
+      {
+        "name": "deadline",
+        "type": "uint256"
+      },
+      {
+        "name": "validUntilBlock",
+        "type": "uint256"
+      },
+      {
+        "components": [
+          {
+            "name": "target",
+            "type": "address"
+          },
+          {
+            "name": "value",
+            "type": "uint256"
+          },
+          {
+            "name": "data",
+            "type": "bytes"
+          }
+        ],
+        "name": "calls",
+        "type": "tuple[]"
+      }
+    ],
+    "name": "flashLoanAave",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "name": "asset",
+        "type": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256"
+      },
+      {
+        "name": "premium",
+        "type": "uint256"
+      },
+      {
+        "name": "initiator",
+        "type": "address"
+      },
+      {
+        "name": "params",
+        "type": "bytes"
+      }
+    ],
+    "name": "executeOperation",
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address"
+      },
+      {
+        "name": "enabled",
+        "type": "bool"
+      }
+    ],
+    "name": "setOperator",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address"
+      },
+      {
+        "name": "enabled",
+        "type": "bool"
+      }
+    ],
+    "name": "setTarget",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "name": "target",
+        "type": "address"
+      },
+      {
+        "name": "selector",
+        "type": "bytes4"
+      },
+      {
+        "name": "enabled",
+        "type": "bool"
+      }
+    ],
+    "name": "setSelector",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address"
+      },
+      {
+        "name": "spender",
+        "type": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256"
+      }
+    ],
+    "name": "approveToken",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+]

@@ -350,11 +350,19 @@ def estimate_tvl_native(
 
 
 def estimate_tvl_from_edge(edge: "PoolEdge") -> float:
-    """Calculate USD TVL from a PoolEdge."""
-    # If TVL is already set (e.g., from test data or cache), use it directly
-    # if edge.tvl_usd > 0:
-    #     return edge.tvl_usd
-    
+    """Calculate USD TVL from a PoolEdge.
+
+    Prefers the TVL already computed for this edge (registry refresh stores
+    either the GeckoTerminal-authoritative value or the reserve-based
+    estimate alongside the reserves themselves). Recomputing here instead
+    would require USD prices for BOTH pool tokens at simulation time, which
+    returns 0.0 for any token without local price data and made the
+    simulator's MIN_POOL_TVL_USD guard silently drop every pool containing
+    an unpriced token — even when the edge carried a perfectly good TVL.
+    """
+    if edge.tvl_usd > 0:
+        return edge.tvl_usd
+
     if edge.version == 2:
         return estimate_tvl_v2(
             edge.token_in, edge.token_out,

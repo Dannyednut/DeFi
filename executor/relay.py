@@ -43,14 +43,17 @@ def relay_transaction(
     Submit a signed transaction to the network.
 
     Args:
-        w3:           Web3 instance (HTTP, not WS — for reliability).
+        w3:           Web3 instance (HTTP, not WS — for reliability) with the
+                      Flashbots middleware attached when use_flashbots is set.
         raw_tx:       Signed raw transaction bytes.
-        chain_id:     Current chain ID.
+        target_tx:    Optional signed trigger transaction to front the bundle.
         target_block: Block number to target for bundle (current+1 if None).
-        relay_signer: Optional signer address for bundle relay (for Base/Arbitrum).
+        use_flashbots: Submit privately via the bundle relay. There is no
+                      public-mempool fallback on this path: private submission
+                      failures fail closed.
 
     Returns:
-        RelayResult with success status and tx_hash.
+        RelayResult with success status and tx_hash. Never None.
     """
 
     chain_id = int(w3.eth.chain_id)
@@ -74,7 +77,6 @@ def _relay_direct(w3: Web3, raw_tx: bytes) -> RelayResult:
         hex_hash = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
         log.info(f"Submitted directly | tx={hex_hash}")
         return RelayResult(success=True, tx_hash=hex_hash, method="direct")
-        # return RelayResult(success=True, tx_hash="", method="direct")
     except Exception as e:
         log.warning(f"Direct relay failed: {e}")
         return RelayResult(success=False, tx_hash="", method="direct", error=str(e))
@@ -117,10 +119,18 @@ def _relay_flashbots(
                 log.info(f"Bundle not found in block {block + 1}")
                 cancel_res = w3.flashbots.cancel_bundles(bundle_hash)
                 log.info(f"Canceled {cancel_res}")
+                # Fail closed: the bundle was not included, so this attempt
+                # failed. A previous version fell through here and returned
+                # None, which crashed callers reading RelayResult attributes.
+                return RelayResult(
+                    success=False,
+                    tx_hash="",
+                    method="flashbots",
+                    error="bundle not included in target block",
+                )
         else:
             log.warning("Private bundle submission returned no result; refusing public fallback for atomic backrun")
             return RelayResult(success=False, tx_hash="", method="flashbots", error="private bundle rejected")
-        # return RelayResult(success=True, tx_hash="", method="flashbots")
 
     except Exception as e:
         log.warning(f"Private bundle relay failed ({e}); refusing public fallback for atomic backrun")

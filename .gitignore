@@ -1,0 +1,15 @@
+*.env
+__pycache__
+*.pyc
+*.pyo
+
+cache/
+logs/
+study/
+
+.vscode/
+.agent/
+
+
+/executor/relay_signer.json
+/study/configV2_mainnet.env

@@ -1,0 +1,13 @@
+# Development / test dependencies (superset of runtime requirements).
+#
+# Regenerate the lock with pip-tools on Python 3.11:
+#
+#   python -m piptools compile --generate-hashes --strip-extras \
+#       -o requirements-dev.txt requirements-dev.in
+
+-r requirements.in
+
+# pytest 9.x — matches the accounting used by the DSS-MISSION-001 baseline
+# register (unittest subTest failures counted individually); keeps CI counts
+# directly comparable with docs/DEPENDENCIES.md.
+pytest>=9,<10

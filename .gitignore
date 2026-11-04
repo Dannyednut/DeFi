@@ -6,3 +6,6 @@ logs/*.jsonl
 cache/
 graph_data.json
 /executor/relay_signer.json
+# DSS-WO-ENG-001: local test/tooling artifacts
+.pytest_cache/
+.venv/

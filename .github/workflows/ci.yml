@@ -1,0 +1,90 @@
+name: CI
+
+# DSS-WO-ENG-001 — reproducible dependencies + CI foundation.
+#
+# Scope and guarantees:
+#   - Triggers on pull requests to main.
+#   - Least-privilege workflow permissions (contents: read).
+#   - Installs ONLY from the committed, hash-verified lock files.
+#   - Runs the import smoke test and the offline test suite.
+#   - Test failures fail the job (red CI is preferable to misleading green).
+#   - No repository secrets, no RPC credentials, no wallet credentials,
+#     no transaction signing or broadcasting, no deployment, no auto-merge,
+#     no privileged pull_request_target workflow.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: import-smoke + offline tests (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install runtime dependencies (hash-verified lock)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.txt
+
+      - name: Install development/test dependencies (hash-verified lock)
+        run: python -m pip install --require-hashes -r requirements-dev.txt
+
+      - name: Import smoke test (full module graph + Flashbots dependency status)
+        run: python scripts/ci_import_smoke.py
+
+      # Two test files are excluded from CI, with reasons recorded in the
+      # failure register (docs/DEPENDENCIES.md). They cannot run on a clean
+      # CI checkout and must never be executed by automation:
+      #
+      #   tests/test_flashbots_integration.py
+      #       Module-level manual script: builds, signs and BROADCASTS a real
+      #       transaction to the Sepolia Flashbots relay. It is uncollectable
+      #       by design and running it in CI would violate the "no signing or
+      #       broadcasting" security requirement of this work order.
+      #
+      #   tests/test_multicall3_yieldout.py
+      #       Requires a local runtime artifact (logs/pending_opportunities.jsonl)
+      #       produced by a live trading run, then dials a live RPC endpoint.
+      #       It can never pass on a clean clone; classified
+      #       network/environment-dependent.
+      #
+      # The suite still contains 22 known-failing test units reproduced from
+      # the DSS-MISSION-001 baseline (23 baseline failures minus the excluded
+      # environment-dependent test, plus 1 fixture error). This job therefore
+      # stays RED until later work orders fix those tests. Failures are
+      # deliberately NOT skipped, xfail-marked or otherwise hidden.
+      - name: Run offline test suite (fails on any test failure)
+        run: >
+          python -m pytest tests
+          --ignore=tests/test_flashbots_integration.py
+          --ignore=tests/test_multicall3_yieldout.py
+          -p no:cacheprovider
+          --tb=short -ra
+          --junitxml=pytest-results.xml
+
+      - name: Publish test results summary
+        if: always()
+        run: python scripts/ci_test_summary.py pytest-results.xml
+
+      - name: Upload test results artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pytest-results
+          path: pytest-results.xml
+          if-no-files-found: warn

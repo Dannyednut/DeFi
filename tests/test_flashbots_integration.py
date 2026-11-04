@@ -72,7 +72,7 @@ SELF_TRANSFER_VALUE_WEI = 0
 def _keystore_path() -> str:
     return os.environ.get(
         "DSS_TESTNET_KEYSTORE",
-        os.path.expanduser("~/.secrets/dss_testnet_wallet.keystore.json"),
+        "/home/z/my-project/.secrets/dss_testnet_wallet.keystore.json",
     )
 
 
@@ -82,13 +82,14 @@ def _keystore_passphrase() -> bytes:
     env_pass = os.environ.get("DSS_TESTNET_KEYSTORE_PASSPHRASE")
     if env_pass:
         return env_pass.encode()
-    pass_path = os.path.expanduser("~/.secrets/dss_testnet_wallet.pass")
+    pass_path = "/home/z/my-project/.secrets/dss_testnet_wallet.pass"
     if os.path.isfile(pass_path):
         with open(pass_path, "rb") as f:
             return f.read().strip()
     raise FileNotFoundError(
-        "agent keystore passphrase not found (~/.secrets/dss_testnet_wallet.pass "
-        "or DSS_TESTNET_KEYSTORE_PASSPHRASE)"
+        "agent keystore passphrase not found "
+        "(/home/z/my-project/.secrets/dss_testnet_wallet.pass or "
+        "DSS_TESTNET_KEYSTORE_PASSPHRASE)"
     )
 
 
@@ -100,7 +101,7 @@ def _skip_reason() -> str | None:
             "(never set in CI)"
         )
     if not os.path.isfile(_keystore_path()):
-        return "DSS agent testnet wallet keystore not found"
+        return "DSS agent testnet wallet keystore not found (/home/z/my-project/.secrets/dss_testnet_wallet.keystore.json)"
     if not os.environ.get("DSS_TESTNET_RPC_URL"):
         return "DSS_TESTNET_RPC_URL not configured"
     return None

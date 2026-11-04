@@ -76,7 +76,18 @@ No previously cached packages or local state were involved (standalone interpret
 
 ## 6. Classified failure register
 
-### ENG-002 register (current; 21 units across 18 test functions, CI scope: 20 failed + 1 error = 21 of 112 units)
+### ENG-003 register (CURRENT — resolved: 0 failed, 0 errors)
+
+**DSS-WO-ENG-003 (2026-11-04) repaired every unit in the ENG-002 register.** The offline CI suite now passes completely: **129 passed, 0 failed, 0 errors, 3 visibly skipped** (intentionally gated live-network tests, never runnable in CI). Failures in any new run are regressions, not baseline noise.
+
+| ENG-002 register entry | Resolution in ENG-003 |
+| --- | --- |
+| Stale relay tests (13 units) | `tests/test_relay.py` rewritten for the current fail-closed interface. **Production defect found and fixed:** the bundle-not-included path in `_relay_flashbots` fell through and returned `None`, crashing callers reading `RelayResult` attributes. Legacy public-fallback / `relay_signer=` / unknown-chain→mainnet behaviour intentionally NOT restored (security removals). |
+| Detector/forensics drift (3) | Interfaces reconciled (block-payload `_audit_shadow_trades`, `DecodedSwap.fee`, `LiquidationScanner` cache arg). **Production defect found and fixed:** `BaseDetector._estimate_gas_usd` declared `float` but returned a tuple on success — the liquidation scanner crashed on every real position (silently swallowed by `except: pass`), making the detector permanently dead. Tuple contract documented, scanner unpacks correctly. |
+| Broken optimizer test (1 error) | The file was a live-network manual script with a `mode` parameter pytest read as a missing fixture. Replaced by deterministic offline tests of the borrow math (verified against an independent float profit model) and entrypoint routing; the manual diagnostic is preserved behind `DSS_LIVE_OPTIMIZER_DIAG=1` and skips visibly. |
+| Synthetic graph failures (4) | **Two production defects found and fixed:** (1) `utils/multicall3.py` used `UNISWAP_V2_FACTORY_ABI`/`UNISWAP_V3_FACTORY_ABI` without importing them — every batched swap-path discovery raised `NameError` and was silently swallowed, disabling V2/V3 pool discovery entirely; (2) `estimate_tvl_from_edge` recomputed TVL from token USD prices, returning $0.00 for any pool containing an unpriced token and making the simulator's TVL guard drop it, even when the edge carried a good precomputed TVL. Regression coverage added (`tests/test_multicall3_discovery.py`); discovery tests rewritten for the current async batched architecture. |
+
+### ENG-002 register (HISTORICAL — superseded by ENG-003; kept for traceability; 21 units across 18 test functions, CI scope: 20 failed + 1 error = 21 of 112 units)
 
 | Category | Tests | Root cause |
 | --- | --- | --- |
@@ -95,19 +106,20 @@ Changes vs the ENG-001 register, all caused by the ENG-002 retirement/alignment:
 
 Baseline scope then: 23 failed / 86 passed / 1 error; CI scope: 22 failed / 86 passed / 1 error (109 units). Category B (the `AtomicArbExecutor` contract-existence failure) and the `test_phase13` ABI mismatch are gone for the reasons above.
 
-### Excluded from CI (2 files, unchanged)
-| Test | Why it cannot run in CI |
+### Excluded / gated tests (current state after ENG-003)
+| Test | Status |
 | --- | --- |
-| tests/test_flashbots_integration.py (**uncollectable**; the "+1" of the baseline) | Lines 192–255 are a module-level manual script: loads `PRIVATE_KEY` from `.env`, signs a real transfer, then calls `w3.flashbots.simulate(...)` and **`w3.flashbots.send_private_transaction(...)`** against the Sepolia relay — a real broadcast. Without `flashbots` it fails at import; with it, it fails on the missing key. Excluded from all pytest runs; it must never be executed by automation. Flagged for rewrite as a proper skip-gated integration test in a future work order. |
-| tests/test_multicall3_yieldout.py::test_run_multicall3_batch_yieldOut | Requires a local artifact from a live run (`logs/pending_opportunities.jsonl`) before it even dials `https://0xrpc.io/eth`; fails on a clean clone with "No cycles to test." Also counts toward the 23 baseline failures; excluded from CI scope only. |
+| tests/test_flashbots_integration.py | **Rewritten in ENG-003 (Workstream B)** and NO LONGER excluded: the old lines 192–255 (module-level load of `PRIVATE_KEY` from `.env`, signing, `w3.flashbots.simulate` + `send_private_transaction` broadcast at import time) are gone. The file now collects safely, never touches keys or network at import, uses only the DSS agent testnet wallet from the secure store, and both live phases skip visibly without `DSS_TESTNET_FLASHBOTS_LIVE=1` + `DSS_TESTNET_RPC_URL` + the agent keystore. Submission additionally requires `DSS_TESTNET_EXEC=1`. Chain-ID gate (mainnet always refused, unknown chains fail closed) is unit-tested offline. CI can never sign or broadcast through it. |
+| tests/test_multicall3_yieldout.py::test_run_multicall3_batch_yieldOut | Still excluded from CI: requires a local artifact from a live run (`logs/pending_opportunities.jsonl`) before it even dials `https://0xrpc.io/eth`; fails on a clean clone with "No cycles to test." Classified network/environment-dependent; candidate for the same gated rewrite later. |
+| tests/test_optimizer.py (live diagnostic portion) | The offline tests always run; the preserved manual live diagnostic skips visibly unless `DSS_LIVE_OPTIMIZER_DIAG=1`. |
 
 Also inspected: `tests/test_mc3.py` defines no pytest-collectable tests (manual script under `__main__`) — contributes 0 tests, harmless.
 
-### Reconciliation (ENG-002 actuals)
+### Reconciliation (ENG-003 actuals)
 
-- CI scope: 112 pytest units = **91 passing + 20 failing + 1 error**; 0 skipped. Baseline scope (without the second `--ignore`) remains 1 unit higher via the excluded environment-dependent test.
-- `tests/test_flashbots_integration.py` remains the uncollectable file excluded everywhere.
-- Historical ENG-001 reconciliation: 105 test functions = 84 passing + 20 failing + 1 error; pytest 9 units = 86 + 23 + 1.
+- CI scope (with the single remaining `--ignore` for `test_multicall3_yieldout.py`): **129 passed, 0 failed, 0 errors, 3 skipped** (all three skips are intentional opt-in live-network gates with visible reasons: Flashbots Sepolia simulation, Flashbots Sepolia submission, optimizer live diagnostic). `tests/test_flashbots_integration.py` is now collected (import-safe) instead of excluded.
+- The ENG-002-era unit counts (112 units) are historical: the relay suite was restructured (21 → 16 units), the broken optimizer script became 10 offline tests + 1 gated diagnostic, discovery gained regression coverage (`tests/test_multicall3_discovery.py`, 4 units) and the chain-ID gate gained offline tests (4 units).
+- Historical ENG-002 reconciliation: 112 pytest units = 91 passing + 20 failing + 1 error; 0 skipped. Historical ENG-001 reconciliation: 105 test functions = 84 passing + 20 failing + 1 error; pytest 9 units = 86 + 23 + 1.
 
 ## 7. Explicit non-goals honored (ENG-001)
 
@@ -122,4 +134,4 @@ Per the Principal's direction, the separate `AtomicArbExecutor` contract is **re
 - **Preserved:** `execution/atomic.py` plan/route compilation, preflight simulation, exact envelope construction, chain-ID validation and fail-closed behaviour; `ArbExecRoute`/`build_arbexec_route` adapter; all `ARB_EXEC_ADDRESS_*` deployment configuration (no addresses invented).
 - **ABI:** `executor/exec_abi.json` is compiler-generated from the pinned source with solc `0.8.28+commit.7893614a` (SHA-256 verified against the official solc-bin checksum) and OpenZeppelin 5.7.0 exactly (`contracts/package-lock.json`). `config.ARB_EXEC_ABI` conforms to the generated interface, enforced by tests.
 - **Solidity versions:** source pragmas `^0.8.19` (Exec) / GPL-2.0-or-later Helper; compiler pinned as above; OZ 5.7.0 (required for the OZ-v5 `Ownable(initialOwner)` constructor style).
-- **New baseline (CI scope):** **20 failed / 91 passed / 1 error** (112 units) — see §6.
+- **New baseline (CI scope, ENG-002, HISTORICAL):** **20 failed / 91 passed / 1 error** (112 units) — fully repaired in ENG-003; see §6. Current expectation: fully green (see ENG-003 reconciliation).

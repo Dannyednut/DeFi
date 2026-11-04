@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from config import ARB_EXEC_ABI, get_chain, get_extended_arb_exec_address
+from config import ARB_EXEC_ABI, get_chain
 from log import get_logger
 
 log = get_logger("adversarial_validation")
@@ -30,7 +30,7 @@ class AdversarialSimulator:
         self.w3 = w3
         self.chain_id = int(chain_id)
         chain = get_chain(self.chain_id)
-        self.address = get_extended_arb_exec_address(self.chain_id) or chain.arb_exec_address
+        self.address = chain.arb_exec_address
         self.contract = None
         if self.address:
             self.contract = w3.eth.contract(

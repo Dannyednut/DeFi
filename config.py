@@ -419,6 +419,10 @@ UNISWAP_V3_POSITION_ABI = [
 ]
 
 ARB_EXEC_ABI = [
+    # Aligned with the authoritative Exec.sol sourced from Dannyednut/EVM at
+    # pinned commit 898fe82f29a5695a01278365eb442ab3a26811b5 (DSS-WO-ENG-002).
+    # Conformance of these entries against the compiler-generated ABI of the
+    # committed source is verified by tests/test_exec_contract_alignment.py.
     {
         "inputs": [{
             "components": [
@@ -430,7 +434,7 @@ ARB_EXEC_ABI = [
                 {"name": "tokenIn", "type": "address"},
                 {"name": "mode", "type": "uint8"},
             ],
-            "internalType": "struct ArbData", "name": "arb", "type": "tuple"
+            "internalType": "struct Data", "name": "arb", "type": "tuple"
         }],
         "name": "yieldOut",
         "outputs": [
@@ -442,7 +446,7 @@ ARB_EXEC_ABI = [
                 {"name": "fees", "type": "uint24[]"},
                 {"name": "tokenIn", "type": "address"},
                 {"name": "mode", "type": "uint8"},
-            ], "internalType": "uint256", "name": "ad", "type": "tuple"},
+            ], "internalType": "struct Data", "name": "ad", "type": "tuple"},
             {"name": "profit", "type": "uint256"},
         ],
         "stateMutability": "view",
@@ -459,12 +463,13 @@ ARB_EXEC_ABI = [
             {"name": "tokenIn", "type": "address"},
             {"name": "mode", "type": "uint8"},
           ],
-          "internalType": "struct ArbData",
+          "internalType": "struct Data",
           "name": "arb",
           "type": "tuple"
         },
-        {"internalType": "bool","name": "forceBalancer", "type": "bool"},
-        {"internalType": "uint256","name": "validUntilBlock", "type": "uint256"}
+        {"internalType": "bool", "name": "lender", "type": "bool"},
+        {"internalType": "uint256", "name": "builderFeeBps", "type": "uint256"},
+        {"internalType": "uint256", "name": "validUntilBlock", "type": "uint256"}
       ],
       "name": "swap",
       "outputs": [],
@@ -472,35 +477,35 @@ ARB_EXEC_ABI = [
       "type": "function"
     },
     {
-		"inputs": [
-			{"internalType": "bytes[]", "name": "calls", "type": "bytes[]"}
-		],
-		"name": "multiCall",
-		"outputs": [
-			{"internalType": "uint256", "name": "successful", "type": "uint256"},
-			{"internalType": "uint256", "name": "failed", "type": "uint256"}
-		],
-		"stateMutability": "nonpayable",
-		"type": "function"
-	},
+                "inputs": [
+                        {"internalType": "bytes[]", "name": "calls", "type": "bytes[]"}
+                ],
+                "name": "multiCall",
+                "outputs": [
+                        {"internalType": "uint256", "name": "successful", "type": "uint256"},
+                        {"internalType": "uint256", "name": "failed", "type": "uint256"}
+                ],
+                "stateMutability": "nonpayable",
+                "type": "function"
+        },
     {
-		"anonymous": False,
-		"inputs": [
-			{"indexed": False, "internalType": "uint256", "name": "successful", "type": "uint256"},
-			{"indexed": False, "internalType": "uint256", "name": "failed", "type": "uint256"}
-		],
-		"name": "BATCH",
-		"type": "event"
-	},
-	{
-		"anonymous": False,
-		"inputs": [
-			{"indexed": True, "internalType": "address", "name": "token", "type": "address"},
-			{"indexed": False, "internalType": "uint256", "name": "amt", "type": "uint256"}
-		],
-		"name": "DONE",
-		"type": "event"
-	},
+                "anonymous": False,
+                "inputs": [
+                        {"indexed": False, "internalType": "uint256", "name": "successful", "type": "uint256"},
+                        {"indexed": False, "internalType": "uint256", "name": "failed", "type": "uint256"}
+                ],
+                "name": "BATCH",
+                "type": "event"
+        },
+        {
+                "anonymous": False,
+                "inputs": [
+                        {"indexed": True, "internalType": "address", "name": "token", "type": "address"},
+                        {"indexed": False, "internalType": "uint256", "name": "amt", "type": "uint256"}
+                ],
+                "name": "DONE",
+                "type": "event"
+        },
 ]
 # ══════════════════════════════════════════════════════════════════════════════
 # DEX CONFIGURATION
@@ -1066,20 +1071,11 @@ def get_factory_by_name(chain_id: int, name: str) -> Optional[str]:
     return None
 
 
-def get_extended_arb_exec_address(chain_id: int) -> str | None:
-    """Return the redeployed gas-optimized Exec address for a chain.
-
-    This is intentionally separate from ARB_EXEC_ADDRESS_* so existing deployed
-    contracts remain untouched until the extended contract is explicitly deployed.
-    """
-    return (os.getenv(f"ARB_EXEC_EXTENDED_ADDRESS_{int(chain_id)}", "").strip() or
-            os.getenv("ARB_EXEC_EXTENDED_ADDRESS", "").strip() or None)
-
-
-def get_atomic_executor_address(chain_id: int) -> str | None:
-    """Return the explicitly configured deployed atomic executor for a chain.
-
-    No deployment address is assumed: production execution stays fail-closed
-    until an address is configured in the environment.
-    """
-    return os.getenv(f"ATOMIC_EXECUTOR_{int(chain_id)}") or os.getenv("ATOMIC_EXECUTOR_ADDRESS")
+# The retired separate AtomicArbExecutor contract and the old gas-optimized
+# Exec variant (5-argument constructor, swapFast/flashLoanAave/executeAtomic)
+# were removed in DSS-WO-ENG-002. The only active execution contract is the
+# authoritative Exec.sol sourced from Dannyednut/EVM at pinned commit
+# 898fe82f29a5695a01278365eb442ab3a26811b5; its deployment address is read
+# exclusively from ARB_EXEC_ADDRESS_* via ChainConfig.arb_exec_address. No
+# deployment address is assumed: production execution stays fail-closed until
+# an address is configured in the environment.

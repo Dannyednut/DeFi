@@ -1,0 +1,8 @@
+{
+  "name": "defi-contracts",
+  "private": true,
+  "description": "Solidity toolchain inputs for compiling the authoritative Exec contract (DSS-WO-ENG-002). Pinned, deterministic dependencies only.",
+  "devDependencies": {
+    "@openzeppelin/contracts": "5.7.0"
+  }
+}

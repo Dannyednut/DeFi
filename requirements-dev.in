@@ -12,3 +12,9 @@
 # register (unittest subTest failures counted individually); keeps CI counts
 # directly comparable with docs/DEPENDENCIES.md.
 pytest>=9,<10
+
+# Solidity compiler driver for the active Exec contract tests
+# (DSS-WO-ENG-002). The solc binary itself is provisioned at a pinned
+# version (0.8.28+commit.7893614a) and SHA-256 checksum-verified after
+# download by scripts/exec_build.py — see contracts/PROVENANCE.md.
+py-solc-x>=2,<3

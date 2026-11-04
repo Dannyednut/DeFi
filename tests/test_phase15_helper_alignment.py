@@ -2,28 +2,18 @@ from pathlib import Path
 import ast
 
 ROOT = Path(__file__).resolve().parents[1]
-EXEC = ROOT / "contracts" / "Exec.sol"
-HELPER = ROOT / "contracts" / "libraries" / "Helper.sol"
 OPTIMAL = ROOT / "optimizer" / "optimal.py"
 
 
-def test_helper_is_present_and_fee_aware_profit_quote_is_canonical():
-    text = HELPER.read_text()
-    assert "function getAmountOutV2WithFee" in text
-    assert "function getAmountInV2WithFee" in text
-    assert "current = tokens[i] == _token0(pools[i])" in text
-    assert "getAmountOutV2WithFee(current, r0, r1, fees[i])" in text
-    assert "getAmountOutV2(current, r0, r1)" not in text
-
-
-def test_exec_delegates_v2_fee_math_to_helper():
-    text = EXEC.read_text()
-    assert "function _getAmountOutV2WithFee" not in text
-    assert "function _getAmountInV2WithFee" not in text
-    assert text.count("Helper.getAmountOutV2WithFee") >= 3
-    assert "Helper.getAmountInV2WithFee" in text
-    assert "Helper._validatePoolTokens(arb.tokens, arb.pools)" in text
-    assert "arb.fees[i] >= 1_000_000" in text
+# DSS-WO-ENG-002 note: the three former string-presence tests that asserted
+# the RETIRED in-repo Exec variant's implementation details (fee-aware V2
+# yield quoting inside Helper, fee-aware V2 math call counts in Exec, the old
+# mode-guard wording and `getAmountInV2WithFee` debt repayment) were removed
+# together with that variant. The authoritative Exec/Helper
+# (Dannyednut/EVM @ 898fe82f) deliberately use different internals (plain
+# getAmountOutV2/getAmountInV2 for V2 math); their behaviour is covered by
+# tests/test_exec_contract_alignment.py, which verifies actual compilation,
+# ABI conformance and Python encoding instead of source strings.
 
 
 def test_optimizer_documents_and_implements_helper_sort_semantics():
@@ -33,12 +23,3 @@ def test_optimizer_documents_and_implements_helper_sort_semantics():
     assert "sorted_tokens = [t0, t1, t0] if borrow_token_smaller else [t1, t0, t1]" in text
     assert "_helper_scaling_factor" in text
     ast.parse(text)
-
-
-def test_exec_mode_one_uses_far_side_flashswap_and_v2_fee_repayment():
-    text = EXEC.read_text()
-    assert "if (arb.mode != 0) revert BadPath();" in text
-    assert "address borrowToken = arb.tokens[1];" in text
-    assert "bool z = (borrowToken == Helper._token0(pool0));" in text
-    assert "bool isT0 = borrowToken == Helper._token0(address(pair));" in text
-    assert "Helper.getAmountInV2WithFee(borrowed, r0, r1, arb.fees[0])" in text

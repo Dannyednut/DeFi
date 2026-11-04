@@ -6,6 +6,9 @@ name: CI
 #   - Triggers on pull requests to main.
 #   - Least-privilege workflow permissions (contents: read).
 #   - Installs ONLY from the committed, hash-verified lock files.
+#   - Installs the pinned Solidity toolchain inputs (OpenZeppelin via
+#     contracts/package-lock.json; solc 0.8.28+commit.7893614a is fetched by
+#     scripts/exec_build.py and SHA-256 checksum-verified before compiling).
 #   - Runs the import smoke test and the offline test suite.
 #   - Test failures fail the job (red CI is preferable to misleading green).
 #   - No repository secrets, no RPC credentials, no wallet credentials,
@@ -44,6 +47,13 @@ jobs:
       - name: Install development/test dependencies (hash-verified lock)
         run: python -m pip install --require-hashes -r requirements-dev.txt
 
+      # DSS-WO-ENG-002: the authoritative Exec contract tests compile the
+      # committed Solidity sources. OpenZeppelin 5.7.0 is pinned in
+      # contracts/package-lock.json; the solc binary is fetched at run time by
+      # scripts/exec_build.py and rejected on checksum mismatch.
+      - name: Install Solidity toolchain inputs (pinned OpenZeppelin)
+        run: npm ci --prefix contracts
+
       - name: Import smoke test (full module graph + Flashbots dependency status)
         run: python scripts/ci_import_smoke.py
 
@@ -63,11 +73,13 @@ jobs:
       #       It can never pass on a clean clone; classified
       #       network/environment-dependent.
       #
-      # The suite still contains 22 known-failing test units reproduced from
-      # the DSS-MISSION-001 baseline (23 baseline failures minus the excluded
-      # environment-dependent test, plus 1 fixture error). This job therefore
-      # stays RED until later work orders fix those tests. Failures are
-      # deliberately NOT skipped, xfail-marked or otherwise hidden.
+      # The suite still contains 20 pre-existing baseline failures and 1
+      # fixture error, reproduced under the DSS-WO-ENG-002 scope (the separate
+      # AtomicArbExecutor and the old in-repo Exec variant were retired and the
+      # repository was aligned with the authoritative Exec from
+      # Dannyednut/EVM @ 898fe82f; see docs/DEPENDENCIES.md §6). This job
+      # therefore stays RED until later work orders fix those tests. Failures
+      # are deliberately NOT skipped, xfail-marked or otherwise hidden.
       - name: Run offline test suite (fails on any test failure)
         run: >
           python -m pytest tests

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -10,10 +10,6 @@ import "./interfaces/IQuoter.sol";
 import "./interfaces/IWETH.sol";
 import "./interfaces/IBalancerVault.sol";
 import {Helper} from "./libraries/Helper.sol";
-
-interface IAaveV3Pool {
-    function flashLoanSimple(address receiver, address asset, uint256 amount, bytes calldata params, uint16 referralCode) external;
-}
 
 struct Data {
     uint256 amountIn;
@@ -45,70 +41,14 @@ contract Exec is Ownable, ReentrancyGuard {
     // and cleared immediately after validation to prevent re-use.
     address private _expectedCallback;
 
-    mapping(address => bool) public operators;
-    mapping(address => bool) public allowedTargets;
-    mapping(address => mapping(bytes4 => bool)) public allowedSelectors;
-    address private immutable AAVE_POOL;
-
-    struct Call {
-        address target;
-        uint256 value;
-        bytes data;
-    }
-
-    error InvalidTarget();
-    error SelectorNotAllowed();
-    error CallFailed(uint256 index, bytes reason);
-    error InvalidArrayLengths();
-    error InvalidLender();
-    error BadAaveInitiator();
-    error ExcessiveBuilderFee();
-
-    event OperatorUpdated(address indexed account, bool enabled);
-    event TargetUpdated(address indexed target, bool enabled);
-    event SelectorUpdated(address indexed target, bytes4 indexed selector, bool enabled);
-    event AtomicExecuted(bytes32 indexed routeId, address indexed token, uint256 profit);
-
     event DONE(address indexed token, uint256 amt);
     event BATCH(uint256 successful, uint256 failed);
 
-    constructor(address _w, address _q, address _b, address _aave, address initialOperator) Ownable(msg.sender) {
+    constructor(address _w, address _q, address _b) Ownable(msg.sender) {
         if (_w == address(0) || _q == address(0)) revert ZeroAddress();
         WETH = _w;
         Quoter = _q;
         BALANCER_VAULT = _b;
-        AAVE_POOL = _aave;
-        if (initialOperator != address(0)) {
-            operators[initialOperator] = true;
-            emit OperatorUpdated(initialOperator, true);
-        }
-    }
-
-    modifier onlyOperator() {
-        if (msg.sender != owner() && !operators[msg.sender] && msg.sender != address(this)) revert Auth();
-        _;
-    }
-
-    function setOperator(address account, bool enabled) external onlyOwner {
-        operators[account] = enabled;
-        emit OperatorUpdated(account, enabled);
-    }
-
-    function setTarget(address target, bool enabled) external onlyOwner {
-        if (target == address(0)) revert InvalidTarget();
-        allowedTargets[target] = enabled;
-        emit TargetUpdated(target, enabled);
-    }
-
-    function setSelector(address target, bytes4 selector, bool enabled) external onlyOwner {
-        if (target == address(0)) revert InvalidTarget();
-        allowedSelectors[target][selector] = enabled;
-        emit SelectorUpdated(target, selector, enabled);
-    }
-
-    function approveToken(address token, address spender, uint256 amount) external onlyOwner {
-        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(0x095ea7b3, spender, amount));
-        if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
     }
 
     receive() external payable {}
@@ -150,45 +90,40 @@ contract Exec is Ownable, ReentrancyGuard {
         emit BATCH(successful, failed);
     }
 
-    function swap(Data calldata arb, bool lender, uint256 builderFeeBps, uint256 validUntilBlock) external onlyOperator nonReentrant {
-        if (builderFeeBps > 2000) revert ExcessiveBuilderFee();
+    function swap(Data calldata arb, bool lender, uint256 builderFeeBps, uint256 validUntilBlock) external nonReentrant {
+        address _owner = owner(); // Cache storage variable
+        if (msg.sender != _owner && msg.sender != address(this)) revert Auth();
         if (block.number > validUntilBlock) revert Block();
-        Data memory arbMem = arb;
-        _validateArb(arbMem);
+        
+        uint256 tokensLen = arb.tokens.length;
+        if (tokensLen <= 2) revert BadPath();
+        if (arb.pools.length != tokensLen - 1) revert BadPath();
+        
+        Helper._validatePoolTokens(arb.tokens, arb.pools);
+
+        Data memory arbMem = arb; 
         uint256 profit;
         (arbMem, profit) = yieldOut(arbMem);
-        if (profit < arbMem.minProfit || profit == 0) revert NoProfit();
-        _startSwap(arbMem, lender, builderFeeBps);
-    }
-
-    /// @notice Hot path: uses the off-chain optimized amount and skips the on-chain quoter.
-    function swapFast(Data calldata arb, bool lender, uint256 builderFeeBps, uint256 validUntilBlock) external onlyOperator nonReentrant {
-        if (builderFeeBps > 2000) revert ExcessiveBuilderFee();
-        if (block.number > validUntilBlock) revert Block();
-        uint256 len = arb.tokens.length;
-        if (arb.amountIn == 0 || len <= 2 || arb.pools.length != len - 1 || arb.fees.length != len - 1) revert BadPath();
-        _validateArb(arb);
-        _startSwap(arb, lender, builderFeeBps);
-    }
-
-    function _startSwap(Data memory arbMem, bool lender, uint256 builderFeeBps) internal {
+        
         uint256 borrowAmt = arbMem.amountIn;
+
+        if (profit < arbMem.minProfit || profit == 0) revert NoProfit();
         if (borrowAmt == 0) revert AmountRequired();
+        if (arbMem.tokens[tokensLen - 1] != arbMem.tokenIn) revert BadPath();
+        
         uint256 startBalance = Helper._balanceOf(arbMem.tokenIn, address(this));
         bytes memory payload = abi.encode(arbMem, borrowAmt);
-        if (lender && BALANCER_VAULT != address(0) && arbMem.mode == 0) {
+
+        if (lender && BALANCER_VAULT != address(0)) {
             _initiateFlashloan(arbMem, borrowAmt, payload);
         } else {
             _initiateFlashswap(arbMem, borrowAmt, payload);
         }
-        _processProfit(arbMem, startBalance, builderFeeBps, owner());
+        
+        _processProfit(arbMem, startBalance, builderFeeBps, _owner);
     }
 
     function _initiateFlashloan(Data memory arb, uint256 amt, bytes memory payload) internal {
-        // The Balancer path is a direct tokenIn loan. mode=1 is the first-pool
-        // flash-swap repayment path and cannot be represented by this single-asset
-        // lender flow without changing the route execution order.
-        if (arb.mode != 0) revert BadPath();
         _expectedCallback = BALANCER_VAULT;
 
         address[] memory a = new address[](1); a[0] = arb.tokenIn;
@@ -204,14 +139,11 @@ contract Exec is Ownable, ReentrancyGuard {
     }
 
     function _initiateFlashswap(Data memory arb, uint256 borrowAmt, bytes memory payload) internal {
-        // A pool flash-swap is the mode=1 path: borrow the far-side token from
-        // pool[0], execute pool[1..], and repay pool[0] in tokenIn.
-        if (arb.mode != 1) revert BadPath();
         address pool0 = arb.pools[0];
-        address borrowToken = arb.tokens[1];
         if (Helper._isUniswapV3(pool0)) {
+            if (arb.mode == 0) revert BadPath();
             _expectedCallback = pool0;
-            bool z = (borrowToken == Helper._token0(pool0));
+            bool z = (arb.tokenIn == Helper._token0(pool0));
             uint160 sqrtLimit = z ? 4295128740 : 1461446703485210103287273052203988822378723970341;
             
             bytes memory data = abi.encode(uint8(2), arb, borrowAmt);
@@ -221,7 +153,7 @@ contract Exec is Ownable, ReentrancyGuard {
 
         IUniswapV2Pair pair = IUniswapV2Pair(pool0);
         _expectedCallback = address(pair);
-        bool isT0 = borrowToken == Helper._token0(address(pair));
+        bool isT0 = arb.tokenIn == Helper._token0(address(pair));
 
         (uint256 a0out, uint256 a1out) = isT0 ? (uint256(0), borrowAmt) : (borrowAmt, uint256(0));
 
@@ -230,46 +162,6 @@ contract Exec is Ownable, ReentrancyGuard {
             _expectedCallback = address(0);
             revert("V2 swap flash failed");
         }
-    }
-
-    function flashLoanAave(
-        address asset,
-        uint256 amount,
-        bytes32 routeId,
-        address profitToken,
-        uint256 minProfit,
-        uint256 deadline,
-        uint256 validUntilBlock,
-        Call[] calldata calls
-    ) external onlyOperator {
-        if (AAVE_POOL == address(0) || asset == address(0) || amount == 0 || profitToken != asset) revert InvalidLender();
-        if (block.timestamp > deadline) revert Block();
-        if (block.number > validUntilBlock) revert Block();
-        uint256 startBalance = Helper._balanceOf(asset, address(this));
-        _expectedCallback = AAVE_POOL;
-        bytes memory params = abi.encode(routeId, profitToken, minProfit, deadline, validUntilBlock, startBalance, calls);
-        IAaveV3Pool(AAVE_POOL).flashLoanSimple(address(this), asset, amount, params, 0);
-        _expectedCallback = address(0);
-    }
-
-    function executeOperation(
-        address asset, uint256 amount, uint256 premium, address initiator, bytes calldata params
-    ) external returns (bool) {
-        if (msg.sender != _expectedCallback || msg.sender != AAVE_POOL) revert Auth();
-        if (initiator != address(this)) revert BadAaveInitiator();
-        _expectedCallback = address(0);
-        (bytes32 routeId, address profitToken, uint256 minProfit, uint256 deadline, uint256 validUntilBlock, uint256 startBalance, Call[] memory calls) =
-            abi.decode(params, (bytes32,address,uint256,uint256,uint256,uint256,Call[]));
-        if (profitToken != asset || block.timestamp > deadline || block.number > validUntilBlock) revert Block();
-        _executeCallsMemory(calls);
-        uint256 afterBalance = Helper._balanceOf(asset, address(this));
-        uint256 owed = amount + premium;
-        if (afterBalance < startBalance + owed + minProfit) revert NoProfit();
-        Helper._safeApprove(asset, AAVE_POOL, owed);
-        uint256 profit = afterBalance - startBalance - owed;
-        Helper._safeTransfer(asset, owner(), profit);
-        emit AtomicExecuted(routeId, asset, profit);
-        return true;
     }
 
     function receiveFlashLoan(address[] memory tokens, uint256[] memory amounts, uint256[] memory feeAmounts, bytes memory userData) external {
@@ -291,9 +183,9 @@ contract Exec is Ownable, ReentrancyGuard {
         _execute(arb, borrowed, 1, 1);
         
         (uint112 r0, uint112 r1,) = IUniswapV2Pair(msg.sender).getReserves();
-        uint256 debtAmount = (arb.tokenIn == Helper._token0(msg.sender))
-            ? Helper.getAmountInV2WithFee(borrowed, r0, r1, arb.fees[0])
-            : Helper.getAmountInV2WithFee(borrowed, r1, r0, arb.fees[0]);
+        uint256 debtAmount = (arb.tokenIn == Helper._token0(msg.sender)) 
+            ? Helper.getAmountInV2(borrowed, r0, r1) 
+            : Helper.getAmountInV2(borrowed, r1, r0);
             
         Helper._safeTransfer(arb.tokenIn, msg.sender, debtAmount);        
     }
@@ -334,12 +226,12 @@ contract Exec is Ownable, ReentrancyGuard {
         uint256 pLen = arb.pools.length;
         
         for (uint i = startPoolIdx; i < pLen; ) {
-            amt = _swap(arb.pools[i], arb.tokens[startTokenIdx], arb.tokens[startTokenIdx + 1], amt, arb.fees[i]);
+            amt = _swap(arb.pools[i], arb.tokens[startTokenIdx], arb.tokens[startTokenIdx + 1], amt);
             unchecked { ++i; ++startTokenIdx; }
         }
     }
 
-    function _swap(address pool, address tokenIn, address tokenOut, uint256 amountIn, uint24 feePip) internal returns (uint256 out) {
+    function _swap(address pool, address tokenIn, address tokenOut, uint256 amountIn) internal returns (uint256 out) {
         if (Helper._isUniswapV3(pool)) {
             bool z = (tokenIn == Helper._token0(pool));
             uint160 sqrtLimit = z ? 4295128740 : 1461446703485210103287273052203988822378723970341;
@@ -353,7 +245,7 @@ contract Exec is Ownable, ReentrancyGuard {
         (uint112 r0, uint112 r1,) = p2.getReserves();
         address t0 = Helper._token0(pool);
         
-        out = (tokenIn == t0) ? Helper.getAmountOutV2WithFee(amountIn, r0, r1, feePip) : Helper.getAmountOutV2WithFee(amountIn, r1, r0, feePip);
+        out = (tokenIn == t0) ? Helper.getAmountOutV2(amountIn, r0, r1) : Helper.getAmountOutV2(amountIn, r1, r0);
         Helper._safeTransfer(tokenIn, pool, amountIn);
         
         (uint256 out0, uint256 out1) = (tokenOut == t0) ? (out, uint256(0)) : (uint256(0), out);
@@ -395,50 +287,6 @@ contract Exec is Ownable, ReentrancyGuard {
         }
     }
 
-    function _executeCallsMemory(Call[] memory calls) internal {
-        for (uint256 i; i < calls.length; ) {
-            Call memory c = calls[i];
-            if (!allowedTargets[c.target] || c.data.length < 4) revert InvalidTarget();
-            bytes4 selector;
-            assembly { selector := shr(224, mload(add(c.data, 32))) }
-            if (!allowedSelectors[c.target][selector]) revert SelectorNotAllowed();
-            (bool ok, bytes memory reason) = c.target.call{value: c.value}(c.data);
-            if (!ok) revert CallFailed(i, reason);
-            unchecked { ++i; }
-        }
-    }
-
-    function executeAtomic(
-        bytes32 routeId, address profitToken, uint256 minProfit, uint256 deadline, uint256 validUntilBlock, Call[] calldata calls
-    ) external onlyOperator returns (uint256 profit) {
-        if (block.timestamp > deadline) revert Block();
-        if (block.number > validUntilBlock) revert Block();
-        uint256 beforeBalance = Helper._balanceOf(profitToken, address(this));
-        for (uint256 i; i < calls.length; ) {
-            Call calldata c = calls[i];
-            if (!allowedTargets[c.target] || c.data.length < 4) revert InvalidTarget();
-            bytes4 selector;
-            assembly { selector := calldataload(c.data.offset) }
-            if (!allowedSelectors[c.target][selector]) revert SelectorNotAllowed();
-            (bool ok, bytes memory reason) = c.target.call{value: c.value}(c.data);
-            if (!ok) revert CallFailed(i, reason);
-            unchecked { ++i; }
-        }
-        uint256 afterBalance = Helper._balanceOf(profitToken, address(this));
-        if (afterBalance < beforeBalance + minProfit) revert NoProfit();
-        profit = afterBalance - beforeBalance;
-        Helper._safeTransfer(profitToken, owner(), profit);
-        emit AtomicExecuted(routeId, profitToken, profit);
-    }
-
-    function multiCallAtomic(bytes[] calldata calls) external onlyOperator {
-        for (uint256 i; i < calls.length; ) {
-            (bool ok, bytes memory reason) = address(this).call(calls[i]);
-            if (!ok) revert CallFailed(i, reason);
-            unchecked { ++i; }
-        }
-    }
-
     function yieldOut(Data memory arb) public view returns (Data memory ad, uint256 profit) {
         ad = _determineBorrow(arb);
         uint256 pLen = ad.pools.length;
@@ -456,8 +304,8 @@ contract Exec is Ownable, ReentrancyGuard {
             } else {
                 (uint112 r0, uint112 r1,) = IUniswapV2Pair(pool).getReserves();
                 current = (ad.tokens[i] == Helper._token0(pool)) 
-                    ? Helper.getAmountOutV2WithFee(current, r0, r1, ad.fees[i])
-                    : Helper.getAmountOutV2WithFee(current, r1, r0, ad.fees[i]);
+                    ? Helper.getAmountOutV2(current, r0, r1) 
+                    : Helper.getAmountOutV2(current, r1, r0);
             }
             unchecked { ++i; }
         }
@@ -474,8 +322,8 @@ contract Exec is Ownable, ReentrancyGuard {
             } else {
                 (uint112 r0, uint112 r1,) = IUniswapV2Pair(p0).getReserves();
                 debt = (ad.tokens[0] == Helper._token0(p0)) 
-                    ? Helper.getAmountInV2WithFee(ad.amountIn, r0, r1, ad.fees[0])
-                    : Helper.getAmountInV2WithFee(ad.amountIn, r1, r0, ad.fees[0]);
+                    ? Helper.getAmountInV2(ad.amountIn, r0, r1) 
+                    : Helper.getAmountInV2(ad.amountIn, r1, r0);
             }
             profit = current > debt ? current - debt : 0;
         }
@@ -489,18 +337,6 @@ contract Exec is Ownable, ReentrancyGuard {
         }
         arb.amountIn = Helper.calcOptimalBorrow(Quoter, arb.pools, arb.tokens, arb.fees, arb.mode);
         return arb;
-    }
-
-    function _validateArb(Data memory arb) internal view {
-        uint256 len = arb.tokens.length;
-        if (len <= 2 || arb.pools.length != len - 1 || arb.fees.length != len - 1) revert BadPath();
-        if (arb.tokenIn == address(0) || arb.tokens[0] != arb.tokenIn || arb.tokens[len - 1] != arb.tokenIn) revert BadPath();
-        if (arb.mode > 1) revert BadPath();
-        for (uint256 i; i < arb.fees.length; ) {
-            if (arb.fees[i] >= 1_000_000) revert BadPath();
-            unchecked { ++i; }
-        }
-        Helper._validatePoolTokens(arb.tokens, arb.pools);
     }
 
     function withdraw(address token, uint256 amount) external onlyOwner {

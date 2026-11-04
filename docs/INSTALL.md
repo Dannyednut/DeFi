@@ -50,16 +50,29 @@ python -m pytest tests \
   -p no:cacheprovider -ra
 ```
 
-- Expected result: **22 failed, 86 passed, 1 error** — the pre-existing
-  baseline failures are classified in `docs/DEPENDENCIES.md` §6 and are being
-  addressed by later work orders. They are not hidden by CI.
+- Expected result: **20 failed, 91 passed, 1 error** — the pre-existing
+  baseline failures are classified in `docs/DEPENDENCIES.md` §6 (ENG-002
+  register) and are being addressed by later work orders. They are not
+  hidden by CI.
+- The suite includes the Exec contract alignment tests
+  (`tests/test_exec_contract_alignment.py`), which compile the authoritative
+  Solidity sources. That requires the npm-pinned OpenZeppelin package and a
+  network fetch of the checksum-verified solc binary on first use:
+
+```bash
+npm ci --prefix contracts   # pinned @openzeppelin/contracts 5.7.0
+```
+
+  `scripts/exec_build.py` provisions solc `0.8.28+commit.7893614a` and
+  refuses to compile on SHA-256 mismatch (see `contracts/PROVENANCE.md`).
+  Without `node_modules` installed the compilation tests fail with a clear
+  setup message — they are never silently skipped.
 - `tests/test_flashbots_integration.py` is a module-level manual script that
   **signs and broadcasts a real transaction**; it must never be run by
   automation (see the failure register).
 - `tests/test_multicall3_yieldout.py` depends on a local runtime artifact and
   a live RPC endpoint; it cannot pass on a clean clone.
-- For the full baseline comparison, run without the second `--ignore`
-  (expected: 23 failed, 86 passed, 1 error).
+- For the full baseline comparison, run without the second `--ignore`.
 
 ## 5. Regenerating the lock files (after editing the `.in` files)
 
@@ -82,7 +95,23 @@ pip-tools 7.6.2 on 2026-11-04 (DSS-WO-ENG-001A).
 - No `.env` file is required for installation, imports or the test suite.
 - The system defaults to simulation/paper mode; `EXECUTE_ONCHAIN` remains
   disabled unless explicitly enabled by an operator through configuration
-  (see `config.py`). This work order did not change any execution behavior.
+  (see `config.py`). DSS-WO-ENG-002 removed only the retired
+  AtomicArbExecutor backend; the active Exec route, its fail-closed gates
+  and the EXECUTE_ONCHAIN handling are unchanged.
 - `executor/relay_signer.json` (Flashbots authentication identity) is no
   longer tracked in the repository; it is generated locally on first use of
   the relay path and is git-ignored.
+
+## 7. Contract alignment (DSS-WO-ENG-002)
+
+- The active contract is the authoritative `contracts/Exec.sol` sourced from
+  `Dannyednut/EVM` at pinned commit `898fe82f29a5695a01278365eb442ab3a26811b5`
+  (provenance and per-file blob SHAs: `contracts/PROVENANCE.md`).
+- The separate `AtomicArbExecutor` contract is retired: its ABI, generic
+  backend, `ATOMIC_EXECUTOR_*` configuration and the old variant's
+  `swapFast`/extended selection were removed. Deployment addresses are read
+  only from `ARB_EXEC_ADDRESS_*`; missing configuration fails closed.
+- To regenerate the committed ABI artifact:
+  `npm ci --prefix contracts && python scripts/exec_build.py`
+  (`--check` verifies the committed `executor/exec_abi.json` against a fresh
+  compilation without writing).

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from config import ARB_EXEC_ABI, get_chain, get_extended_arb_exec_address
+from config import ARB_EXEC_ABI, get_chain
 from log import get_logger
 
 log = get_logger("opportunity_validation")
@@ -37,7 +37,7 @@ class OpportunityValidator:
         self.w3 = w3
         self.chain_id = int(chain_id)
         chain = get_chain(self.chain_id)
-        address = get_extended_arb_exec_address(self.chain_id) or chain.arb_exec_address
+        address = chain.arb_exec_address
         self.address = address
         self.contract = None
         if address:

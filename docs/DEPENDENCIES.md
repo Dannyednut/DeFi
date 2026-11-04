@@ -54,7 +54,7 @@ Residual risk: the test suite is heavily mocked; web3 6-vs-7 differences on *liv
 
 - Generated with **pip-tools 7.6.2** (`pip-compile --generate-hashes --strip-extras`) running under CPython 3.11.18. Regeneration must use this exact pip-tools version; byte-identical reproduction of both committed locks from the committed `.in` files was verified with pip-tools 7.6.2 on 2026-11-04 (DSS-WO-ENG-001A).
 - `requirements.txt`: 61 pinned distributions, every one with `--hash=sha256:` entries (2,410 hash lines).
-- `requirements-dev.txt`: 65 pinned distributions (adds pytest + its runner deps).
+- `requirements-dev.txt`: 66 pinned distributions (adds pytest + its runner deps + py-solc-x 2.1.0 for the Exec contract compilation tests, DSS-WO-ENG-002; runtime lock unchanged).
 - Install with hash enforcement: `pip install --require-hashes -r requirements-dev.txt`.
 - What the locks guarantee: exact pinned versions plus SHA-256 artifact verification at install time (`--require-hashes`). They do **not** guarantee identical binary artifacts across operating systems — wheels are platform-specific; reproducibility is scoped to the resolved versions and hash-verified artifacts on each platform.
 - pytest pinned to the 9.x line because the DSS-MISSION-001 baseline register was produced under pytest 9.x accounting (unittest subTest failures counted individually); keeps CI counts directly comparable.
@@ -72,36 +72,30 @@ Fresh CPython 3.11.18 venv, pip wheel cache disabled (`--no-cache-dir`), both lo
 
 No previously cached packages or local state were involved (standalone interpreter + `--no-cache-dir`).
 
-## 6. Classified failure register (24 units across 21 test functions + 1 uncollectable file)
+**DSS-WO-ENG-002 update (2026-11-04):** the separate AtomicArbExecutor contract and the old in-repo Exec variant were retired by the Principal, and the repository was aligned with the authoritative `Exec.sol` from Dannyednut/EVM at pinned commit `898fe82f29a5695a01278365eb442ab3a26811b5`. The suite was re-run in this environment after the alignment: **20 failed, 91 passed, 1 error** (112 counted units, CI scope) — see §8. Items 4–5 above are the historical ENG-001 records.
 
-Accounting note: 105 test functions; unittest `subTest` failures are counted individually by pytest 9, giving 110 counted units (86 passed / 23 failed / 1 error).
+## 6. Classified failure register
 
-### A. Stale or invalid tests — API drift between test code and current production code (16 units / 13 functions; offline, deterministic)
-| Test | Symptom | Root cause |
+### ENG-002 register (current; 21 units across 18 test functions, CI scope: 20 failed + 1 error = 21 of 112 units)
+
+| Category | Tests | Root cause |
 | --- | --- | --- |
-| tests/test_relay.py — `TestRelayFlashbots` (8 functions) | `TypeError: _relay_flashbots() got multiple values for argument 'target_block'` | tests target a removed signature: `chain_id` positional + `relay_signer=` kwarg no longer exist; the fail-closed relay redesign removed the public-fallback behavior the tests assert |
-| tests/test_relay.py — `TestRelayTransaction` (2 functions → 5 subTest units) | `TypeError: relay_transaction() got an unexpected keyword argument 'relay_signer'` | same signature drift |
-| tests/test_shadow_audit.py::test_shadow_detection | `TypeError: OutcomeResolver._audit_shadow_trades() takes 3 positional arguments but 4 were given` | resolver API drift |
-| tests/test_decoder.py::test_decode_v3_exact_input_single | `AttributeError: 'DecodedSwap' object has no attribute 'v3_fees'` | dataclass field removed/renamed |
-| tests/test_liquidation.py::test_detect_at_risk_position | `TypeError: LiquidationScanner.__init__() missing 1 required positional argument: 'chain_id'` | chain-awareness refactor |
-| tests/test_optimizer.py::test_get_optimal_amount (**error**) | `fixture 'mode' not found` | test references a pytest fixture that is defined nowhere (broken test infrastructure) |
+| Stale relay tests — API drift (13 units) | `tests/test_relay.py` `TestRelayFlashbots` (8) + `TestRelayTransaction` (2 → 5 subTest units) | tests target a removed `relay_signer=`/`chain_id` signature and public-fallback behavior the fail-closed relay redesign removed |
+| Stale detector/forensics tests — API drift (3) | `test_shadow_audit.py::test_shadow_detection`, `test_decoder.py::test_decode_v3_exact_input_single`, `test_liquidation.py::test_detect_at_risk_position` | resolver/decoder/scanner API drift |
+| Broken test infrastructure (1 **error**) | `test_optimizer.py::test_get_optimal_amount` | references a pytest fixture (`mode`) defined nowhere |
+| Deterministic functional failures (4) | `test_cycle_detector.py::test_triangular_arbitrage`, `test_discovery.py::test_discover_v2`, `test_integration_arb_discovery.py::test_pipeline_discovers_and_simulates`, `test_simulator_flow.py::test_cross_dex_token_returns_arb` | detector/simulation logic on synthetic graphs (DSS-MISSION-001 findings) |
 
-### B. Dependency / artifact failures (1 unit; deterministic)
-| Test | Symptom | Root cause |
-| --- | --- | --- |
-| tests/test_phase12_atomic_executor.py::test_atomic_executor_source_exists_and_is_fail_closed | `FileNotFoundError: contracts/AtomicArbExecutor.sol` | contract source absent from repository (identified in DSS-MISSION-001 as F2/F3); restoration is explicitly out of scope for ENG-001 (awaiting the contract-restoration work order) |
+Changes vs the ENG-001 register, all caused by the ENG-002 retirement/alignment:
 
-### C. Deterministic functional failures — detector/simulation logic on synthetic graphs (5 units)
-| Test | Symptom |
-| --- | --- |
-| tests/test_cycle_detector.py::test_triangular_arbitrage | `AssertionError: False is not true` (no cycle found on synthetic graph) |
-| tests/test_discovery.py::test_discover_v2 | `AssertionError: False is not true` |
-| tests/test_integration_arb_discovery.py::test_pipeline_discovers_and_simulates | expected synthetic pool missing from graph |
-| tests/test_multicall3_yieldout.py — *(reclassified, see D)* | — |
-| tests/test_simulator_flow.py::test_cross_dex_token_returns_arb | simulator returned no opportunity (`assert None is not None`) |
-| tests/test_phase13_arbexec_adapter.py::test_arbexec_abi_matches_supplied_four_argument_swap | adapter ABI parameter mismatch (DSS-MISSION-001 F6 calldata/ABI drift) |
+- **Fixed:** `tests/test_phase13_arbexec_adapter.py::test_arbexec_abi_matches_supplied_four_argument_swap` — `config.ARB_EXEC_ABI` is now generated-aligned with the authoritative 4-argument `swap(arb, lender, builderFeeBps, validUntilBlock)` (the old entry encoded a 3-argument variant).
+- **Removed with the retired contract** (`AtomicArbExecutor` + old Exec variant): the Phase 12 contract-existence tests (including the B-category `FileNotFoundError` failure), the Phase 14 string-presence tests (`swapFast`/`flashLoanAave`/`executeAtomic`/`multiCallAtomic`/operator allow-lists), and three Phase 15 string-presence tests asserting the old variant's fee-aware V2 internals. Replaced by `tests/test_exec_contract_alignment.py` (15 tests: real compilation, ABI conformance, Python encoding, fail-closed behaviour).
+- **Unchanged:** all remaining A/C-category failures above (pre-existing, owned by later work orders).
 
-### D. Network / environment-dependent tests — excluded from CI (2 files)
+### Historical ENG-001 register (kept for traceability; superseded by the ENG-002 register above)
+
+Baseline scope then: 23 failed / 86 passed / 1 error; CI scope: 22 failed / 86 passed / 1 error (109 units). Category B (the `AtomicArbExecutor` contract-existence failure) and the `test_phase13` ABI mismatch are gone for the reasons above.
+
+### Excluded from CI (2 files, unchanged)
 | Test | Why it cannot run in CI |
 | --- | --- |
 | tests/test_flashbots_integration.py (**uncollectable**; the "+1" of the baseline) | Lines 192–255 are a module-level manual script: loads `PRIVATE_KEY` from `.env`, signs a real transfer, then calls `w3.flashbots.simulate(...)` and **`w3.flashbots.send_private_transaction(...)`** against the Sepolia relay — a real broadcast. Without `flashbots` it fails at import; with it, it fails on the missing key. Excluded from all pytest runs; it must never be executed by automation. Flagged for rewrite as a proper skip-gated integration test in a future work order. |
@@ -109,13 +103,23 @@ Accounting note: 105 test functions; unittest `subTest` failures are counted ind
 
 Also inspected: `tests/test_mc3.py` defines no pytest-collectable tests (manual script under `__main__`) — contributes 0 tests, harmless.
 
-### Reconciliation
+### Reconciliation (ENG-002 actuals)
 
-- 105 test functions = 84 passing + 20 failing + 1 error.
-- pytest 9 units = 86 passing + 23 failing + 1 error (the two `TestRelayTransaction` tests contribute 2 function-failures that expand to 5 subTest units).
-- `tests/test_flashbots_integration.py` is the baseline's "1 uncollectable file" (excluded everywhere).
-- Baseline scope: 23F/86P/1E — **matches DSS-MISSION-001 exactly**. CI scope: 22F/86P/1E.
+- CI scope: 112 pytest units = **91 passing + 20 failing + 1 error**; 0 skipped. Baseline scope (without the second `--ignore`) remains 1 unit higher via the excluded environment-dependent test.
+- `tests/test_flashbots_integration.py` remains the uncollectable file excluded everywhere.
+- Historical ENG-001 reconciliation: 105 test functions = 84 passing + 20 failing + 1 error; pytest 9 units = 86 + 23 + 1.
 
-## 7. Explicit non-goals honored
+## 7. Explicit non-goals honored (ENG-001)
 
-No detector, contract, execution or strategy logic was modified in this work order; dependency/CI changes only. `EXECUTE_ONCHAIN` handling untouched. Fixing the register entries above belongs to later work orders (contract restoration, test repair).
+No detector, contract, execution or strategy logic was modified in ENG-001; dependency/CI changes only. `EXECUTE_ONCHAIN` handling untouched. Fixing the register entries above belongs to later work orders (contract restoration, test repair).
+
+## 8. DSS-WO-ENG-002 — authoritative Exec alignment
+
+Per the Principal's direction, the separate `AtomicArbExecutor` contract is **retired** (not restored), and the active contract is the authoritative `Exec.sol` sourced from `Dannyednut/EVM`:
+
+- **Pinned provenance:** commit `898fe82f29a5695a01278365eb442ab3a26811b5`; all seven contract files (Exec.sol, Helper.sol, five interfaces) copied byte-for-byte and re-verified by git blob SHA (`contracts/PROVENANCE.md`, mechanically checked by tests). The DeFi Exec copy (5-argument constructor `(_w, _q, _b, _aave, initialOperator)`) was replaced by the authoritative 3-argument `constructor(_w, _q, _b)` version — the variants were never combined.
+- **Removed:** `executor/atomic_executor_abi.json`, `ATOMIC_EXECUTOR_ABI_PATH`, `_atomic_contract()`, `build_atomic_executor()`, the generic `executeAtomic` backend and its `backend="generic"` branches, `config.get_atomic_executor_address()` and all `ATOMIC_EXECUTOR_*` environment configuration, `config.get_extended_arb_exec_address()` and the `swapFast` extended selection (`ARB_EXEC_EXTENDED_ADDRESS_*`), and `executor/exec_extended_abi.json` (unused by any code; referenced only by a removed test).
+- **Preserved:** `execution/atomic.py` plan/route compilation, preflight simulation, exact envelope construction, chain-ID validation and fail-closed behaviour; `ArbExecRoute`/`build_arbexec_route` adapter; all `ARB_EXEC_ADDRESS_*` deployment configuration (no addresses invented).
+- **ABI:** `executor/exec_abi.json` is compiler-generated from the pinned source with solc `0.8.28+commit.7893614a` (SHA-256 verified against the official solc-bin checksum) and OpenZeppelin 5.7.0 exactly (`contracts/package-lock.json`). `config.ARB_EXEC_ABI` conforms to the generated interface, enforced by tests.
+- **Solidity versions:** source pragmas `^0.8.19` (Exec) / GPL-2.0-or-later Helper; compiler pinned as above; OZ 5.7.0 (required for the OZ-v5 `Ownable(initialOwner)` constructor style).
+- **New baseline (CI scope):** **20 failed / 91 passed / 1 error** (112 units) — see §6.

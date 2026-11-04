@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from cache import PoolCache
 
 from config import (
-    get_chain, ARB_EXEC_ABI, get_extended_arb_exec_address,
+    get_chain, ARB_EXEC_ABI,
     NATIVE_PRICE_USD, MIN_PROFIT_USD,
     DEFAULT_GAS_UNITS, GAS_MULTIPLIER,
 )
@@ -26,7 +26,7 @@ from executor.builder import build_arb_data
 from log import get_logger
 log = get_logger("base")
 
-ARB_EXEC_ADDRESS = get_extended_arb_exec_address(get_chain().chain_id) or get_chain().arb_exec_address
+ARB_EXEC_ADDRESS = get_chain().arb_exec_address
 
 class BaseDetector(ABC):
     """Base class for all opportunity detectors."""

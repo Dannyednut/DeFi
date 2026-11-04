@@ -45,10 +45,12 @@ def summarize(path: Path) -> str:
         f"- passed: **{passed}** | failed: **{failures}** | errors: **{errors}** | skipped: **{skipped}**",
         "",
         "Reference points (see docs/DEPENDENCIES.md failure register):",
-        "- DSS-MISSION-001 baseline (excluding tests/test_flashbots_integration.py): "
-        "23 failed, 86 passed, 1 error.",
-        "- Expected for this CI scope (additionally excluding the environment-dependent "
-        "tests/test_multicall3_yieldout.py): 22 failed, 86 passed, 1 error.",
+        "- DSS-WO-ENG-002 actual baseline for this CI scope (after retiring the "
+        "separate AtomicArbExecutor and aligning with the authoritative Exec "
+        "from Dannyednut/EVM @ 898fe82f): 20 failed, 91 passed, 1 error.",
+        "- Historical DSS-WO-ENG-001 CI scope (pre-retirement): 22 failed, "
+        "86 passed, 1 error; DSS-MISSION-001 original baseline: 23 failed, "
+        "86 passed, 1 error.",
         "- These are pre-existing baseline failures; the job stays red until later work "
         "orders fix them. No failure is skipped or hidden by CI.",
         "",

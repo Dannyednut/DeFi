@@ -1702,6 +1702,7 @@ packaging==26.3 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
     # via
     #   matplotlib
+    #   py-solc-x
     #   pytest
 pandas==2.3.3 \
     --hash=sha256:0242fe9a49aa8b4d78a4fa03acb397a58833ef6199e9aa40a95f027bb3a1b6e7 \
@@ -2009,6 +2010,10 @@ py-ecc==8.0.0 \
     --hash=sha256:56aca19e5dc37294f60c1cc76666c03c2276e7666412b9a559fa0145d099933d \
     --hash=sha256:c0b2dfc4bde67a55122a392591a10e851a986d5128f680628c80b405f7663e13
     # via eth-keyfile
+py-solc-x==2.1.0 \
+    --hash=sha256:4bf45aa96c29ed0a3654dcb6951f0f14c648d2be3f938260babbbd1ace6dde04 \
+    --hash=sha256:aa78ea0ae6df87729280532400d7529a3d881dbe4e77db27ea173a7ce6329a05
+    # via -r requirements-dev.in
 pycryptodome==3.24.1 \
     --hash=sha256:0003d83a044639d3f7442bb3282db83ab8cf0b3977bb44d4018aacc2f901e839 \
     --hash=sha256:03cc4a9be177c323425b1204884c1bae3195061d7348e27f6a150833a8e3bf1a \
@@ -2229,6 +2234,7 @@ requests==2.34.2 \
     --hash=sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed
     # via
     #   -r requirements.in
+    #   py-solc-x
     #   web3
 rlp==5.0.0 \
     --hash=sha256:9525fb895d3a6540b7401eadd11c1b64740a5eccb82e543ac7e9735d319b0977 \

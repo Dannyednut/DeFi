@@ -9,3 +9,6 @@ graph_data.json
 # DSS-WO-ENG-001: local test/tooling artifacts
 .pytest_cache/
 .venv/
+
+# Solidity toolchain (DSS-WO-ENG-002): npm-installed compiler deps
+node_modules/

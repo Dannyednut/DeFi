@@ -1,255 +1,413 @@
-# """
-# tests/test_flashbots_integration.py
-# =====================================
-# Integration test for Flashbots relay with a real simple transfer transaction.
+"""
+tests/test_flashbots_integration.py
+====================================
+OPT-IN Flashbots Sepolia integration test — DSS agent wallet only, through
+the unified testnet gate (DSS-WO-ENG-004).
 
-# This script:
-# 1. Connects to Sepolia testnet (chain_id=11155111)
-# 2. Builds a simple ETH transfer transaction
-# 3. Signs it with your PRIVATE_KEY from .env
-# 4. Submits via Flashbots relay
+History and safety contract:
 
-# Run with: python tests/test_flashbots_integration.py
-# """
+1. The ORIGINAL version of this file executed at IMPORT time — it loaded
+   PRIVATE_KEY from .env, built a signer, dialed a live RPC, signed a
+   transaction, simulated a bundle and BROADCAST it via
+   eth_sendPrivateTransaction. Collecting the file was enough to move
+   money. That script was removed in DSS-WO-ENG-003 (Workstream B) and the
+   replacement was rewritten again for DSS-WO-ENG-004: importing or
+   collecting this module performs NO key loading, NO network activity and
+   NO signing. Only stdlib + already-installed package imports run at
+   module level.
+
+2. Everything is disabled by default. Live tests skip visibly with their
+   reason unless every required testnet-only flag and credential is
+   present (see _skip_reason()).
+
+3. SINGLE wallet path (DSS-WO-ENG-004 §2): the wallet is loaded EXCLUSIVELY
+   by executor.testnet_gate.load_agent_wallet from the DSS secure store
+   (encrypted v3 keystore + hex-encoded passphrase file). This file has no
+   key-handling code of its own — no direct keystore decryption call, no
+   legacy key access, no .env reading, no passphrase environment override,
+   no keystore-path override. There is no code path to any other wallet.
+
+4. Authorization lives in the gate (DSS-WO-ENG-004 §3): every live
+   operation goes through prepare_flashbots_bundle → FlashbotsBundleSession,
+   which enforces wallet identity binding, the Sepolia-only production
+   allowlist, mainnet hard rejection, RPC chain-ID verification before
+   signing and immediately before submission, transaction policy (incl.
+   monetary fee-exposure caps) and audit records. The relay is a transport
+   only; it never creates an independent authorization path.
+
+5. Simulation-before-submission is ENFORCED IN PRODUCTION CODE
+   (DSS-WO-ENG-004 §4): FlashbotsBundleSession.submit refuses to call the
+   relay unless the same session previously simulated the EXACT signed
+   payload for the EXACT target block successfully, the target block is
+   still in the future and the chain identity still matches.
+
+6. The test transaction is a 0-value self-transfer from the agent wallet
+   to itself: no third party can receive anything, and the only possible
+   cost is gas on testnet ETH, bounded by the gate's monetary fee caps.
+
+7. CI never signs, broadcasts, deploys or submits: CI provides none of the
+   required flags or credentials, so both live tests skip.
+
+Endpoint provenance (verified 2026-11-04): the Sepolia bundle relay
+https://relay-sepolia.flashbots.net is the currently documented Flashbots
+testnet relay (docs.flashbots.net, "Flashbots Auction > Testnets", page
+last updated 2025-12-16). No endpoint is invented here; if Flashbots
+withdraws Sepolia support, the live run will fail at the relay and this
+file's documentation must be updated rather than silently pointed
+elsewhere.
+
+Gating environment variables (agent runtime only, never set in CI):
+    DSS_TESTNET_FLASHBOTS_LIVE=1        opt in to live testnet interaction
+    DSS_TESTNET_RPC_URL=<https url>     Sepolia RPC endpoint
+    DSS_TESTNET_EXEC=1                  submission gate (simulation-only
+                                        without it; the gate checks it at
+                                        submit() time)
+
+There is deliberately NO environment variable for the keystore path, the
+passphrase or any alternative wallet: the recorded DSS agent identity
+cannot be bypassed (DSS-WO-ENG-004 §2 reqs 5–6).
+"""
+import json
 import os
 import sys
-# import requests
-# import json
+import tempfile
+import unittest
+from unittest.mock import MagicMock
 
-# # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# from web3 import Web3
-# from eth_account import Account
-from dotenv import load_dotenv
+from eth_account import Account  # noqa: F401 — throwaway keys for offline tests
 
-# from executor.relay import relay_transaction, FLASHBOTS_RPCS
-# from config import get_alchemy_http_url, CHAIN_ID
+from executor.testnet_gate import (
+    FLASHBOTS_SEPOLIA_RELAY,
+    MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
+    MAX_TESTNET_TX_FEE_WEI,
+    TestnetExecutionConfig,
+    TestnetSafetyError,
+    prepare_flashbots_bundle,
+    verify_secret_store,
+)
 
-# # Load environment variables
-load_dotenv()
+SEPOLIA_CHAIN_ID = 11155111
 
-# # Test configuration
-TEST_CHAIN_ID = 11155111  # Sepolia testnet
-RECIPIENT_ADDRESS = "0x0000000000000000000000000000000000000000"  #
-TRANSFER_AMOUNT_ETH = 0.0001  # Small amount for testing
-
-
-# def test_flashbots_with_real_transfer():
-#     """Build and submit a real ETH transfer via Flashbots."""
-#     print("=" * 60)
-#     print("Flashbots Integration Test - Simple ETH Transfer")
-#     print("=" * 60)
-
-#     # Get private key from environment
-#     private_key = os.getenv("PRIVATE_KEY", "").strip()
-#     if not private_key:
-#         print("ERROR: PRIVATE_KEY not found in .env")
-#         return False
-
-#     # Create account from private key
-#     account = Account.from_key(private_key)
-#     sender_address = account.address
-#     print(f"Sender address: {sender_address}")
-#     print(f"Chain ID: {TEST_CHAIN_ID} (Sepolia)")
-
-#     # Connect to Sepolia RPC
-#     rpc_url = get_alchemy_http_url(TEST_CHAIN_ID)
-#     w3 = Web3(Web3.HTTPProvider(rpc_url))
-
-#     if not w3.is_connected():
-#         print(f"ERROR: Failed to connect to RPC: {rpc_url}")
-#         return False
-
-#     print(f"Connected to RPC: {rpc_url}")
-#     print(f"Current block: {w3.eth.block_number}")
-
-#     # Check sender balance
-#     balance = w3.eth.get_balance(sender_address)
-#     balance_eth = w3.from_wei(balance, "ether")
-#     print(f"Sender balance: {balance_eth:.6f} ETH")
-
-#     if balance == 0:
-#         print("ERROR: Sender has no ETH for gas fees")
-#         print(f"Please fund the address: {sender_address}")
-#         return False
-
-#     # Build a simple ETH transfer transaction
-#     transfer_amount_wei = w3.to_wei(TRANSFER_AMOUNT_ETH, "ether")
-#     nonce = w3.eth.get_transaction_count(sender_address, "pending")
-
-#     # Get gas pricing
-#     latest = w3.eth.get_block("latest")
-#     base_fee = latest.get("baseFeePerGas", w3.eth.gas_price)
-#     priority_fee = w3.to_wei(1, "gwei")  # 1 gwei priority fee
-#     max_fee = int(base_fee * 1.5) + priority_fee
-
-#     tx = {
-#         "to": RECIPIENT_ADDRESS,
-#         "value": transfer_amount_wei,
-#         "gas": 21000,  # Standard transfer gas limit
-#         "maxFeePerGas": max_fee,
-#         "maxPriorityFeePerGas": priority_fee,
-#         "nonce": nonce,
-#         "chainId": TEST_CHAIN_ID,
-#         "type": 2,  # EIP-1559
-#     }
-
-#     print("\n" + "-" * 60)
-#     print("Transaction Details:")
-#     print("-" * 60)
-#     print(f"  To: {RECIPIENT_ADDRESS}")
-#     print(f"  Value: {TRANSFER_AMOUNT_ETH} ETH ({transfer_amount_wei} wei)")
-#     print(f"  Gas Limit: {tx['gas']}")
-#     print(f"  Max Fee: {w3.from_wei(max_fee, 'gwei'):.2f} gwei")
-#     print(f"  Priority Fee: {w3.from_wei(priority_fee, 'gwei'):.2f} gwei")
-#     print(f"  Nonce: {nonce}")
-
-#     # Sign the transaction
-#     signed_tx = account.sign_transaction(tx)
-#     raw_tx = signed_tx.rawTransaction
-
-#     print(f"\nSigned transaction hash: {signed_tx.hash.hex()}")
-#     print(f"Raw transaction length: {len(raw_tx)} bytes")
-
-#     # Ask for confirmation before simulating
-#     print("\n" + "=" * 60)
-#     confirm = input("Simulate bundle via Alchemy? (yes/no): ").strip().lower()
-#     if confirm not in ("yes", "y"):
-#         print("Simulation cancelled by user")
-#         return False
-
-#     # Simulate via Alchemy
-#     alchemy_url = get_alchemy_http_url(TEST_CHAIN_ID)
-#     print(f"\nSubmitting eth_call to Alchemy...")
-
-#     try:
-#         # Using eth_call via w3 provider
-#         tx_dict = {
-#             "from": sender_address,
-#             "to": tx["to"],
-#             "value": tx["value"],  # eth_call takes integer values
-#             "gas": tx["gas"],
-#             "maxFeePerGas": tx["maxFeePerGas"],
-#             "maxPriorityFeePerGas": tx["maxPriorityFeePerGas"]
-#         }
-        
-#         # eth_call will raise an exception if the transaction reverts
-#         try:
-#             result = w3.eth.call(tx_dict)
-#             success = True
-#             result_hex = result.hex()
-#         except Exception as sim_err:
-#             success = False
-#             result_hex = str(sim_err)
-
-#         print("\n" + "=" * 60)
-#         print("eth_call Simulation Result:")
-#         print("=" * 60)
-#         print(f"Status: {'Success' if success else 'Reverted'}")
-#         print(f"Output: {result_hex}")
-        
-#         if not success:
-#             print("\n[X] Simulation failed")
-#             return False
-#         else:
-#             print("\n[OK] Simulation successful!")
-#             return True
-
-#     except Exception as e:
-#         print(f"\n[X] Error during simulation: {e}")
-#         import traceback
-#         traceback.print_exc()
-#         return False
+# The test transaction moves zero value. Gas on Sepolia ETH is the only
+# possible expenditure, and only from the DSS agent wallet.
+SELF_TRANSFER_VALUE_WEI = 0
 
 
-# def main():
-#     """Run integration tests."""
-#     print("\nFlashbots Relay Integration Test\n")
+def _skip_reason() -> str | None:
+    """Return a human-readable skip reason, or None if fully provisioned.
 
-#     # Show comparison info
-#     print("\nAlchemy bundle simulation mode activated.")
-
-#     # Ask if user wants to submit real transaction
-#     print("\n" + "=" * 60)
-#     print("This will submit a real transaction to Sepolia testnet!")
-#     print("Make sure your wallet has Sepolia ETH for gas fees.")
-#     print("=" * 60)
-
-#     choice = input("\nRun real Alchemy bundle simulation? (yes/no): ").strip().lower()
-#     if choice in ("yes", "y"):
-#         success = test_flashbots_with_real_transfer()
-#         sys.exit(0 if success else 1)
-#     else:
-#         print("Test skipped. Run with 'yes' to submit a real simulation.")
-#         sys.exit(0)
-
-
-# if __name__ == "__main__":
-#     main()
+    Touches only local files and environment flags — no network, no keys.
+    """
+    if os.environ.get("DSS_TESTNET_FLASHBOTS_LIVE") != "1":
+        return (
+            "opt-in live testnet test: set DSS_TESTNET_FLASHBOTS_LIVE=1 "
+            "(never set in CI)"
+        )
+    # Secret store presence + permissions through the gate's custody check.
+    # The config carries no RPC URL yet; verify only the secret-store part.
+    probe = TestnetExecutionConfig(enabled=True, rpc_url=None)
+    try:
+        verify_secret_store(probe)
+    except TestnetSafetyError as exc:
+        return f"DSS agent secret store failed custody check: {exc}"
+    if not os.environ.get("DSS_TESTNET_RPC_URL"):
+        return "DSS_TESTNET_RPC_URL not configured"
+    return None
 
 
-from eth_account.signers.local import LocalAccount
-from web3 import Web3, HTTPProvider
-from flashbots import flashbot
-from eth_account.account import Account
-from config import get_alchemy_http_url
+def _read_recorded_address(cfg: TestnetExecutionConfig) -> str:
+    """Public metadata only — the recorded agent address, read through the
+    gate so a malformed record fails closed."""
+    return cfg.load_agent_address()
 
-# Signer key for authentication (reputation only — keep it empty, no funds)
-ETH_SIGNER_KEY = os.getenv("PRIVATE_KEY")
-signer: LocalAccount = Account.from_key(ETH_SIGNER_KEY)
 
-# Your provider (Alchemy, Infura, etc.)
-w3 = Web3(HTTPProvider(get_alchemy_http_url(TEST_CHAIN_ID)))  # Sepolia testnet
+class TestWalletIdentityBindings(unittest.TestCase):
+    """Offline pins for the single wallet path (DSS-WO-ENG-004 §2).
 
-# Initialize Flashbots (mainnet by default)
-flashbot(w3, signer, "https://relay-sepolia.flashbots.net")  # For Goerli/Holesky use the relay URL as 3rd arg
+    The live wallet is NEVER touched here: every wallet-bearing test uses
+    a throwaway key in a temporary directory. Deep custody coverage
+    (roundtrip, mismatch, symlink, permissions, hex format) lives in
+    tests/test_testnet_gate.py against the same production function.
+    """
 
-latest = w3.eth.get_block("latest")
-base_fee = latest.get("baseFeePerGas", w3.eth.gas_price)
-priority_fee = w3.to_wei(5, "gwei")  # 5 gwei priority fee
-max_fee = int(base_fee * 1.5) + priority_fee
+    def test_from_env_provides_no_wallet_override(self):
+        """No environment variable can redirect the wallet: from_env only
+        reads the exec flag, RPC URL and expected chain id. The credential
+        paths are structural defaults pointing at the DSS secret store."""
+        cfg = TestnetExecutionConfig.from_env(env={
+            "DSS_TESTNET_EXEC": "1",
+            "DSS_TESTNET_RPC_URL": "https://sepolia.example",
+            # Key names built via concatenation so this file's source does
+            # not contain the override variable names verbatim (the source
+            # pin below asserts they appear nowhere in this file). The gate
+            # must ignore them completely.
+            ("DSS_TESTNET_KEYSTORE" + ""): "/tmp/evil.json",
+            ("DSS_TESTNET_KEYSTORE" + "_PASSPHRASE"): "evil",
+            "PRIVATE" + "_KEY": "evil",
+        })
+        self.assertEqual(
+            cfg.keystore_path,
+            os.path.join("/home/z/my-project/.secrets",
+                         "dss_testnet_wallet.keystore.json"),
+        )
+        self.assertEqual(
+            cfg.passphrase_path,
+            os.path.join("/home/z/my-project/.secrets",
+                         "dss_testnet_wallet.pass"),
+        )
+        self.assertEqual(
+            cfg.address_path,
+            os.path.join("/home/z/my-project/.secrets",
+                         "dss_testnet_wallet.address"),
+        )
+        self.assertEqual(cfg.relay_url, FLASHBOTS_SEPOLIA_RELAY)
 
-# Build transaction
-tx = {
-    'from': signer.address,
-    'to': RECIPIENT_ADDRESS,
-    'value': w3.to_wei(TRANSFER_AMOUNT_ETH, 'ether'),
-    'gas': 21000,
-    'maxFeePerGas': max_fee,
-    'maxPriorityFeePerGas': priority_fee,
-    'nonce': w3.eth.get_transaction_count(signer.address),
-    'chainId': TEST_CHAIN_ID,
-}
+    def test_source_pins_no_independent_wallet_or_env_path(self):
+        """This file must not contain any independent wallet-loading,
+        passphrase-decoding or legacy-key path. The gate is the only
+        wallet authority (DSS-WO-ENG-004 §2 reqs 5–6, §3)."""
+        with open(__file__, "r") as f:
+            src = f.read()
+        # Built via concatenation so this file's own source does not contain
+        # the forbidden literals verbatim.
+        getenv = "os.get" + "env("
+        environ_get = "os.environ.get("
+        forbidden = (
+            getenv + '"PRIVATE' + '_KEY")',
+            environ_get + '"PRIVATE' + '_KEY")',
+            "load_dot" + "env",
+            "Account." + "decrypt",
+            "Account." + "from_key",
+            "DSS_TESTNET_KEYSTORE" + "_PASSPHRASE",
+            environ_get + '"DSS_TESTNET' + '_KEYSTORE")',
+            "send_" + "private_transaction",
+        )
+        for item in forbidden:
+            self.assertNotIn(item, src)
 
-# tx = {
-#         "to": RECIPIENT_ADDRESS,
-#         "value": transfer_amount_wei,
-#         "gas": 21000,  # Standard transfer gas limit
-#         "maxFeePerGas": max_fee,
-#         "maxPriorityFeePerGas": priority_fee,
-#         "nonce": nonce,
-#         "chainId": TEST_CHAIN_ID,
-#         "type": 2,  # EIP-1559
-#     }
+    def test_skip_reason_is_visible_and_secret_free(self):
+        reason = _skip_reason()
+        self.assertIsNotNone(reason)
+        self.assertIn("DSS_TESTNET_FLASHBOTS_LIVE", reason)
+        self.assertNotIn("passphrase", reason.lower())
 
-signed_tx = w3.eth.account.sign_transaction(tx, private_key=ETH_SIGNER_KEY)
 
-bundle = [{"signed_transaction": signed_tx.rawTransaction}]
-print(f"\nSigned transaction hash: {signed_tx.hash.hex()}")
+class TestPreparePathOffline(unittest.TestCase):
+    """The unified prepare path with a throwaway wallet — no network."""
 
-tnx = {"signed_transaction": signed_tx.rawTransaction}
+    def _provisioned(self, tmp):
+        acct = Account.create()
+        keystore = Account.encrypt(acct.key, b"throwaway-passphrase")
 
-# Simulae as a bundle
-simulation = w3.flashbots.simulate(bundle, latest.number + 1)
-if simulation.get("error"):
-    print(f"Simulation error: {simulation['error']}")
-else:
-    print(f"Simulation successful: {simulation}")
+        def w(path, data, mode=0o600):
+            with open(path, "wb") as f:
+                f.write(data)
+            os.chmod(path, mode)
 
-# Send privately
-response = w3.flashbots.send_private_transaction(tnx)
+        w(os.path.join(tmp, "keystore.json"), json.dumps(keystore).encode())
+        w(os.path.join(tmp, "pass"), b"throwaway-passphrase".hex().encode())
+        w(os.path.join(tmp, "address"), (acct.address + "\n").encode())
+        cfg = TestnetExecutionConfig(
+            enabled=False,  # prepare/simulate must not need the exec flag
+            rpc_url="https://sepolia.example",
+            keystore_path=os.path.join(tmp, "keystore.json"),
+            passphrase_path=os.path.join(tmp, "pass"),
+            address_path=os.path.join(tmp, "address"),
+            tx_log_path=os.path.join(tmp, "txlog.jsonl"),
+        )
+        return cfg, acct
 
-response.wait()  # Wait for inclusion (optional)
-receipts = response.receipts()
-print(f"Mined in block {receipts[0].blockNumber}")
+    def _mock_w3(self):
+        w3 = MagicMock()
+        w3.is_connected.return_value = True
+        w3.eth.chain_id = SEPOLIA_CHAIN_ID
+        w3.eth.block_number = 100
+        w3.eth.get_transaction_count.return_value = 7
+        w3.eth.get_block.return_value = {"baseFeePerGas": 10**9}
+        w3.to_wei.side_effect = lambda v, u: int(v * 10**9) if u == "gwei" else v
+        return w3
+
+    def test_prepare_signs_bound_wallet_and_never_touches_relay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, acct = self._provisioned(tmp)
+            w3 = self._mock_w3()
+            relay = MagicMock()
+            session, signed, target_block = prepare_flashbots_bundle(
+                [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
+                purpose="offline prepare check",
+                config=cfg,
+                web3_factory=lambda url: w3,
+                relay_factory=lambda url, auth, relay_url: relay,
+            )
+            self.assertEqual(target_block, 101)
+            self.assertEqual(len(signed), 1)
+            self.assertIsInstance(signed[0], bytes)
+            self.assertTrue(signed[0])
+            relay.assert_not_called()  # no transport interaction in prepare
+            self.assertEqual(
+                session._sender.lower(), acct.address.lower()
+            )
+
+    def test_prepare_refuses_policy_violation_before_relay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, acct = self._provisioned(tmp)
+            stranger = "0x" + "bb" * 20
+            relay = MagicMock()
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    [{"to": stranger, "value": 1}],
+                    purpose="must never prepare",
+                    config=cfg,
+                    web3_factory=lambda url: self._mock_w3(),
+                    relay_factory=lambda url, auth, relay_url: relay,
+                )
+            self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
+            relay.assert_not_called()
+
+    def test_prepare_refuses_allowlisted_but_unexpected_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, acct = self._provisioned(tmp)
+            cfg = TestnetExecutionConfig(
+                enabled=False,
+                rpc_url=cfg.rpc_url,
+                keystore_path=cfg.keystore_path,
+                passphrase_path=cfg.passphrase_path,
+                address_path=cfg.address_path,
+                tx_log_path=cfg.tx_log_path,
+                expected_chain_id=SEPOLIA_CHAIN_ID,
+                # controlled test allowlist; production stays Sepolia-only
+                allowlist={SEPOLIA_CHAIN_ID: "Ethereum Sepolia", 17000: "Holesky"},
+            )
+            w3 = self._mock_w3()
+            w3.eth.chain_id = 17000
+            relay = MagicMock()
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    [{"to": acct.address, "value": 0}],
+                    purpose="must never prepare",
+                    config=cfg,
+                    web3_factory=lambda url: w3,
+                    relay_factory=lambda url, auth, relay_url: relay,
+                )
+            self.assertIn("RPC chain mismatch", str(ctx.exception))
+            relay.assert_not_called()
+
+    def test_prepare_refuses_over_cap_rpc_suggested_fee(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, acct = self._provisioned(tmp)
+            w3 = self._mock_w3()
+            w3.eth.get_block.return_value = {"baseFeePerGas": 400 * 10**9}
+            relay = MagicMock()
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    [{"to": acct.address, "value": 0}],
+                    purpose="must never prepare",
+                    config=cfg,
+                    web3_factory=lambda url: w3,
+                    relay_factory=lambda url, auth, relay_url: relay,
+                )
+            self.assertIn("exceeds the testnet cap", str(ctx.exception))
+            relay.assert_not_called()
+
+    def test_zero_value_self_transfer_is_within_fee_caps(self):
+        """The planned initial operation (0-value self-transfer, 21,000 gas
+        at the cap price) must fit inside the monetary fee cap."""
+        self.assertLess(21000 * MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
+                        MAX_TESTNET_TX_FEE_WEI)
+
+
+class TestFlashbotsSepoliaSimulation(unittest.TestCase):
+    """Phase 1 — relay connectivity and bundle simulation (no submission)."""
+
+    def test_flashbots_sepolia_bundle_simulation(self):
+        reason = _skip_reason()
+        if reason:
+            self.skipTest(reason)
+
+        from web3 import Web3, HTTPProvider
+
+        cfg = TestnetExecutionConfig.from_env()
+        recorded = _read_recorded_address(cfg)
+
+        # Read-only funding check (public RPC, no wallet).
+        probe = Web3(HTTPProvider(os.environ["DSS_TESTNET_RPC_URL"]))
+        if not probe.is_connected():
+            self.skipTest("testnet RPC is not reachable")
+        balance = probe.eth.get_balance(recorded)
+        if balance == 0:
+            self.skipTest(
+                "DSS agent wallet is unfunded on Sepolia — awaiting "
+                "Principal funding; no simulation possible"
+            )
+
+        # Unified gate path: identity binding, chain verification, policy,
+        # signing — then the read-only relay simulation.
+        session, signed, target_block = prepare_flashbots_bundle(
+            [{"to": recorded, "value": SELF_TRANSFER_VALUE_WEI}],
+            purpose="Flashbots Sepolia relay simulation check (0-value self-transfer)",
+            config=cfg,
+        )
+        simulation = session.simulate(
+            signed, target_block,
+            purpose="Flashbots Sepolia relay simulation check",
+        )
+        self.assertTrue(simulation.get("results"), "simulation returned no results")
+
+
+class TestFlashbotsSepoliaSubmission(unittest.TestCase):
+    """Phase 2 — submission. Requires the dedicated testnet execution gate.
+
+    This phase is separate from simulation and additionally gated behind
+    DSS_TESTNET_EXEC=1 (checked inside the gate's submit(), never trusted
+    from the test). The submission itself is REFUSED by production code
+    unless a successful simulation of the exact payload and target block
+    was recorded first (FlashbotsBundleSession). Before any state-changing
+    submission the Coordinator must have reviewed the transaction plan;
+    the gate flag encodes that authorization.
+    """
+
+    def test_flashbots_sepolia_self_transfer_submission(self):
+        reason = _skip_reason()
+        if reason:
+            self.skipTest(reason)
+        if os.environ.get("DSS_TESTNET_EXEC") != "1":
+            self.skipTest(
+                "submission requires the testnet execution gate "
+                "DSS_TESTNET_EXEC=1 (simulation-only run)"
+            )
+
+        cfg = TestnetExecutionConfig.from_env()
+        recorded = _read_recorded_address(cfg)
+
+        from web3 import Web3, HTTPProvider
+        probe = Web3(HTTPProvider(os.environ["DSS_TESTNET_RPC_URL"]))
+        balance = probe.eth.get_balance(recorded)
+        if balance == 0:
+            self.skipTest("DSS agent wallet is unfunded on Sepolia")
+
+        session, signed, target_block = prepare_flashbots_bundle(
+            [{"to": recorded, "value": SELF_TRANSFER_VALUE_WEI}],
+            purpose="Flashbots Sepolia 0-value self-transfer via relay",
+            config=cfg,
+        )
+        # Simulation first — submit() fails closed without it (production
+        # enforcement, not a test convention).
+        session.simulate(signed, target_block,
+                         purpose="pre-submission simulation")
+        result = session.submit(
+            signed, target_block,
+            purpose="Flashbots Sepolia 0-value self-transfer via relay",
+        )
+        self.assertIsNotNone(result["relay_result"], "relay returned no result")
+
+
+if __name__ == "__main__":
+    print("This module is an opt-in pytest integration test.")
+    print("Set DSS_TESTNET_FLASHBOTS_LIVE=1 and DSS_TESTNET_RPC_URL, and")
+    print("provide the DSS agent keystore in the DSS secret store, to")
+    print("enable it. Submission additionally requires DSS_TESTNET_EXEC=1.")
+    print()
+    print("Never point it at mainnet. The wallet cannot be redirected by")
+    print("any environment variable.")

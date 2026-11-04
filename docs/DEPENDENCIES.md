@@ -95,11 +95,11 @@ Changes vs the ENG-001 register, all caused by the ENG-002 retirement/alignment:
 
 Baseline scope then: 23 failed / 86 passed / 1 error; CI scope: 22 failed / 86 passed / 1 error (109 units). Category B (the `AtomicArbExecutor` contract-existence failure) and the `test_phase13` ABI mismatch are gone for the reasons above.
 
-### Excluded from CI (2 files, unchanged)
-| Test | Why it cannot run in CI |
+### Excluded from CI (updated by DSS-WO-ENG-004)
+| Test | Status |
 | --- | --- |
-| tests/test_flashbots_integration.py (**uncollectable**; the "+1" of the baseline) | Lines 192–255 are a module-level manual script: loads `PRIVATE_KEY` from `.env`, signs a real transfer, then calls `w3.flashbots.simulate(...)` and **`w3.flashbots.send_private_transaction(...)`** against the Sepolia relay — a real broadcast. Without `flashbots` it fails at import; with it, it fails on the missing key. Excluded from all pytest runs; it must never be executed by automation. Flagged for rewrite as a proper skip-gated integration test in a future work order. |
-| tests/test_multicall3_yieldout.py::test_run_multicall3_batch_yieldOut | Requires a local artifact from a live run (`logs/pending_opportunities.jsonl`) before it even dials `https://0xrpc.io/eth`; fails on a clean clone with "No cycles to test." Also counts toward the 23 baseline failures; excluded from CI scope only. |
+| tests/test_flashbots_integration.py | **No longer excluded** (ENG-004). The module-level broadcast script described below was REPLACED on this branch by an import-safe, gate-routed integration test: it collects cleanly, its offline tests run in CI, and its two live phases skip visibly without `DSS_TESTNET_FLASHBOTS_LIVE=1` + RPC + the DSS agent keystore (CI provides none of these). The gate (executor/testnet_gate.py) is the single wallet/authorization path; the relay is a transport only. |
+| tests/test_multicall3_yieldout.py::test_run_multicall3_batch_yieldOut | Still excluded (unchanged): requires a local artifact from a live run (`logs/pending_opportunities.jsonl`) before it even dials `https://0xrpc.io/eth`; fails on a clean clone with "No cycles to test." |
 
 Also inspected: `tests/test_mc3.py` defines no pytest-collectable tests (manual script under `__main__`) — contributes 0 tests, harmless.
 
@@ -123,3 +123,40 @@ Per the Principal's direction, the separate `AtomicArbExecutor` contract is **re
 - **ABI:** `executor/exec_abi.json` is compiler-generated from the pinned source with solc `0.8.28+commit.7893614a` (SHA-256 verified against the official solc-bin checksum) and OpenZeppelin 5.7.0 exactly (`contracts/package-lock.json`). `config.ARB_EXEC_ABI` conforms to the generated interface, enforced by tests.
 - **Solidity versions:** source pragmas `^0.8.19` (Exec) / GPL-2.0-or-later Helper; compiler pinned as above; OZ 5.7.0 (required for the OZ-v5 `Ownable(initialOwner)` constructor style).
 - **New baseline (CI scope):** **20 failed / 91 passed / 1 error** (112 units) — see §6.
+
+## 9. DSS-WO-ENG-004 — unified signing, Flashbots gate and fee caps (this branch)
+
+`executor/testnet_gate.py` is the single authorization boundary for every
+testnet signing operation; the Flashbots relay is a transport only:
+
+- **Single wallet path:** `load_agent_wallet` (secret-store presence, file
+  types/symlinks, 0600/0700 permissions, v3 keystore shape, hex passphrase
+  decoding, `LocalAccount` construction, recorded-address binding). No
+  environment variable can redirect the wallet or passphrase.
+- **Fee exposure caps (§5 of the work order):** worst-case monetary
+  expenditure `gasLimit × maxFeePerGas` / `gasLimit × gasPrice` capped at
+  2×10¹⁵ wei, fee price capped at 50 gwei, priority fee at 2 gwei;
+  missing/negative/malformed/contradictory inputs rejected. Applied per
+  transaction and per bundle transaction (`validate_bundle`). Calculation
+  and Coordinator-review note in docs/testnet-policy.md §4.
+- **Simulation-before-submission (§4):** `FlashbotsBundleSession.simulate`
+  evaluates the eth_callBundle response fail-closed (error, firstRevert,
+  per-tx errors, result-count mismatch, zero-gas) and authorizes an
+  order-sensitive fingerprint of (exact signed payload, exact target
+  block); `submit` re-checks the execution gate, re-verifies the chain ID
+  immediately before the relay call, refuses stale targets (block reached)
+  and refuses any submission without a matching successful simulation;
+  the authorization is consumed. `prepare_flashbots_bundle` signs only
+  after gate + chain + policy + custody checks and never calls the relay.
+- **Allowlist injection (§6):** offline tests may inject a controlled
+  allowlist explicitly to exercise the real mismatch branch (allowlisted
+  but unexpected RPC chain rejected before signing) and the
+  chain-identity-change-between-signing-and-submission branch; the
+  production map stays Sepolia-only and is never environment-settable;
+  mainnet is rejected even on injected allowlists.
+- **The old broadcast script is gone:** tests/test_flashbots_integration.py
+  is now import-safe, gate-routed and collected by CI (its live phases
+  skip visibly). The old workflow exclusion was removed.
+- **Baseline note:** the 20 failures / 1 error from the ENG-002 scope are
+  still present on this branch (fixed on work/dss-eng-001-deps-ci, PR #1;
+  this branch forked before those fixes). All ENG-004 additions pass.

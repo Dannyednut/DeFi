@@ -45,14 +45,22 @@ def summarize(path: Path) -> str:
         f"- passed: **{passed}** | failed: **{failures}** | errors: **{errors}** | skipped: **{skipped}**",
         "",
         "Reference points (see docs/DEPENDENCIES.md failure register):",
-        "- DSS-WO-ENG-002 actual baseline for this CI scope (after retiring the "
-        "separate AtomicArbExecutor and aligning with the authoritative Exec "
-        "from Dannyednut/EVM @ 898fe82f): 20 failed, 91 passed, 1 error.",
-        "- Historical DSS-WO-ENG-001 CI scope (pre-retirement): 22 failed, "
-        "86 passed, 1 error; DSS-MISSION-001 original baseline: 23 failed, "
-        "86 passed, 1 error.",
-        "- These are pre-existing baseline failures; the job stays red until later work "
-        "orders fix them. No failure is skipped or hidden by CI.",
+        "- DSS-WO-ENG-004 scope on this branch: the old module-level broadcast "
+        "script is replaced by a gate-routed import-safe integration test "
+        "(collected; its live phases skip visibly). All gate/fee/simulation/"
+        "custody additions must pass; the ONLY skipped units are the two "
+        "opt-in live Flashbots phases.",
+        "- Still expected on this branch: the 20 pre-existing baseline failures "
+        "and 1 fixture error carried over from the DSS-WO-ENG-002 scope (fixed "
+        "on work/dss-eng-001-deps-ci, PR #1 — this branch forked before those "
+        "fixes). The job stays red until the branches reconcile.",
+        "- Historical: DSS-WO-ENG-002 CI scope: 20 failed, 91 passed, 1 error; "
+        "DSS-WO-ENG-001 CI scope (pre-retirement): 22 failed, 86 passed, "
+        "1 error; DSS-MISSION-001 original baseline: 23 failed, 86 passed, "
+        "1 error.",
+        "- Failures and errors in THIS run that are NOT part of that known set "
+        "are regressions — treat them as blockers. No failure is skipped, "
+        "xfail-marked or otherwise hidden by CI.",
         "",
     ]
     if failing:

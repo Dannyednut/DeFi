@@ -7,7 +7,10 @@ module is listed in EXPECTED_IMPORT_FAILURES with a documented reason.
 
 It also asserts the Flashbots dependency status explicitly: the distribution
 `flashbots` must provide FlashbotsWeb3 and flashbot — the exact symbols
-guarded by executor/executor.py — so the bundle-relay path is available.
+guarded by executor/executor.py — so the provider imports and attaches to
+the web3 instance successfully. This is a dependency-wiring check only:
+relay execution (bundle submission against a Flashbots relay) is NOT
+exercised here and still requires separate validation.
 
 Run:  python scripts/ci_import_smoke.py
 Exit: 0 = all modules import (or only allowlisted failures), 1 otherwise.
@@ -59,8 +62,9 @@ def check_flashbots_status() -> tuple[bool, str]:
         version = md.version("flashbots")
         w3v = md.version("web3")
         return True, (
-            f"flashbots {version} provides FlashbotsWeb3 + flashbot "
-            f"(web3 {w3v}) -> bundle relay path available"
+            f"flashbots {version} imports and attaches to web3 {w3v} "
+            f"(FlashbotsWeb3 + flashbot present) — provider attach verified "
+            f"only; relay execution still requires separate validation"
         )
     except Exception as e:  # noqa: BLE001
         return False, f"flashbots dependency broken: {type(e).__name__}: {e}"

@@ -1,7 +1,8 @@
 # Runtime dependencies for the DeFi arbitrage research system.
 #
 # This is the human-maintained INPUT file; the pinned lock is requirements.txt.
-# After editing, regenerate the lock with pip-tools on Python 3.11:
+# After editing, regenerate the lock with pip-tools==7.6.2 on Python 3.11
+# (the exact version used to generate the committed locks):
 #
 #   python -m piptools compile --generate-hashes --strip-extras \
 #       -o requirements.txt requirements.in

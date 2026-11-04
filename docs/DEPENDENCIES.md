@@ -52,10 +52,11 @@ Residual risk: the test suite is heavily mocked; web3 6-vs-7 differences on *liv
 
 ## 4. Deterministic lock files
 
-- Generated with **pip-tools 7.x** (`pip-compile --generate-hashes --strip-extras`) running under CPython 3.11.18.
+- Generated with **pip-tools 7.6.2** (`pip-compile --generate-hashes --strip-extras`) running under CPython 3.11.18. Regeneration must use this exact pip-tools version; byte-identical reproduction of both committed locks from the committed `.in` files was verified with pip-tools 7.6.2 on 2026-11-04 (DSS-WO-ENG-001A).
 - `requirements.txt`: 61 pinned distributions, every one with `--hash=sha256:` entries (2,410 hash lines).
 - `requirements-dev.txt`: 65 pinned distributions (adds pytest + its runner deps).
 - Install with hash enforcement: `pip install --require-hashes -r requirements-dev.txt`.
+- What the locks guarantee: exact pinned versions plus SHA-256 artifact verification at install time (`--require-hashes`). They do **not** guarantee identical binary artifacts across operating systems — wheels are platform-specific; reproducibility is scoped to the resolved versions and hash-verified artifacts on each platform.
 - pytest pinned to the 9.x line because the DSS-MISSION-001 baseline register was produced under pytest 9.x accounting (unittest subTest failures counted individually); keeps CI counts directly comparable.
 - Regeneration commands are documented at the top of both `.in` files and in docs/INSTALL.md.
 

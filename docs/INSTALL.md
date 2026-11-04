@@ -22,8 +22,11 @@ python -m pip install --require-hashes -r requirements.txt
 python -m pip install --require-hashes -r requirements-dev.txt
 ```
 
-`--require-hashes` makes pip verify every artifact against the committed
-SHA-256 hashes — installs are reproducible byte-for-byte.
+`--require-hashes` makes pip resolve exactly the pinned versions and verify
+every downloaded artifact against the committed SHA-256 hashes. Scope note:
+the locks pin versions and verify artifact integrity on each platform; they
+do not imply identical binary artifacts across operating systems (wheels
+are platform-specific).
 
 ## 3. Verify the import graph
 
@@ -33,7 +36,10 @@ python scripts/ci_import_smoke.py
 
 Imports every repository module and asserts the Flashbots dependency status
 explicitly (`flashbots 2.0.0` must provide `FlashbotsWeb3` + `flashbot` on
-`web3 6.20.4`). Expected output ends with `IMPORT SMOKE: PASS` (91 modules).
+`web3 6.20.4`, i.e. the provider imports and attaches successfully). This
+verifies dependency wiring only — relay execution (bundle submission) is
+not exercised here and still requires separate validation. Expected output
+ends with `IMPORT SMOKE: PASS` (91 modules).
 
 ## 4. Run the test suite
 
@@ -58,15 +64,18 @@ python -m pytest tests \
 ## 5. Regenerating the lock files (after editing the `.in` files)
 
 ```bash
-python -m pip install pip-tools
+python -m pip install pip-tools==7.6.2
 python -m piptools compile --generate-hashes --strip-extras \
     -o requirements.txt requirements.in
 python -m piptools compile --generate-hashes --strip-extras \
     -o requirements-dev.txt requirements-dev.in
 ```
 
-Locks were generated under CPython 3.11; regenerate under the same major
-version to keep marker resolution identical.
+Locks were generated with **pip-tools 7.6.2** under CPython 3.11.18;
+regenerate with that exact pip-tools version and the same Python major
+version to keep marker resolution identical. Byte-identical regeneration
+of both committed locks from the committed `.in` files was verified with
+pip-tools 7.6.2 on 2026-11-04 (DSS-WO-ENG-001A).
 
 ## 6. Runtime configuration notes
 

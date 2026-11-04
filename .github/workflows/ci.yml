@@ -57,15 +57,9 @@ jobs:
       - name: Import smoke test (full module graph + Flashbots dependency status)
         run: python scripts/ci_import_smoke.py
 
-      # Two test files are excluded from CI, with reasons recorded in the
-      # failure register (docs/DEPENDENCIES.md). They cannot run on a clean
-      # CI checkout and must never be executed by automation:
-      #
-      #   tests/test_flashbots_integration.py
-      #       Module-level manual script: builds, signs and BROADCASTS a real
-      #       transaction to the Sepolia Flashbots relay. It is uncollectable
-      #       by design and running it in CI would violate the "no signing or
-      #       broadcasting" security requirement of this work order.
+      # One test file is excluded from CI, with the reason recorded here and
+      # in the failure register (docs/DEPENDENCIES.md). It cannot run on a
+      # clean CI checkout:
       #
       #   tests/test_multicall3_yieldout.py
       #       Requires a local runtime artifact (logs/pending_opportunities.jsonl)
@@ -73,17 +67,19 @@ jobs:
       #       It can never pass on a clean clone; classified
       #       network/environment-dependent.
       #
-      # The suite still contains 20 pre-existing baseline failures and 1
-      # fixture error, reproduced under the DSS-WO-ENG-002 scope (the separate
-      # AtomicArbExecutor and the old in-repo Exec variant were retired and the
-      # repository was aligned with the authoritative Exec from
-      # Dannyednut/EVM @ 898fe82f; see docs/DEPENDENCIES.md §6). This job
-      # therefore stays RED until later work orders fix those tests. Failures
-      # are deliberately NOT skipped, xfail-marked or otherwise hidden.
+      # tests/test_flashbots_integration.py is NO LONGER excluded:
+      # DSS-WO-ENG-003 rewrote it as an import-safe, opt-in integration test
+      # (the old version signed and broadcast at import time). It collects
+      # cleanly and skips visibly without DSS_TESTNET_FLASHBOTS_LIVE=1 plus
+      # the DSS agent keystore; CI provides neither, so CI can never sign or
+      # broadcast through it.
+      #
+      # The offline suite passes completely as of DSS-WO-ENG-003
+      # (Workstream A). Intentionally gated live-network tests appear as
+      # skipped with their reason; no failure, xfail or hidden skip remains.
       - name: Run offline test suite (fails on any test failure)
         run: >
           python -m pytest tests
-          --ignore=tests/test_flashbots_integration.py
           --ignore=tests/test_multicall3_yieldout.py
           -p no:cacheprovider
           --tb=short -ra

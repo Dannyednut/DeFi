@@ -12,10 +12,12 @@ Design invariants (all fail closed):
     stays false. This boundary is a SEPARATE gate that only ever permits
     explicitly allowlisted testnets.
   * The gate is disabled by default: without DSS_TESTNET_EXEC=1 nothing
-    in this module will sign or submit anything. Bundle submission
-    additionally requires a SUCCESSFUL simulation of the exact payload
-    (see FlashbotsBundleSession — enforced in production code, not in
-    tests).
+    in this module will decrypt the wallet, sign or submit anything —
+    including Flashbots bundle preparation, which signs and therefore
+    passes the SAME gate as direct-RPC submission (DSS-WO-ENG-005 §2).
+    Bundle submission additionally requires a SUCCESSFUL simulation of
+    the exact prepared payload (see FlashbotsBundleSession — enforced
+    in production code, not in tests).
   * Ethereum mainnet (chain ID 1) is ALWAYS rejected — hard-coded, not
     configurable.
   * Unknown chains fail closed. Only chains listed in
@@ -34,11 +36,18 @@ Design invariants (all fail closed):
     decrypts the v3 keystore with the hex-encoded passphrase file, builds
     a proper eth_account LocalAccount, and BINDS it to the recorded
     public address before any signing can happen.
-  * Fee exposure is capped in monetary terms, not just gas units:
-    gasLimit × maxFeePerGas (EIP-1559) or gasLimit × gasPrice (legacy)
-    must be within MAX_TESTNET_TX_FEE_WEI; fee-price inputs that are
+  * Fee exposure is capped in monetary terms, not just gas units, PER
+    TRANSACTION and PER BUNDLE: gasLimit × maxFeePerGas (EIP-1559) or
+    gasLimit × gasPrice (legacy) must be within MAX_TESTNET_TX_FEE_WEI
+    for every transaction AND for the aggregate across a whole Flashbots
+    bundle, checked before wallet decryption; fee-price inputs that are
     missing, negative, malformed or above MAX_TESTNET_MAX_FEE_PER_GAS_WEI
-    are rejected.
+    are rejected (DSS-WO-ENG-005 §5).
+  * Flashbots submission authority is an unforgeable capability: only
+    prepare_flashbots_bundle can mint a PreparedFlashbotsBundle, and the
+    session re-verifies EVERY binding — wallet identity, chain ID,
+    validated intent, exact signed payload, target block — at
+    construction and before every relay interaction (DSS-WO-ENG-005 §3).
   * No arbitrary EOA transfers: the only permitted recipient without an
     entry in KNOWN_TARGETS is the agent wallet itself (self-transfer).
   * No unlimited token approvals: approve/increaseAllowance calldata is
@@ -46,9 +55,11 @@ Design invariants (all fail closed):
   * No unverified contract targets and no contract deployments: `to`
     must be a real recipient (self or a recorded known target);
     deployments (empty `to`) are rejected outright.
-  * Every simulation and every submission is recorded (purpose, chain
-    ID, target, function, estimated/actual gas, hash, outcome, fee
-    exposure) to a JSONL log that never contains credentials.
+  * Every simulation and every submission — successful, failed, refused
+    or of uncertain outcome — is recorded (purpose, chain ID, target,
+    function, estimated/actual gas, hash, outcome, fee exposure) to a
+    JSONL log that never contains credentials, raw signed transaction
+    bytes or any other secret material (DSS-WO-ENG-005 §4).
 
 This module holds NO key material. The agent wallet is decrypted from
 the DSS secret store (encrypted keystore + passphrase file) only inside
@@ -59,6 +70,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import time
 from dataclasses import dataclass
@@ -85,23 +97,29 @@ MAX_TESTNET_TX_VALUE_WEI = 10**15          # 0.001 native units
 MAX_TESTNET_GAS_UNITS = 500_000
 MAX_TOKEN_APPROVAL_AMOUNT = 10**18         # bounded approvals only
 
-# Maximum monetary fee exposure (DSS-WO-ENG-004 §5). A gas-unit cap is NOT
-# a monetary cap: these bounds fail closed on the actual fee inputs.
+# Maximum monetary fee exposure (DSS-WO-ENG-004 §5; aggregate per
+# DSS-WO-ENG-005 §5). A gas-unit cap is NOT a monetary cap: these bounds
+# fail closed on the actual fee inputs.
 #
 #   * MAX_TESTNET_MAX_FEE_PER_GAS_WEI — sanity ceiling on the fee price
 #     itself (maxFeePerGas / gasPrice). Sepolia base fees are typically
 #     0.01–30 gwei; 50 gwei covers even severe congestion.
 #   * MAX_TESTNET_MAX_PRIORITY_FEE_WEI — priority-fee ceiling (2 gwei is
 #     far above what Sepolia inclusion requires).
-#   * MAX_TESTNET_TX_FEE_WEI — hard ceiling on the total worst-case
-#     expenditure per transaction: gasLimit × maxFeePerGas (EIP-1559) or
-#     gasLimit × gasPrice (legacy).
+#   * MAX_TESTNET_TX_FEE_WEI — hard ceiling on the worst-case expenditure
+#     of ONE transaction (gasLimit × maxFeePerGas for EIP-1559, gasLimit ×
+#     gasPrice for legacy) AND on the AGGREGATE fee exposure of a whole
+#     Flashbots bundle (sum over all its transactions), checked before
+#     wallet decryption.
 #
-# Proposed for the initial 0-value self-transfer (21,000 gas): worst-case
-# expenditure 21,000 × 50 gwei = 1.05e15 wei ≈ 0.00105 native; the ceiling
-# 2e15 wei (0.002 native) is ~1.9× that, i.e. it absorbs one full retry at
-# the worst-case price. Coordinator review is required before any live
-# transaction; raising these caps is a reviewed code change, never an
+# APPROVED for the initial operation (DSS-WO-ENG-005 §5–6): the initial
+# state-changing test is ONE 0-value self-transfer of 21,000 gas — worst
+# case 21,000 × 50 gwei = 0.00105 native. The 0.002 native ceiling is a
+# ONE-TRANSACTION MAXIMUM for that initial operation. It does NOT absorb
+# a second full worst-case retry: two such transactions would total
+# 2 × 0.00105 = 0.0021 native, which EXCEEDS the ceiling. Any retry
+# therefore requires a NEW authorization and must not be assumed to fit
+# the same budget. Raising these caps is a reviewed code change, never an
 # environment setting.
 MAX_TESTNET_MAX_FEE_PER_GAS_WEI = 50 * 10**9      # 50 gwei per gas
 MAX_TESTNET_MAX_PRIORITY_FEE_WEI = 2 * 10**9      # 2 gwei per gas
@@ -481,6 +499,47 @@ def validate_fee_exposure(
     return expenditure
 
 
+def validate_bundle_fee_exposure(
+    txs: Sequence[dict],
+    *,
+    max_fee_per_gas_wei: int = MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
+    max_priority_fee_wei: int = MAX_TESTNET_MAX_PRIORITY_FEE_WEI,
+    max_total_fee_wei: int = MAX_TESTNET_TX_FEE_WEI,
+) -> int:
+    """Aggregate BUNDLE-level fee-exposure check (DSS-WO-ENG-005 §5).
+
+    Per-transaction caps alone are not enough: a bundle of two
+    transactions, each individually within its own cap, can still carry
+    a combined worst-case expenditure above the approved budget. The sum
+    of every transaction's worst-case expenditure (gasLimit × fee price)
+    must stay within max_total_fee_wei. Values are never clipped and
+    every transaction's fee inputs are re-validated strictly (missing,
+    negative, malformed, contradictory or over-cap inputs are rejected).
+    One rejected transaction rejects the whole bundle.
+
+    Returns the aggregate worst-case expenditure in wei.
+    """
+    total = 0
+    for i, tx in enumerate(txs):
+        try:
+            total += validate_fee_exposure(
+                tx,
+                max_fee_per_gas_wei=max_fee_per_gas_wei,
+                max_priority_fee_wei=max_priority_fee_wei,
+                max_total_fee_wei=max_total_fee_wei,
+            )
+        except TestnetSafetyError as exc:
+            raise TestnetSafetyError(f"bundle tx[{i}] rejected: {exc}") from exc
+    if total > max_total_fee_wei:
+        raise TestnetSafetyError(
+            f"aggregate bundle fee exposure {total} wei exceeds the "
+            f"testnet cap {max_total_fee_wei} wei — a bundle of "
+            "individually compliant transactions may not exceed the "
+            "approved budget as a whole"
+        )
+    return total
+
+
 # ── Transaction policy ───────────────────────────────────────────────────────
 
 def validate_transaction(
@@ -579,7 +638,13 @@ def validate_bundle(
     known_targets: Optional[dict[int, dict[str, str]]] = None,
 ) -> list[dict]:
     """Apply the same transaction policy to every transaction of a
-    Flashbots bundle. One rejected transaction rejects the whole bundle."""
+    Flashbots bundle. One rejected transaction rejects the whole bundle.
+
+    The AGGREGATE fee exposure across all bundle transactions is
+    additionally capped at max_total_fee_wei (DSS-WO-ENG-005 §5) — an
+    over-limit bundle is rejected as a whole, before any wallet is
+    decrypted or anything signed.
+    """
     validated: list[dict] = []
     for i, tx in enumerate(unsigned_txs):
         try:
@@ -598,6 +663,12 @@ def validate_bundle(
             )
         except TestnetSafetyError as exc:
             raise TestnetSafetyError(f"bundle tx[{i}] rejected: {exc}") from exc
+    validate_bundle_fee_exposure(
+        validated,
+        max_fee_per_gas_wei=max_fee_per_gas_wei,
+        max_priority_fee_wei=max_priority_fee_wei,
+        max_total_fee_wei=max_total_fee_wei,
+    )
     return validated
 
 
@@ -622,6 +693,29 @@ def record_testnet_tx(log_path: str, **fields) -> dict:
     with open(log_path, "a") as f:
         f.write(json.dumps(record) + "\n")
     return record
+
+
+# Raw signed transactions serialize to ≥ ~200 hex characters, while
+# keystore/bundle/transaction hashes are exactly 64. Any hex blob of 100+
+# characters inside an error string is therefore treated as potential
+# secret material and redacted before it can reach the audit log.
+_LONG_HEX_RE = re.compile(r"0x[0-9a-fA-F]{100,}")
+
+
+def _sanitize_error(message: object, *forbidden: str) -> str:
+    """Make an error message safe for the audit log (DSS-WO-ENG-005 §4).
+
+    Replaces every occurrence of each explicitly forbidden string (the
+    exact signed payload hex, with and without the 0x prefix) with a
+    redaction marker, then redacts any remaining long hex blob that could
+    be raw signed transaction bytes or other key material. Truncated to
+    300 characters so a hostile error cannot bloat the log.
+    """
+    text = str(message)
+    for secret in forbidden:
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return _LONG_HEX_RE.sub("0x<redacted-hex>", text)[:300]
 
 
 # ── Simulation gate (DSS-WO-ENG-004 §4) ──────────────────────────────────────
@@ -706,45 +800,220 @@ def _payload_fingerprint(signed_txs: Sequence[bytes], target_block: int) -> str:
     return h.hexdigest()
 
 
-# ── Flashbots transport session ──────────────────────────────────────────────
+# ── Flashbots transport session (capability-gated, DSS-WO-ENG-005 §3) ─────────
 
-class FlashbotsBundleSession:
-    """Production simulate/submit orchestration for the Flashbots transport.
+# Unforgeable in-process minting authority: the only live reference is
+# held by prepare_flashbots_bundle below. Any OTHER code path — including
+# tests — that tries to construct a PreparedFlashbotsBundle fails this
+# runtime authority check. This is enforced behavior, not a naming
+# convention; the session additionally re-verifies every binding of every
+# capability it is given (exact type, signer recovery, fingerprint).
+_PREPARATION_AUTHORITY = object()
 
-    The relay is a TRANSPORT only. Every authorization decision is made by
-    the gate: the session's payload was already policy-validated and signed
-    through prepare_flashbots_bundle (wallet identity bound, chain verified,
-    transaction policy enforced) before it can reach this class.
 
-    ENFORCEMENT (in production code, never only in tests): submit() refuses
-    to call the relay unless THIS session previously recorded a SUCCESSFUL
-    simulation of the EXACT signed payload for the EXACT target block, the
-    target block is still in the future, the execution gate flag is set,
-    and the RPC chain ID still matches the expected allowlisted chain —
-    re-verified immediately before the submission call.
+class PreparedFlashbotsBundle:
+    """The authorization capability for ONE prepared Flashbots bundle.
+
+    Minted exclusively by prepare_flashbots_bundle (via _mint) AFTER the
+    execution gate, chain verification, full transaction policy (including
+    the aggregate bundle fee cap), wallet-custody binding and signing have
+    all succeeded. It is immutable and binds together the verified wallet
+    identity (sender), the allowlisted chain ID, the validated transaction
+    intent, the EXACT signed payload, the EXACT target block and their
+    order-sensitive fingerprint.
+
+    FlashbotsBundleSession re-verifies every one of these bindings at
+    construction and again before every relay interaction — a mismatch
+    refuses the operation. An arbitrary signed bundle can never gain
+    submission authority, because no code path outside prepare_
+    flashbots_bundle can produce this capability.
     """
 
     # Not a pytest test class despite the Test prefix.
     __test__ = False
 
+    __slots__ = (
+        "_sender", "_chain_id", "_validated_txs", "_signed_payload",
+        "_target_block", "_fingerprint", "_total_fee_exposure_wei",
+        "_purpose", "_config",
+    )
+
     def __init__(
         self,
-        relay_w3: object,
         *,
+        _authority: object,
         sender: str,
-        config: TestnetExecutionConfig,
         chain_id: int,
-        known_targets: Optional[dict[int, dict[str, str]]] = None,
+        validated_txs: Sequence[dict],
+        signed_payload: Sequence[bytes],
+        target_block: int,
+        fingerprint: str,
+        total_fee_exposure_wei: int,
+        purpose: str,
+        config: "TestnetExecutionConfig",
     ):
-        self._w3 = relay_w3
-        self._sender = str(sender)
-        self._config = config
+        if _authority is not _PREPARATION_AUTHORITY:
+            raise TestnetSafetyError(
+                "PreparedFlashbotsBundle is an internal capability minted "
+                "EXCLUSIVELY by prepare_flashbots_bundle(); external "
+                "construction is refused"
+            )
+        self._sender = str(sender).lower()
         self._chain_id = int(chain_id)
-        self._known_targets = (
-            KNOWN_TARGETS if known_targets is None else known_targets
-        )
-        # fingerprint -> successful simulation summary
+        self._validated_txs = tuple(dict(t) for t in validated_txs)
+        self._signed_payload = tuple(bytes(r) for r in signed_payload)
+        self._target_block = int(target_block)
+        self._fingerprint = str(fingerprint)
+        self._total_fee_exposure_wei = int(total_fee_exposure_wei)
+        self._purpose = str(purpose)
+        self._config = config
+
+    @classmethod
+    def _mint(cls, **fields) -> "PreparedFlashbotsBundle":
+        """The ONLY minting path — the private authority token is held by
+        prepare_flashbots_bundle in this module."""
+        return cls(_authority=_PREPARATION_AUTHORITY, **fields)
+
+    @property
+    def sender(self) -> str:
+        return self._sender
+
+    @property
+    def chain_id(self) -> int:
+        return self._chain_id
+
+    @property
+    def validated_txs(self) -> tuple:
+        return self._validated_txs
+
+    @property
+    def signed_payload(self) -> tuple:
+        return self._signed_payload
+
+    @property
+    def target_block(self) -> int:
+        return self._target_block
+
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint
+
+    @property
+    def total_fee_exposure_wei(self) -> int:
+        return self._total_fee_exposure_wei
+
+    @property
+    def purpose(self) -> str:
+        return self._purpose
+
+    @property
+    def config(self) -> "TestnetExecutionConfig":
+        return self._config
+
+
+def _recover_signer(raw: bytes) -> str:
+    """Recover the signer address from a raw signed transaction."""
+    from eth_account import Account
+
+    return Account.recover_transaction(bytes(raw))
+
+
+class FlashbotsBundleSession:
+    """Production simulate/submit orchestration for the Flashbots transport.
+
+    The relay is a TRANSPORT only. A session can ONLY be created from a
+    PreparedFlashbotsBundle minted by prepare_flashbots_bundle (the
+    sanctioned preparation path): the constructor refuses every other
+    object — forged, hand-rolled, duck-typed or subclassed (exact-type
+    check) — so session construction can never bypass transaction policy
+    or wallet-identity validation (DSS-WO-ENG-005 §3).
+
+    simulate() and submit() take NO payload: they operate exclusively on
+    the bound capability. An arbitrary signed bundle can therefore never
+    gain submission authority merely by being passed around.
+
+    ENFORCEMENT (in production code, never only in tests): every binding —
+    wallet identity (recovered signers), chain ID, validated intent,
+    exact signed payload fingerprint, target block — is re-verified at
+    construction and again before every relay interaction. submit()
+    refuses to call the relay unless THIS session previously recorded a
+    SUCCESSFUL simulation of the exact prepared payload for the exact
+    target block, the target block is still in the future, the execution
+    gate flag is set, and the RPC chain ID still matches the expected
+    allowlisted chain — re-verified immediately before the submission
+    call. The one-use authorization is consumed BEFORE the relay call so
+    a relay timeout cannot silently authorize unlimited retries.
+    """
+
+    # Not a pytest test class despite the Test prefix.
+    __test__ = False
+
+    _SIMULATION_OUTCOMES = ("simulated", "simulation_failed", "simulation_refused")
+
+    def __init__(self, relay_w3: object, prepared: PreparedFlashbotsBundle):
+        if type(prepared) is not PreparedFlashbotsBundle:
+            raise TestnetSafetyError(
+                "FlashbotsBundleSession must be created from a "
+                "PreparedFlashbotsBundle minted by prepare_flashbots_bundle() "
+                "— directly constructed, forged or subclassed authorization "
+                "objects are refused"
+            )
+        self._w3 = relay_w3
+        self._prepared = prepared
+        self._config = prepared.config
+        self._sender = prepared.sender
+        self._chain_id = int(prepared.chain_id)
+        # fingerprint -> successful simulation summary (one-use)
         self._authorized: dict[str, dict] = {}
+        # Runtime binding verification — enforced behavior, not trust.
+        self._verify_bindings()
+
+    # ── binding verification ────────────────────────────────────────────────
+
+    def _payload_hexes(self) -> tuple:
+        """Exact signed payload hex (with and without 0x) for error
+        redaction — these strings must never reach the audit log."""
+        hexes = []
+        for raw in self._prepared.signed_payload:
+            h = bytes(raw).hex()
+            hexes.extend((h, "0x" + h))
+        return tuple(hexes)
+
+    def _verify_payload_signers(self) -> None:
+        """Wallet-identity binding: every signed transaction in the
+        capability must have been signed by the verified agent wallet."""
+        for i, raw in enumerate(self._prepared.signed_payload):
+            try:
+                signer = _recover_signer(raw)
+            except Exception as exc:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] is not a recoverable signed "
+                    "transaction — refusing"
+                ) from exc
+            if signer.lower() != self._prepared.sender:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] was signed by {signer.lower()}, "
+                    "not the verified agent wallet — refusing"
+                )
+
+    def _verify_bindings(self) -> None:
+        """Re-verify EVERY capability binding before any relay interaction:
+        chain identity (allowlist + expectation + capability match),
+        wallet identity (signer recovery) and the exact-payload/target
+        fingerprint."""
+        p = self._prepared
+        reported = self.verify_chain()  # allowlist + expected chain (live RPC)
+        if reported != p.chain_id:
+            raise TestnetSafetyError(
+                f"chain binding mismatch: the bundle was prepared for chain "
+                f"{p.chain_id} but the transport now reports {reported}"
+            )
+        self._verify_payload_signers()
+        if _payload_fingerprint(p.signed_payload, p.target_block) != p.fingerprint:
+            raise TestnetSafetyError(
+                "payload binding mismatch: the prepared signed payload does "
+                "not match its recorded fingerprint — refusing"
+            )
 
     def verify_chain(self) -> int:
         """Verify the transport RPC's reported chain ID against the
@@ -754,137 +1023,213 @@ class FlashbotsBundleSession:
             reported, self._config.expected_chain_id, self._config.effective_allowlist()
         )
 
-    def simulate(
-        self,
-        signed_txs: Sequence[bytes],
-        target_block: int,
-        *,
-        purpose: str = "flashbots bundle simulation",
-    ) -> dict:
-        """Simulate the signed bundle via eth_callBundle (read-only relay
-        operation; no execution gate required, every other check applies).
+    # ── audit ───────────────────────────────────────────────────────────────
 
-        A successful return stores the authorization that submit() will
-        later require. Simulation and submission are distinct operations.
-        """
-        cfg = self._config
-        if not cfg.rpc_url:
-            raise TestnetSafetyError(
-                "relay RPC URL is required for bundle simulation"
-            )
-        self.verify_chain()
-        payload = [bytes(r) for r in signed_txs]
-        if not payload:
-            raise TestnetSafetyError("empty bundle refused")
-        head = int(self._w3.eth.block_number)
-        if int(target_block) <= head:
-            raise TestnetSafetyError(
-                f"target block {target_block} is not in the future "
-                f"(head {head}) — refusing to simulate"
-            )
-        simulation = self._w3.flashbots.simulate(
-            [{"signed_transaction": raw} for raw in payload],
-            int(target_block),
+    def _record(self, outcome: str, *, error=None, tx_hash=None, estimated_gas=None) -> dict:
+        """Append one audit record for this bundle; error text must already
+        be sanitized by the caller."""
+        return record_testnet_tx(
+            self._config.tx_log_path,
+            purpose=self._prepared.purpose,
+            chain_id=self._prepared.chain_id,
+            target=self._prepared.sender,
+            function=(
+                "flashbots_callBundle"
+                if outcome in self._SIMULATION_OUTCOMES
+                else "flashbots_send_bundle"
+            ),
+            estimated_gas=estimated_gas,
+            actual_gas_used=None,
+            tx_hash=tx_hash,
+            outcome=outcome,
+            error=error,
+            max_fee_exposure_wei=self._prepared.total_fee_exposure_wei,
         )
-        evaluate_bundle_simulation(simulation, expected_tx_count=len(payload))
+
+    def simulate(self) -> dict:
+        """Simulate the PREPARED bundle via eth_callBundle (read-only relay
+        operation on the exact prepared payload and target block — there
+        is no parameter to substitute another payload).
+
+        A successful return stores the one-use authorization that submit()
+        later requires. Simulation and submission are distinct operations.
+        Every outcome — success, failure or refusal — is audited; error
+        text is sanitized and never contains the signed payload.
+        """
+        p = self._prepared
+        try:
+            if not self._config.rpc_url:
+                raise TestnetSafetyError(
+                    "relay RPC URL is required for bundle simulation"
+                )
+            self._verify_bindings()  # chain + wallet + payload bindings
+            head = int(self._w3.eth.block_number)
+            if p.target_block <= head:
+                raise TestnetSafetyError(
+                    f"stale simulation refused: target block {p.target_block} "
+                    f"already reached (head {head}) — refusing to simulate"
+                )
+        except TestnetSafetyError as exc:
+            self._record(
+                "simulation_refused",
+                error=_sanitize_error(exc, *self._payload_hexes()),
+            )
+            raise
+        try:
+            simulation = self._w3.flashbots.simulate(
+                [{"signed_transaction": raw} for raw in p.signed_payload],
+                p.target_block,
+            )
+            evaluate_bundle_simulation(
+                simulation, expected_tx_count=len(p.signed_payload)
+            )
+        except Exception as exc:
+            # Failed simulations are audited too: top-level relay errors,
+            # reverts, firstRevert, malformed responses, missing results
+            # and result-count mismatches (DSS-WO-ENG-005 §4).
+            self._record(
+                "simulation_failed",
+                error=_sanitize_error(exc, *self._payload_hexes()),
+            )
+            raise
         total_gas = None
         try:
             total_gas = int(simulation.get("totalGasUsed"))
         except (TypeError, ValueError, AttributeError):
             total_gas = None
-        self._authorized[_payload_fingerprint(payload, int(target_block))] = {
-            "target_block": int(target_block),
+        self._authorized[p.fingerprint] = {
+            "target_block": p.target_block,
             "chain_id": self._chain_id,
             "total_gas_used": total_gas,
             "timestamp": time.time(),
-            "purpose": purpose,
         }
-        record_testnet_tx(
-            cfg.tx_log_path,
-            purpose=purpose,
-            chain_id=self._chain_id,
-            target=self._sender.lower(),
-            function="flashbots_callBundle",
-            estimated_gas=total_gas,
-            actual_gas_used=None,
+        self._record(
+            "simulated",
             tx_hash=simulation.get("bundleHash"),
-            outcome="simulated",
-            error=None,
+            estimated_gas=total_gas,
         )
         return simulation
 
-    def submit(
-        self,
-        signed_txs: Sequence[bytes],
-        target_block: int,
-        *,
-        purpose: str = "flashbots bundle submission",
-    ) -> dict:
-        """Submit the signed bundle via eth_sendBundle.
+    def submit(self) -> dict:
+        """Submit the PREPARED bundle via eth_sendBundle.
 
         Fail-closed sequence BEFORE any relay submission call:
           1. the testnet execution gate flag must be set;
-          2. the RPC chain ID is re-verified (allowlist + expectation);
+          2. EVERY capability binding is re-verified — including the RPC
+             chain identity, immediately before submission;
           3. the target block must still be in the future — a simulation
              for a reached block is stale and cannot authorize anything;
-          4. a successful simulation of the EXACT signed payload for the
+          4. a successful simulation of the EXACT prepared payload for the
              EXACT target block must exist in this session.
-        The authorization is consumed by the submission.
+
+        The one-use authorization is consumed BEFORE the relay call, so a
+        relay timeout or any other submission failure cannot silently
+        authorize unlimited retries (DSS-WO-ENG-005 §4): a retry requires
+        a NEW successful simulation. Every attempt — accepted, rejected,
+        uncertain or refused — is audited; error text is sanitized and
+        never contains the signed payload or any other secret material.
         """
-        cfg = self._config
-        if not cfg.enabled:
-            raise TestnetSafetyError(
-                "bundle submission requires the testnet execution gate "
-                "(set DSS_TESTNET_EXEC=1); it is off by default"
-            )
-        if not cfg.rpc_url:
-            raise TestnetSafetyError("relay RPC URL is required for submission")
-        payload = [bytes(r) for r in signed_txs]
-        if not payload:
-            raise TestnetSafetyError("empty bundle refused")
-
-        self.verify_chain()  # 2: immediately before submission
-        head = int(self._w3.eth.block_number)
-        if head >= int(target_block):  # 3: staleness
-            raise TestnetSafetyError(
-                f"stale submission refused: target block {target_block} "
-                f"already reached (head {head}) — the simulation result is "
-                "no longer valid"
-            )
-        fingerprint = _payload_fingerprint(payload, int(target_block))
-        auth = self._authorized.get(fingerprint)
-        if auth is None:  # 4: mandatory successful simulation
-            raise TestnetSafetyError(
-                "submission refused: no successful simulation recorded for "
-                "this exact signed payload and target block — simulate() "
-                "must succeed first, and the submitted payload and target "
-                "block must match it exactly"
-            )
-
-        result = self._w3.flashbots.send_bundle(
-            [{"signed_transaction": raw} for raw in payload],
-            target_block_number=int(target_block),
-        )
-
-        bundle_hash = None
+        p = self._prepared
+        auth = None
         try:
-            bundle_hash = simulation_hash(result)
-        except Exception:
-            bundle_hash = None
-        record = record_testnet_tx(
-            cfg.tx_log_path,
-            purpose=purpose,
-            chain_id=self._chain_id,
-            target=self._sender.lower(),
-            function="flashbots_send_bundle",
-            estimated_gas=auth.get("total_gas_used"),
-            actual_gas_used=None,
+            if not self._config.enabled:
+                raise TestnetSafetyError(
+                    "bundle submission requires the testnet execution gate "
+                    "(set DSS_TESTNET_EXEC=1); it is off by default"
+                )
+            if not self._config.rpc_url:
+                raise TestnetSafetyError(
+                    "relay RPC URL is required for submission"
+                )
+            self._verify_bindings()  # 2: incl. chain, immediately pre-submission
+            head = int(self._w3.eth.block_number)
+            if head >= p.target_block:  # 3: staleness
+                raise TestnetSafetyError(
+                    f"stale submission refused: target block {p.target_block} "
+                    f"already reached (head {head}) — the simulation result is "
+                    "no longer valid"
+                )
+            auth = self._authorized.pop(p.fingerprint, None)  # consumed FIRST
+            if auth is None:  # 4: mandatory successful simulation
+                raise TestnetSafetyError(
+                    "submission refused: no successful simulation recorded "
+                    "for this exact prepared payload and target block — "
+                    "simulate() must succeed first, and the submitted "
+                    "payload and target block must match it exactly"
+                )
+        except TestnetSafetyError as exc:
+            self._record(
+                "submission_refused",
+                error=_sanitize_error(exc, *self._payload_hexes()),
+            )
+            raise
+
+        try:
+            result = self._w3.flashbots.send_bundle(
+                [{"signed_transaction": raw} for raw in p.signed_payload],
+                target_block_number=p.target_block,
+            )
+        except Exception as exc:
+            # Submission attempt failed: classify explicitly. A JSON-RPC
+            # error response is a deterministic REJECTION; anything else
+            # (timeout, transport failure) leaves the outcome UNCERTAIN —
+            # the bundle may still have landed. Either way the consumed
+            # authorization is NOT restored: retries need a new
+            # successful simulation.
+            outcome = "rejected" if isinstance(exc, ValueError) else "uncertain"
+            self._record(
+                outcome,
+                error=_sanitize_error(exc, *self._payload_hexes()),
+                estimated_gas=(auth or {}).get("total_gas_used"),
+            )
+            raise
+
+        bundle_hash = simulation_hash(result)
+        relay_error = _relay_error(result)
+        if relay_error is not None:
+            # The relay explicitly rejected the bundle (error in a 200
+            # response body instead of a raised error).
+            self._record(
+                "rejected",
+                error=_sanitize_error(
+                    f"relay error: {relay_error}", *self._payload_hexes()
+                ),
+                tx_hash=bundle_hash,
+                estimated_gas=auth.get("total_gas_used"),
+            )
+            raise TestnetSafetyError(
+                f"relay rejected the bundle submission: {relay_error}"
+            )
+        if bundle_hash is None:
+            self._record(
+                "uncertain",
+                error=(
+                    "relay returned no bundle hash — submission outcome "
+                    "unknown, failing closed"
+                ),
+                estimated_gas=auth.get("total_gas_used"),
+            )
+            raise TestnetSafetyError(
+                "relay submission outcome is uncertain: no bundle hash in "
+                "the relay response — treating the submission as failed"
+            )
+        record = self._record(
+            "accepted",
             tx_hash=bundle_hash,
-            outcome="submitted_to_relay",
-            error=None,
+            estimated_gas=auth.get("total_gas_used"),
         )
-        del self._authorized[fingerprint]  # one simulation authorizes once
         return {"relay_result": result, "audit": record}
+
+
+def _relay_error(result: object) -> Optional[str]:
+    """Explicit error field on a relay result — some relays return errors
+    inside a 200 response body instead of raising. Unknown shapes return
+    None; this function never touches credentials."""
+    if isinstance(result, dict):
+        err = result.get("error")
+        return str(err) if err else None
+    err = getattr(result, "error", None)
+    return str(err) if err else None
 
 
 def simulation_hash(result: object) -> Optional[str]:
@@ -1026,7 +1371,40 @@ def sign_and_submit_testnet_tx(
         int(w3.eth.chain_id), cfg.expected_chain_id, cfg.effective_allowlist()
     )
 
-    tx_hash = w3.eth.send_raw_transaction(raw)  # 7
+    selector = "transfer"
+    data = tx.get("data") or b""
+    if isinstance(data, str):
+        data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
+    if len(data) >= 4:
+        selector = "0x" + data[:4].hex()
+    elif int(tx.get("value", 0)) > 0:
+        selector = "eth_transfer"
+
+    # The exact signed payload must never appear in the audit log, even if
+    # a transport error embeds it (DSS-WO-ENG-005 §4).
+    raw_hexes = (raw.hex(), "0x" + raw.hex())
+    try:
+        tx_hash = w3.eth.send_raw_transaction(raw)  # 7
+    except Exception as exc:
+        # The submission attempt failed and is audited (DSS-WO-ENG-005 §4):
+        # a JSON-RPC error response is a deterministic REJECTION by the
+        # node; anything else (timeout, transport failure) leaves the
+        # outcome UNCERTAIN — the transaction may still have been received.
+        outcome = "rejected" if isinstance(exc, ValueError) else "uncertain"
+        record_testnet_tx(
+            cfg.tx_log_path,
+            purpose=purpose,
+            chain_id=chain_id,
+            target=str(tx.get("to", "")).lower(),
+            function=selector,
+            estimated_gas=tx["gas"],
+            actual_gas_used=None,
+            tx_hash=None,
+            outcome=outcome,
+            error=_sanitize_error(exc, *raw_hexes),
+            max_fee_exposure_wei=fee_exposure,
+        )
+        raise
     tx_hash_hex = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
 
     actual_gas_used = None
@@ -1041,16 +1419,7 @@ def sign_and_submit_testnet_tx(
         outcome = "mined" if int(status) == 1 else "reverted"
     except Exception as exc:  # receipt timeout — submission already happened
         outcome = "receipt_unavailable"
-        error = str(exc)
-
-    selector = "transfer"
-    data = tx.get("data") or b""
-    if isinstance(data, str):
-        data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
-    if len(data) >= 4:
-        selector = "0x" + data[:4].hex()
-    elif int(tx.get("value", 0)) > 0:
-        selector = "eth_transfer"
+        error = _sanitize_error(exc, *raw_hexes)
 
     record = record_testnet_tx(
         cfg.tx_log_path,
@@ -1081,30 +1450,40 @@ def prepare_flashbots_bundle(
 ) -> tuple["FlashbotsBundleSession", list[bytes], int]:
     """The ONLY sanctioned preparation path for Flashbots bundle operations.
 
-    Gate → verify chain → policy-validate the FINAL transactions → bind the
-    wallet identity → sign. NO relay call happens here; simulation and
-    submission are separate, explicit operations on the returned session.
+    Gate → verify chain → policy-validate the FINAL transactions (including
+    the aggregate bundle fee cap) → bind the wallet identity → sign → mint
+    the authorization capability → build the session. NO relay call happens
+    here; simulation and submission are separate, explicit operations on
+    the returned session.
 
     Sequence (every step fails closed):
-      1. config provisioned (RPC URL, allowlisted expected chain, secret
-         store custody checks) — the execution flag is NOT required yet:
-         simulation is read-only; submission enforces it in submit();
+      1. the testnet execution gate must be ENABLED and the config fully
+         provisioned (DSS_TESTNET_EXEC=1, RPC URL, allowlisted expected
+         chain, secret-store custody checks). Preparation DECRYPTS the
+         wallet and SIGNS, so it passes the SAME explicit gate as
+         direct-RPC submission — it must refuse to sign when
+         DSS_TESTNET_EXEC is unset or false (DSS-WO-ENG-005 §2);
       2. connect to the configured RPC and verify its REPORTED chain ID;
       3. fill nonce/gas/fee defaults, then validate every transaction of
-         the bundle against the policy (including fee exposure);
+         the bundle against the policy — including the per-transaction AND
+         the AGGREGATE bundle fee-exposure caps. An over-limit bundle is
+         refused BEFORE the wallet is decrypted or anything signed;
       4. decrypt the agent wallet through the single custody path and bind
          it to the recorded agent address;
       5. re-verify the chain ID, sign every transaction;
       6. build the relay transport (Flashbots middleware attached by the
-         factory; the agent wallet is the relay auth signer) and return
-         (session, signed_raw_txs, target_block).
+         factory; the agent wallet is the relay auth signer), MINT the
+         PreparedFlashbotsBundle capability — binding wallet identity,
+         chain ID, validated intent, exact signed payload, target block
+         and fingerprint — and return (session, signed_raw_txs,
+         target_block). No other code path can mint the capability.
 
     The Flashbots relay never becomes an independent authorization path:
-    the session only transports payloads that already passed every gate
-    above.
+    the session only transports the exact payload that already passed
+    every gate above.
     """
     cfg = config or TestnetExecutionConfig.from_env()
-    cfg.require_provisioned()  # 1
+    cfg.require_ready()  # 1 — SAME explicit gate as direct RPC (ENG-005 §2)
 
     if web3_factory is None:
         def web3_factory(url: str):
@@ -1124,14 +1503,20 @@ def prepare_flashbots_bundle(
     for tx in txs:
         tx["chainId"] = reported
     _fill_tx_defaults(w3, txs, sender)  # 3a
-    validate_bundle(
+    validated = validate_bundle(
         txs, sender=sender, chain_id=reported,
         max_value_wei=cfg.max_value_wei, max_gas_units=cfg.max_gas_units,
         max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
         max_priority_fee_wei=cfg.max_priority_fee_wei,
         max_total_fee_wei=cfg.max_total_fee_wei,
         known_targets=known_targets,
-    )  # 3b
+    )  # 3b — includes the AGGREGATE bundle fee cap, before wallet decryption
+    total_fee_exposure = validate_bundle_fee_exposure(
+        validated,
+        max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
+        max_priority_fee_wei=cfg.max_priority_fee_wei,
+        max_total_fee_wei=cfg.max_total_fee_wei,
+    )
 
     account = load_agent_wallet(cfg)  # 4
 
@@ -1148,13 +1533,18 @@ def prepare_flashbots_bundle(
             flashbot(relay_w3, auth_account, relay_url)
             return relay_w3
 
-    relay_w3 = relay_factory(cfg.rpc_url, account, cfg.relay_url)  # 6
-    session = FlashbotsBundleSession(
-        relay_w3,
-        sender=sender,
-        config=cfg,
-        chain_id=reported,
-        known_targets=known_targets,
-    )
+    relay_w3 = relay_factory(cfg.rpc_url, account, cfg.relay_url)  # 6a
     target_block = int(w3.eth.block_number) + 1
-    return session, signed, target_block
+    prepared = PreparedFlashbotsBundle._mint(  # 6b: the ONLY minting path
+        sender=sender,
+        chain_id=reported,
+        validated_txs=validated,
+        signed_payload=signed,
+        target_block=target_block,
+        fingerprint=_payload_fingerprint(signed, target_block),
+        total_fee_exposure_wei=total_fee_exposure,
+        purpose=purpose,
+        config=cfg,
+    )
+    session = FlashbotsBundleSession(relay_w3, prepared)
+    return session, list(signed), target_block

@@ -5,3 +5,4 @@ logs/*.jsonl
 *.env
 cache/
 graph_data.json
+/executor/relay_signer.json

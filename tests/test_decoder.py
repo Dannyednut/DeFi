@@ -66,7 +66,13 @@ class TestSwapDecoder(unittest.TestCase):
         self.assertEqual(swap.router_name, "UniswapV3")
         self.assertEqual(swap.version, 3)
         self.assertEqual(swap.token_path, [token1.lower(), token2.lower()])
-        self.assertEqual(swap.v3_fees, [3000])
+        # Fee tiers moved to DecodedSwap.fee (list, one per hop).
+        self.assertEqual(swap.fee, [3000])
+        # The canonical UniswapV3 ExactInputSingleParams struct includes a
+        # deadline field; the decoder must skip it when reading amounts.
+        self.assertEqual(swap.amount_in, 1000)
+        self.assertEqual(swap.amount_out_min, 900)
+        self.assertTrue(swap.amount_in_is_exact)
 
 if __name__ == "__main__":
     unittest.main()

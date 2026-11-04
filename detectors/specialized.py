@@ -250,7 +250,7 @@ class LiquidationScanner(BaseDetector):
                 debt_usd = total_debt / 1e8
                 bonus_pct = 0.05
                 gross_usd = debt_usd * bonus_pct
-                gas_usd = self._estimate_gas_usd(gas_units=500_000)
+                gas_usd, _gas_wei = self._estimate_gas_usd(gas_units=500_000)
                 net_usd = gross_usd - gas_usd
                 
                 opp = Opportunity(

@@ -176,8 +176,13 @@ class BaseDetector(ABC):
         price = _oracle_price(token_address) or NATIVE_PRICE_USD
         return (wei / 1e18) * price
     
-    def _estimate_gas_usd(self, gas_units: int = DEFAULT_GAS_UNITS) -> float:
-        """Estimate gas cost in USD."""
+    def _estimate_gas_usd(self, gas_units: int = DEFAULT_GAS_UNITS) -> tuple[float, int]:
+        """Estimate gas cost. Returns ``(gas_cost_usd, gas_cost_wei)``.
+
+        The declared ``float`` return type previously contradicted the
+        tuple actually returned on success (and ``0.0`` on failure), which
+        broke scalar consumers such as LiquidationScanner.on_block.
+        """
         try:
             from config import get_chain
             native_addr = get_chain().wrapped_native

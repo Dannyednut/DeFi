@@ -32,16 +32,22 @@ Every safety invariant of the gate is pinned here:
     CONTROLLED SESSION ONLY, no public API exposes broadcastable signed
     bytes, relay responses are scrubbed before they leave the session and
     the capability has no signed-payload property;
-  * caller-visible exception containment (ENG-007 Finding A): a transport
-    or evaluation exception that embeds the exact signed payload hex is
+  * caller-visible exception containment (ENG-007 Finding A; provider-
+    credential containment per ENG-008 Finding A): a transport or
+    evaluation exception that embeds the exact signed payload hex is
     NEVER re-raised to the caller and never attached as a visible cause
-    or context — the caller receives a TestnetSafetyError carrying the
-    failure classification, the original exception class name and a
-    sanitized diagnostic, with __cause__ and __context__ detached;
-    relay-provided error text (top-level simulation error, firstRevert,
-    per-transaction errors, explicit eth_sendBundle rejection bodies) is
-    sanitized before it reaches any caller-visible exception; the audit
-    record keeps the correct outcome and sanitized diagnostic; the
+    or context — and, hardened per ENG-008, its TEXT never reaches the
+    caller or the audit log at all: callers receive a TestnetSafetyError
+    carrying the failure classification, the original exception class
+    name and the safe stage. Relay-provided error text (top-level
+    simulation error, firstRevert, per-transaction errors, explicit
+    eth_sendBundle rejection bodies) is the only detail ever retained;
+    it is sanitized against the configured credential material (RPC/relay
+    URLs, user information, path-embedded provider keys, query-string
+    tokens) plus structural rules (any URL, Bearer/Basic values,
+    credential-shaped assignments, 100+ char hex with any 0x/0X prefix
+    casing or none) before it reaches any caller-visible exception or
+    the audit record; the audit record keeps the correct outcome; the
     one-use authorization consumption and retry rules are unchanged;
   * capability immutability and integrity (ENG-006 §3): prepared state is
     frozen (frozen dataclasses + refused attribute assignment), intents
@@ -56,13 +62,14 @@ Every safety invariant of the gate is pinned here:
     token approvals, chainId binding, and an AGGREGATE bundle-level fee
     cap enforced before wallet decryption (ENG-005 §5);
   * access lists are OUT OF POLICY (ENG-007 Finding B, Option A — fail
-    closed): a supplied non-empty accessList is rejected before signing,
-    a malformed accessList is rejected, an absent/None/empty accessList
-    is accepted (eth_account signs an empty list either way), the
-    signed-transaction decoder refuses a non-empty access list in the
-    signed EIP-1559 envelope, and a signed transaction that differs from
-    its validated intent by an access list fails closed before any relay
-    interaction;
+    closed; type consistency per ENG-008 Finding B): a supplied non-empty
+    accessList is rejected before signing, a malformed accessList —
+    including tuples, empty or not — is rejected, an absent/None/empty
+    LIST accessList is accepted (eth_account signs an empty list either
+    way), the signed-transaction decoder refuses a non-empty access list
+    in the signed EIP-1559 envelope, and a signed transaction that
+    differs from its validated intent by an access list fails closed
+    before any relay interaction;
   * wallet custody: the single wallet-loading path verifies secret-file
     presence/types/permissions, hex-decodes the passphrase, builds a
     proper eth_account LocalAccount and binds it to the recorded address;
@@ -115,6 +122,8 @@ from executor.testnet_gate import (
     ValidatedTransactionIntent,
     _decode_signed_tx,
     _payload_fingerprint,
+    _registered_secrets,
+    _sanitize_error,
     check_chain_id,
     evaluate_bundle_simulation,
     load_agent_wallet,
@@ -773,18 +782,21 @@ def _minted_capability(tmp, *, intent_tx, signed_tx,
 
 def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
                      fee_price_gwei=2, chain_values=(SEPOLIA,), head=99,
-                     purpose="capability session test"):
+                     purpose="capability session test",
+                     rpc_url="https://sepolia.example"):
     """Prepare a REAL bundle through the sanctioned path with a throwaway
     wallet. Returns (session, cfg, target, acct).
 
     ENG-006 §2 containment: this helper deliberately does NOT return the
     signed raw payload — tests that need the white-box payload read it
-    from session._prepared._state.signed_payload directly."""
+    from session._prepared._state.signed_payload directly. The rpc_url
+    parameter lets credential-containment tests (ENG-008) configure a
+    credential-bearing fake provider URL."""
     info = _tmp_keystore(tmp)
     acct = info["account"]
     cfg = TestnetExecutionConfig(
         enabled=enabled,
-        rpc_url="https://sepolia.example",
+        rpc_url=rpc_url,
         keystore_path=os.path.join(tmp, "keystore.json"),
         passphrase_path=os.path.join(tmp, "pass"),
         address_path=os.path.join(tmp, "address"),
@@ -1364,11 +1376,17 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
                 ))
             uncertain = [r for r in (json.loads(l) for l in log.splitlines() if l.strip())
                          if r["outcome"] == "uncertain"][-1]
-            # sanitized diagnostic preserved in the audit record (the class
-            # name is part of the caller-visible exception, not the audit
-            # error field)
-            self.assertIn("send failed", uncertain["error"])
-            self.assertIn("0x<redacted>", uncertain["error"])
+            # ENG-008 Finding A (preferred containment): the audit record
+            # keeps the classification, the exception CLASS NAME and the
+            # safe stage — the raw provider/HTTP exception text is never
+            # forwarded to the audit log either.
+            self.assertIn(
+                "bundle submission uncertain: RuntimeError "
+                "during relay submission call",
+                uncertain["error"],
+            )
+            self.assertNotIn("send failed", uncertain["error"])
+            self.assertNotIn("0x<redacted>", uncertain["error"])
             self.assertNotIn(payload_hex, uncertain["error"])
 
 
@@ -2031,8 +2049,9 @@ class TestPayloadContainmentENG006(unittest.TestCase):
             session, cfg, target, acct = _prepared_bundle(tmp, relay)
             # ENG-007 Finding A: the raw ConnectionError is replaced by a
             # caller-safe TestnetSafetyError with the classification, the
-            # exception class name and the sanitized diagnostic; the
-            # audit refusal record is unchanged.
+            # exception class name and the safe stage; the audit refusal
+            # record keeps the same shape (ENG-008 Finding A: classification
+            # + class name + stage, no raw transport text).
             with self.assertRaises(TestnetSafetyError) as ctx:
                 session.simulate()
             self.assertIn("bundle simulation refused", str(ctx.exception))
@@ -2042,7 +2061,15 @@ class TestPayloadContainmentENG006(unittest.TestCase):
             self.assertIn("simulation_refused", outcomes)
             with open(cfg.tx_log_path) as f:
                 log = f.read()
-            self.assertIn("RPC transport failure", log)
+            # ENG-008 Finding A: the raw transport text is never forwarded
+            # to the audit log — the record carries the classification, the
+            # class name and the safe stage instead.
+            self.assertNotIn("RPC transport failure", log)
+            self.assertIn(
+                "bundle simulation refused: ConnectionError "
+                "during relay preflight",
+                log,
+            )
             raw = session._prepared._state.signed_payload[0]
             self.assertNotIn(raw.hex(), log)
             self.assertFalse(relay.simulate_calls)  # relay never reached
@@ -2071,7 +2098,9 @@ class TestPayloadContainmentENG006(unittest.TestCase):
             #   binding check.
             with open(cfg.tx_log_path) as f:
                 log = f.read()
-            self.assertIn("RPC transport failure", log)
+            # ENG-008 Finding A: no raw transport text in the audit record.
+            self.assertNotIn("RPC transport failure", log)
+            self.assertIn("ConnectionError during relay preflight", log)
 
 
 class TestAuditLog(unittest.TestCase):
@@ -2346,16 +2375,21 @@ class TestExceptionContainmentENG007(unittest.TestCase):
             # classification preserved: uncertain + original class named
             self.assertIn("bundle submission uncertain", str(exc))
             self.assertIn("RuntimeError", str(exc))
-            # audit record: correct outcome + sanitized diagnostic (the
-            # audit error field carries the sanitized MESSAGE; the class
-            # name is part of the caller-visible exception)
+            # audit record: correct outcome + ENG-008 containment (the
+            # audit error carries ONLY the classification, the class name
+            # and the safe stage — the raw provider text is never
+            # forwarded)
             with open(cfg.tx_log_path) as f:
                 recs = [json.loads(l) for l in f if l.strip()]
             self.assertEqual(
                 [r["outcome"] for r in recs], ["simulated", "uncertain"]
             )
-            self.assertIn("send failed", recs[-1]["error"])
-            self.assertIn("0x<redacted>", recs[-1]["error"])
+            self.assertIn(
+                "bundle submission uncertain: RuntimeError "
+                "during relay submission call",
+                recs[-1]["error"],
+            )
+            self.assertNotIn("send failed", recs[-1]["error"])
             self.assertNotIn(payload_hex, recs[-1]["error"])
             self.assertNotIn(payload_hex, json.dumps(recs))
             # one-use authorization consumed by the attempt: a bare retry
@@ -2416,8 +2450,14 @@ class TestExceptionContainmentENG007(unittest.TestCase):
             failed = [
                 r for r in recs if r["outcome"] == "simulation_failed"
             ][-1]
-            self.assertIn("POST body rejected", failed["error"])
-            self.assertIn("0x<redacted>", failed["error"])
+            # ENG-008 Finding A: the raw transport text ("POST body
+            # rejected") is never forwarded to the audit log.
+            self.assertIn(
+                "bundle simulation failed: ConnectionAbortedError "
+                "during relay simulation call",
+                failed["error"],
+            )
+            self.assertNotIn("POST body rejected", failed["error"])
             self.assertNotIn(payload_hex, failed["error"])
             self.assertNotIn(payload_hex, json.dumps(recs))
             # a failed simulation authorizes nothing
@@ -2777,6 +2817,446 @@ class TestAccessListPolicyENG007(unittest.TestCase):
             self.assertEqual(decoded["kind"], "eip1559")
             session.simulate()
             self.assertEqual(len(relay.simulate_calls), 1)
+
+
+class TestAccessListTypeConsistencyENG008(unittest.TestCase):
+    """DSS-WO-ENG-008 Finding B: the validator and the documented policy
+    agree on access-list TYPES — absent, None and an empty LIST are
+    accepted; a tuple (empty or not) and every other non-list value are
+    rejected as MALFORMED. The signed EIP-1559 decoder keeps its
+    independent non-empty access-list rejection (unchanged)."""
+
+    SENDER = "0x" + "aa" * 20
+    ACCESS_LIST = [
+        {"address": "0x" + "bb" * 20, "storageKeys": ["0x" + "11" * 32]}
+    ]
+
+    def _tx(self, **over):
+        tx = {
+            "to": self.SENDER, "value": 0, "gas": 21000,
+            "maxFeePerGas": 2 * 10**9, "maxPriorityFeePerGas": 10**9,
+            "data": b"", "chainId": 11155111,
+        }
+        tx.update(over)
+        return tx
+
+    def test_empty_tuple_rejected_as_malformed(self):
+        with self.assertRaises(TestnetSafetyError) as ctx:
+            validate_transaction(
+                self._tx(accessList=()),
+                sender=self.SENDER, chain_id=11155111,
+            )
+        self.assertIn("malformed accessList", str(ctx.exception))
+
+    def test_non_empty_tuple_rejected_as_malformed(self):
+        """A tuple used to slip through the `(list, tuple)` acceptance and
+        be refused only as an unsupported access list; per the documented
+        policy it is MALFORMED — the type inconsistency is gone."""
+        with self.assertRaises(TestnetSafetyError) as ctx:
+            validate_transaction(
+                self._tx(accessList=tuple(self.ACCESS_LIST)),
+                sender=self.SENDER, chain_id=11155111,
+            )
+        self.assertIn("malformed accessList", str(ctx.exception))
+        self.assertNotIn("not supported", str(ctx.exception))
+
+    def test_list_none_and_absent_still_accepted(self):
+        for value in ([], None):
+            validate_transaction(
+                self._tx(accessList=value),
+                sender=self.SENDER, chain_id=11155111,
+            )
+        validate_transaction(
+            self._tx(), sender=self.SENDER, chain_id=11155111
+        )
+
+    def test_bundle_rejects_tuple_access_list(self):
+        with self.assertRaises(TestnetSafetyError) as ctx:
+            validate_bundle(
+                [self._tx(), self._tx(accessList=())],
+                sender=self.SENDER, chain_id=11155111,
+            )
+        self.assertIn("bundle tx[1] rejected", str(ctx.exception))
+        self.assertIn("malformed accessList", str(ctx.exception))
+
+    def test_signed_decoder_independent_rejection_unchanged(self):
+        """The signed-envelope decoder keeps its OWN non-empty access-list
+        refusal (DSS-WO-ENG-007 Finding B, unchanged)."""
+        acct = Account.create()
+        signed = acct.sign_transaction(dict(
+            self._tx(), to=acct.address, nonce=0,
+            accessList=self.ACCESS_LIST,
+        ))
+        raw = bytes(
+            getattr(signed, "raw_transaction", None) or signed.rawTransaction
+        )
+        self.assertEqual(raw[0], 0x02)  # EIP-1559 envelope
+        with self.assertRaises(TestnetSafetyError) as ctx:
+            _decode_signed_tx(raw)
+        self.assertIn("non-empty EIP-1559 access list", str(ctx.exception))
+
+
+# ── DSS-WO-ENG-008 Finding A: provider credential containment ────────────────
+
+FAKE_PROVIDER_KEY = "SK-FAKE-PROVIDER-KEY-0123456789abcdef"   # non-hex, 38 chars
+FAKE_URL_PASSWORD = "fake-url-password-99"
+FAKE_QUERY_TOKEN = "fake-query-token-77"
+CRED_RPC_URL = (
+    "https://agent:" + FAKE_URL_PASSWORD
+    + "@rpc.sepolia.invalid/v2/" + FAKE_PROVIDER_KEY
+    + "?token=" + FAKE_QUERY_TOKEN
+)
+CRED_SECRET_MATERIAL = (
+    CRED_RPC_URL,                 # the full credential-bearing RPC URL
+    FAKE_PROVIDER_KEY,            # provider API key (URL path)
+    FAKE_URL_PASSWORD,            # URL password
+    "agent:" + FAKE_URL_PASSWORD, # URL user information
+    FAKE_QUERY_TOKEN,             # query-string token
+)
+
+
+class TestCredentialContainmentENG008(unittest.TestCase):
+    """DSS-WO-ENG-008 Finding A: provider credentials never reach any
+    caller-visible exception surface (str, repr, args, formatted
+    traceback, cause/context chain) or the audit-log JSONL — for the
+    Flashbots simulation transport, the Flashbots submission transport and
+    the direct-RPC path alike, using a deliberately fake 38-character
+    provider key embedded in a test RPC URL.
+
+    Foreign transport/HTTP exceptions expose ONLY the failure
+    classification, the exception class name and the safe stage (the
+    preferred containment: no arbitrary provider/HTTP text reaches the
+    caller or the audit log); retained relay-provided text is sanitized
+    against the configured credential material and the structural rules.
+    Failure classifications, audit outcomes and the one-use authorization
+    rules are unchanged."""
+
+    def _assert_audit_clean(self, log_path, forbidden):
+        with open(log_path) as f:
+            log = f.read()
+        for secret in forbidden:
+            self.assertNotIn(secret, log)
+        return log
+
+    def _read_records(self, log_path):
+        with open(log_path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    # ── mandatory regression 1: Flashbots simulation transport ──────────
+
+    def test_flashbots_simulation_transport_exception_with_credential_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(
+                tmp, relay, rpc_url=CRED_RPC_URL)
+
+            def _boom(bundle, block_tag, *args, **kwargs):
+                raise RuntimeError(
+                    f"POST {CRED_RPC_URL} failed: HTTP 401 unauthorized")
+
+            relay.simulate = _boom
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL)
+            # preferred containment: classification + class name + stage,
+            # NO arbitrary provider/HTTP text
+            self.assertIn("bundle simulation failed", str(exc))
+            self.assertIn("RuntimeError", str(exc))
+            self.assertIn("relay simulation call", str(exc))
+            self.assertNotIn("POST", str(exc))
+            self.assertNotIn("401", str(exc))
+            # audit: outcome preserved; credential AND provider text absent
+            log = self._assert_audit_clean(
+                cfg.tx_log_path, CRED_SECRET_MATERIAL)
+            self.assertNotIn("POST", log)
+            recs = self._read_records(cfg.tx_log_path)
+            self.assertEqual(
+                [r["outcome"] for r in recs], ["simulation_failed"])
+            self.assertIn(
+                "bundle simulation failed: RuntimeError "
+                "during relay simulation call",
+                recs[-1]["error"],
+            )
+            # a failed simulation authorizes nothing: submission is refused
+            # without any relay interaction (one-use rules unchanged)
+            with self.assertRaises(TestnetSafetyError):
+                session.submit()
+            self.assertEqual(relay.send_calls, [])
+
+    # ── mandatory regression 2: Flashbots submission transport ──────────
+
+    def test_flashbots_submission_transport_exception_with_credential(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(
+                tmp, relay, rpc_url=CRED_RPC_URL)
+            session.simulate()
+
+            def _boom(bundle, target_block_number=None, **kw):
+                raise ConnectionResetError(
+                    f"connection to {CRED_RPC_URL} reset while submitting")
+
+            relay.send_bundle = _boom
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.submit()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL)
+            self.assertIn("bundle submission uncertain", str(exc))
+            self.assertIn("ConnectionResetError", str(exc))
+            self.assertIn("relay submission call", str(exc))
+            self._assert_audit_clean(cfg.tx_log_path, CRED_SECRET_MATERIAL)
+            recs = self._read_records(cfg.tx_log_path)
+            self.assertEqual(
+                [r["outcome"] for r in recs], ["simulated", "uncertain"])
+            # one-use authorization: the consumed authorization is NOT
+            # restored — a bare retry is refused without a new simulation
+            del relay.send_bundle  # restore the accepting stub
+            with self.assertRaises(TestnetSafetyError) as retry_err:
+                session.submit()
+            self.assertIn(
+                "no successful simulation", str(retry_err.exception))
+            self.assertEqual(len(relay.send_calls), 0)
+
+    # ── mandatory regression 3: direct-RPC submission ────────────────────
+
+    def test_direct_rpc_submission_exception_with_credential(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            sender = info["account"].address
+            cfg = TestnetExecutionConfig(
+                enabled=True,
+                rpc_url=CRED_RPC_URL,
+                keystore_path=os.path.join(tmp, "keystore.json"),
+                passphrase_path=os.path.join(tmp, "pass"),
+                address_path=os.path.join(tmp, "address"),
+                tx_log_path=os.path.join(tmp, "txlog.jsonl"),
+            )
+            w3 = MagicMock()
+            w3.is_connected.return_value = True
+            w3.eth.chain_id = 11155111
+            w3.eth.get_transaction_count.return_value = 7
+            w3.eth.get_block.return_value = {"baseFeePerGas": 10**9}
+            w3.to_wei.side_effect = (
+                lambda v, u: int(v * 10**9) if u == "gwei" else v
+            )
+            w3.eth.send_raw_transaction.side_effect = RuntimeError(
+                f"cannot reach {CRED_RPC_URL} (connection refused)")
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    {"to": sender, "value": 0, "gas": 21000, "data": b""},
+                    purpose="credential containment (direct RPC)",
+                    config=cfg,
+                    web3_factory=lambda url: w3,
+                )
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL)
+            self.assertIn("testnet submission uncertain", str(exc))
+            self.assertIn("RuntimeError", str(exc))
+            self.assertIn("direct-RPC submission", str(exc))
+            self._assert_audit_clean(cfg.tx_log_path, CRED_SECRET_MATERIAL)
+            rec = self._read_records(cfg.tx_log_path)[-1]
+            self.assertEqual(rec["outcome"], "uncertain")
+            self.assertIn(
+                "testnet submission uncertain: RuntimeError "
+                "during direct-RPC submission",
+                rec["error"],
+            )
+
+    # ── mandatory regression 4: relay error responses ────────────────────
+
+    def test_relay_error_response_with_credential_like_token(self):
+        """A relay rejection body carrying a credential-like token (the
+        fake provider key, registered from the configured RPC URL): the
+        retained relay text is sanitized before it reaches the caller
+        exception and the audit log."""
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(
+                tmp, relay, rpc_url=CRED_RPC_URL)
+            session.simulate()
+
+            def _leaky(bundle, target_block_number=None, **kw):
+                return {
+                    "error": {
+                        "message": (
+                            "relay auth failed for apikey="
+                            + FAKE_PROVIDER_KEY
+                            + " (Bearer " + FAKE_PROVIDER_KEY + ")"
+                        )
+                    },
+                    "bundleHash": "0x" + "77" * 32,
+                }
+
+            relay.send_bundle = _leaky
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.submit()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL)
+            self.assertIn(
+                "relay rejected the bundle submission", str(exc))
+            self._assert_audit_clean(
+                cfg.tx_log_path, CRED_SECRET_MATERIAL)
+            recs = self._read_records(cfg.tx_log_path)
+            self.assertEqual(
+                [r["outcome"] for r in recs], ["simulated", "rejected"])
+
+    def test_relay_simulation_error_with_credential_like_token(self):
+        """Same containment for the eth_callBundle path: a top-level
+        simulation error carrying credential-shaped material is sanitized
+        against the configured credential material plus the structural
+        rules (DSS-WO-ENG-008 Finding A)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(
+                tmp, relay, rpc_url=CRED_RPC_URL)
+            relay._sim_result = {
+                "error": (
+                    "relay denied: token=" + FAKE_QUERY_TOKEN
+                    + " key=" + FAKE_PROVIDER_KEY
+                )
+            }
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL)
+            self.assertIn("bundle simulation failed", str(exc))
+            self._assert_audit_clean(
+                cfg.tx_log_path, CRED_SECRET_MATERIAL)
+            self.assertIn(
+                "simulation_failed", _audit_outcomes(cfg))
+
+    # ── mandatory regression 5: query parameter / authorization style ────
+
+    def test_credential_in_query_parameter_and_authorization_style(self):
+        """A credential appearing as a URL query parameter AND in
+        authorization-style strings is contained even when the exception
+        carries several shapes at once."""
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(
+                tmp, relay, rpc_url=CRED_RPC_URL)
+
+            def _boom(bundle, block_tag, *args, **kwargs):
+                raise RuntimeError(
+                    "request rejected — headers: "
+                    "Authorization: Bearer " + FAKE_PROVIDER_KEY + "; "
+                    "x-api-key: " + FAKE_PROVIDER_KEY + "; "
+                    "url: https://rpc.sepolia.invalid/v2/"
+                    + FAKE_PROVIDER_KEY + "?api_key=" + FAKE_QUERY_TOKEN
+                )
+
+            relay.simulate = _boom
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            _assert_exception_clean(
+                self, ctx.exception, CRED_SECRET_MATERIAL)
+            self._assert_audit_clean(
+                cfg.tx_log_path, CRED_SECRET_MATERIAL)
+            # foreign text is dropped entirely under the preferred
+            # containment — only classification/class/stage remain
+            self.assertIn("bundle simulation failed", str(ctx.exception))
+            self.assertNotIn("Authorization", str(ctx.exception))
+            self.assertNotIn("x-api-key", str(ctx.exception))
+
+    # ── mandatory regression 6: uppercase 0X prefix bypass ───────────────
+
+    def test_long_signed_payload_hex_with_uppercase_0x_prefix(self):
+        """The sanitization rule cannot be bypassed through prefix casing:
+        a long signed-payload hex echoed with an uppercase `0X` prefix (or
+        with no prefix) is redacted from every caller-visible surface and
+        the audit log."""
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(tmp, relay)
+            payload_hex = bytes(
+                session._prepared._state.signed_payload[0]).hex()
+            upper_prefixed = "0X" + payload_hex.upper()
+            forbidden = [upper_prefixed, payload_hex.upper(), payload_hex]
+
+            def _boom(bundle, block_tag, *args, **kwargs):
+                raise RuntimeError(
+                    f"preflight check failed for {upper_prefixed}")
+
+            relay.simulate = _boom
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            _assert_exception_clean(self, ctx.exception, forbidden)
+            log = self._assert_audit_clean(cfg.tx_log_path, forbidden)
+            # preferred containment: the foreign text (with its 0X-prefixed
+            # payload) is never forwarded at all — only classification,
+            # class name and stage reach the audit record...
+            recs = self._read_records(cfg.tx_log_path)
+            self.assertEqual(
+                [r["outcome"] for r in recs], ["simulation_failed"])
+            self.assertNotIn("preflight check failed", recs[-1]["error"])
+            # ...and the structural rule itself provably redacts the 0X
+            # form whenever such text is retained (relay-provided text)
+            self.assertEqual(
+                _sanitize_error(f"tx {upper_prefixed} end"),
+                "tx 0x<redacted-hex> end",
+            )
+            self.assertEqual(
+                _sanitize_error(f"tx {payload_hex} end"),
+                "tx 0x<redacted-hex> end",
+            )
+
+
+class TestSanitizerCredentialRulesENG008(unittest.TestCase):
+    """DSS-WO-ENG-008 Finding A: the structural rules themselves. Long hex
+    in ANY prefix casing (or none) is redacted; URLs, Bearer/Basic values
+    and credential-shaped assignments are redacted; legitimate hashes,
+    addresses and metadata survive. Generic long-hex redaction is
+    explicitly NOT claimed to be credential protection: credentials are
+    contained primarily by never forwarding foreign exception text at
+    all, plus the registered-secrets match and these structural rules."""
+
+    def test_long_hex_prefix_casing_all_redacted(self):
+        blob = "ab" * 60  # 120 hex chars
+        for form in ("0x" + blob, "0X" + blob, "0X" + blob.upper(), blob):
+            out = _sanitize_error(f"raw {form} end")
+            self.assertNotIn(blob, out)
+            self.assertIn("0x<redacted-hex>", out)
+
+    def test_short_hashes_and_addresses_survive(self):
+        text = "hash 0x" + "ab" * 32 + " addr 0x" + "cd" * 20
+        self.assertEqual(_sanitize_error(text), text)
+
+    def test_url_with_userinfo_query_and_path_key_redacted(self):
+        out = _sanitize_error(
+            "POST https://agent:pw1234567890@rpc.invalid/v2/"
+            + FAKE_PROVIDER_KEY + "?token=" + FAKE_QUERY_TOKEN + " failed")
+        self.assertNotIn(FAKE_PROVIDER_KEY, out)
+        self.assertNotIn(FAKE_QUERY_TOKEN, out)
+        self.assertNotIn("pw1234567890", out)
+        self.assertNotIn("://", out)
+        self.assertIn("<redacted-url>", out)
+
+    def test_bearer_basic_and_credential_assignments_redacted(self):
+        out = _sanitize_error(
+            "auth error: Authorization: Bearer sk1234567890abcdef, "
+            "Basic dXNlcjpwYXNzd29yZDEyMzQ1Ng==, apikey=0123456789abcdef, "
+            "passphrase=hunter2said")
+        self.assertNotIn("sk1234567890abcdef", out)
+        self.assertNotIn("dXNlcjpwYXNzd29yZDEyMzQ1Ng", out)
+        self.assertNotIn("0123456789abcdef", out)
+        self.assertNotIn("hunter2said", out)
+
+    def test_registered_secrets_from_config(self):
+        cfg = TestnetExecutionConfig(
+            enabled=True,
+            rpc_url=CRED_RPC_URL,
+            relay_url="https://relay-sepolia.flashbots.net",
+        )
+        registered = _registered_secrets(cfg)
+        for secret in (
+            CRED_RPC_URL, FAKE_PROVIDER_KEY, FAKE_URL_PASSWORD,
+            "agent:" + FAKE_URL_PASSWORD, FAKE_QUERY_TOKEN,
+        ):
+            self.assertIn(secret, registered)
+        # short components are NOT registered individually: registering
+        # the username "agent" would over-redact ordinary words
+        self.assertNotIn("agent", registered)
 
 
 if __name__ == "__main__":

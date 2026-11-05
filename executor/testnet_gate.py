@@ -86,16 +86,25 @@ Design invariants (all fail closed):
     returned to callers are scrubbed of raw-transaction-shaped keys and
     long hex blobs before they leave the session (DSS-WO-ENG-006 §4).
   * Caller-visible EXCEPTIONS never carry secret material (DSS-WO-ENG-007
-    Finding A): transport and evaluation failures can embed the exact
-    signed payload hex (relays and HTTP libraries quote request bodies),
-    so simulate()/submit() and the direct-RPC submission path never
-    re-raise such an exception and never attach one as a visible cause or
-    context. Callers receive a TestnetSafetyError carrying the failure
-    classification (refused / failed / rejected / uncertain), the original
-    exception CLASS NAME and a sanitized diagnostic; relay-provided error
-    text is sanitized before it is incorporated into any caller-visible
-    exception; gate-raised TestnetSafetyErrors keep their exact type and
-    message with cause and context detached.
+    Finding A; hardened per DSS-WO-ENG-008 Finding A): transport and
+    evaluation failures can embed the exact signed payload hex AND
+    credential material — provider API keys, credential-bearing RPC URLs,
+    user information, query-string tokens, authorization values — in
+    shapes no sanitizer can reliably recognize. Foreign (non-gate)
+    exceptions are therefore NEVER re-raised, never attached as a visible
+    cause or context, and their TEXT never reaches the caller or the
+    audit log: callers receive a TestnetSafetyError carrying ONLY the
+    failure classification (refused / failed / rejected / uncertain), the
+    original exception CLASS NAME and the safe stage. The only detail
+    ever retained is RELAY-PROVIDED error text, which is sanitized
+    against the configured credential material (RPC/relay URLs and their
+    user information, path-embedded provider keys and query-string
+    tokens) plus structural rules (any URL, Bearer/Basic values,
+    credential-shaped assignments, and 100+ char hex blobs with a lower-
+    or uppercase 0x/0X prefix or none) before it reaches a caller-visible
+    exception or the audit log. Generic long-hex redaction alone is NOT
+    claimed to be credential protection. Gate-raised TestnetSafetyErrors
+    keep their exact type and message with cause and context detached.
   * Access lists are OUT OF POLICY (DSS-WO-ENG-007 Finding B, Option A —
     fail closed): any supplied non-empty accessList is rejected by the
     transaction policy BEFORE signing, the signed-transaction decoder
@@ -116,6 +125,7 @@ import os
 import re
 import stat
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -603,8 +613,9 @@ def validate_transaction(
       * a supplied (non-empty) EIP-1559 access list is REJECTED — access
         lists are out of policy at this execution boundary (DSS-WO-ENG-007
         Finding B, Option A — fail closed); an absent, None or empty
-        accessList is accepted, and a malformed (non-list) accessList is
-        rejected;
+        accessList is accepted, and a malformed (non-list — including
+        tuple) accessList is rejected (type consistency per
+        DSS-WO-ENG-008 Finding B);
       * no deployments (`to` must be a real recipient);
       * recipient must be the sender itself or a recorded known target
         for this chain (no arbitrary EOA transfers, no unverified targets);
@@ -625,11 +636,16 @@ def validate_transaction(
     # in the signed EIP-1559 envelope. An absent, None or EMPTY accessList
     # is accepted — eth_account signs an empty list either way, so the
     # only accepted form is exactly one: none.
+    # DSS-WO-ENG-008 Finding B (type consistency): the accepted types are
+    # exactly the documented policy — absent, None and empty LIST. A tuple
+    # (empty or not) is MALFORMED, like every other non-list value; the
+    # previous `(list, tuple)` acceptance contradicted the policy.
     access_list = tx.get("accessList")
-    if access_list is not None and not isinstance(access_list, (list, tuple)):
+    if access_list is not None and not isinstance(access_list, list):
         raise TestnetSafetyError(
-            "malformed accessList: expected a list — refusing "
-            "(DSS-WO-ENG-007 Finding B)"
+            "malformed accessList: expected a list — tuples and every "
+            "other non-list value are rejected as malformed "
+            "(DSS-WO-ENG-007 Finding B; DSS-WO-ENG-008 Finding B)"
         )
     if access_list:
         raise TestnetSafetyError(
@@ -768,24 +784,116 @@ def record_testnet_tx(log_path: str, **fields) -> dict:
 # Raw signed transactions serialize to ≥ ~200 hex characters, while
 # keystore/bundle/transaction hashes are exactly 64. Any hex blob of 100+
 # characters inside an error string is therefore treated as potential
-# secret material and redacted before it can reach the audit log.
-_LONG_HEX_RE = re.compile(r"0x[0-9a-fA-F]{100,}")
+# secret material and redacted before it can reach the audit log — with a
+# lowercase or UPPERCASE 0x/0X prefix, or with no prefix at all
+# (DSS-WO-ENG-008 Finding A: the old rule matched only a lowercase "0x",
+# so an uppercase-prefix or bare-hex echo of the signed bytes bypassed
+# it).
+_LONG_HEX_RE = re.compile(r"(?:0[xX])?[0-9a-fA-F]{100,}")
+
+# DSS-WO-ENG-008 Finding A: generic long-hex redaction is NOT credential
+# protection. Provider credentials are typically SHORT and non-hex, and
+# they hide in specific shapes — URLs, user information, path-embedded
+# API keys, query-string tokens and authorization headers. The rules
+# below redact exactly those shapes structurally (applied to every
+# string that reaches a caller-visible exception, the audit log or a
+# scrubbed relay response):
+#
+#   * any scheme://... URL is replaced wholesale — a URL can carry user
+#     information, a path-embedded provider key and query tokens that do
+#     not have to look like hex;
+#   * Bearer/Basic scheme tokens are redacted (authorization values are
+#     neither hex nor long);
+#   * credential-shaped assignments (api key / token / secret / password
+#     / passphrase / authorization / credentials = value) are redacted.
+_CRED_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s'\"<>]+")
+_AUTH_SCHEME_RE = re.compile(
+    r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._+/=:\-]{8,}"
+)
+_CRED_KV_RE = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?key|secret|token|password|passwd|"
+    r"pwd|passphrase|authorization|auth|credential|credentials)\b"
+    r"(\s*[=:]\s*)[^\s'\";&,]+"
+)
+
+
+def _sanitize_text(text: str) -> str:
+    """Structural credential-containment rules shared by the audit/error
+    sanitizer and the relay-response scrubber (DSS-WO-ENG-008 Finding
+    A). Order matters: URLs first (they can embed query tokens), then
+    Bearer/Basic values, then credential-shaped assignments, then any
+    remaining long hex."""
+    text = _CRED_URL_RE.sub("<redacted-url>", text)
+    text = _AUTH_SCHEME_RE.sub(r"\1 <redacted>", text)
+    text = _CRED_KV_RE.sub(r"\1\2<redacted>", text)
+    return _LONG_HEX_RE.sub("0x<redacted-hex>", text)
 
 
 def _sanitize_error(message: object, *forbidden: str) -> str:
-    """Make an error message safe for the audit log (DSS-WO-ENG-005 §4).
+    """Make an error message safe for the audit log AND every
+    caller-visible surface (DSS-WO-ENG-005 §4; hardened per
+    DSS-WO-ENG-008 Finding A).
 
-    Replaces every occurrence of each explicitly forbidden string (the
-    exact signed payload hex, with and without the 0x prefix) with a
-    redaction marker, then redacts any remaining long hex blob that could
-    be raw signed transaction bytes or other key material. Truncated to
+    Layers, in order:
+      1. every explicitly forbidden string — the configured RPC/relay
+         URLs and their credential-bearing components (user information,
+         path-embedded provider keys, query-string tokens) and the exact
+         signed payload hex — is replaced with a redaction marker;
+      2. the structural rules from _sanitize_text: any URL, Bearer/Basic
+         values, credential-shaped assignments, and any 100+ character
+         hex blob (potential raw signed transaction bytes) regardless of
+         prefix casing.
+
+    Generic long-hex redaction alone is explicitly NOT credential
+    protection — provider credentials are short and non-hex, which is
+    why layers 1–2 exist and why foreign transport exception text is
+    never forwarded at all (see _clean_raise_candidate). Truncated to
     300 characters so a hostile error cannot bloat the log.
     """
     text = str(message)
     for secret in forbidden:
         if secret:
             text = text.replace(secret, "<redacted>")
-    return _LONG_HEX_RE.sub("0x<redacted-hex>", text)[:300]
+    return _sanitize_text(text)[:300]
+
+
+def _registered_secrets(config: object) -> tuple:
+    """Exact credential strings tied to THIS configuration that must
+    never reach a caller-visible exception or the audit log
+    (DSS-WO-ENG-008 Finding A): the configured RPC and relay URLs
+    verbatim plus their credential-bearing components — user information
+    ("user:password"), the password itself, path segments that carry
+    provider API keys and query-string token values.
+
+    Components shorter than 16 characters are NOT registered
+    individually: they are ordinary words whose exact-match redaction
+    would over-redact benign text (the verbatim URL and the structural
+    rules cover those shapes). Components are matched verbatim only —
+    percent-encoded variants are handled by the structural URL rule
+    instead."""
+    secrets: list[str] = []
+    for url in (
+        getattr(config, "rpc_url", None),
+        getattr(config, "relay_url", None),
+    ):
+        if not isinstance(url, str) or not url:
+            continue
+        secrets.append(url)
+        try:
+            parts = urllib.parse.urlsplit(url)
+        except ValueError:
+            continue
+        if parts.username and parts.password:
+            secrets.append(f"{parts.username}:{parts.password}")
+        candidates = [parts.username, parts.password]
+        candidates.extend(parts.path.split("/"))
+        candidates.extend(
+            pair.partition("=")[2] for pair in parts.query.split("&") if pair
+        )
+        for component in candidates:
+            if component and len(component) >= 16 and component not in secrets:
+                secrets.append(component)
+    return tuple(secrets)
 
 
 # Response keys that could carry raw signed transaction bytes out of the
@@ -801,12 +909,15 @@ _SCRUB_MAX_DEPTH = 24
 
 def _scrub_transport_payload(obj: object, depth: int = 0):
     """Scrub a relay response before it leaves the session
-    (DSS-WO-ENG-006 §2/§4): values under raw-transaction-shaped keys are
-    replaced with a redaction marker, byte strings of broadcastable size
-    (a signed transaction is ≥ ~100 bytes; 32-byte hashes pass) are
-    redacted, and any long hex blob that could be raw signed bytes is
-    redacted from strings. Legitimate relay metadata — hashes, gas
-    figures, statuses — survives untouched."""
+    (DSS-WO-ENG-006 §2/§4; hardened per DSS-WO-ENG-008 Finding A): values
+    under raw-transaction-shaped keys are replaced with a redaction
+    marker, byte strings of broadcastable size (a signed transaction is
+    ≥ ~100 bytes; 32-byte hashes pass) are redacted, and every STRING is
+    passed through the structural credential-containment rules — any
+    URL, Bearer/Basic value, credential-shaped assignment and long hex
+    blob (lower- or uppercase 0x/0X prefix or none) is redacted, while
+    legitimate relay metadata — hashes, gas figures, statuses — survives
+    untouched."""
     if depth > _SCRUB_MAX_DEPTH:
         return "<redacted:too-deep>"
     if isinstance(obj, dict):
@@ -823,29 +934,36 @@ def _scrub_transport_payload(obj: object, depth: int = 0):
     if isinstance(obj, (bytes, bytearray)):
         return "<redacted-bytes>" if len(obj) >= 100 else bytes(obj)
     if isinstance(obj, str):
-        return _LONG_HEX_RE.sub("0x<redacted-hex>", obj)
+        return _sanitize_text(obj)
     return obj
 
 
 def _clean_raise_candidate(
-    exc: BaseException, classification: str, *forbidden: str
+    exc: BaseException,
+    classification: str,
+    *forbidden: str,
+    stage: Optional[str] = None,
 ) -> TestnetSafetyError:
     """Build the exception a caller may SEE after a failed operation
-    (DSS-WO-ENG-007 Finding A).
+    (DSS-WO-ENG-007 Finding A; hardened per DSS-WO-ENG-008 Finding A).
 
     A transport or evaluation exception can embed the exact signed payload
-    hex (relays and HTTP libraries routinely quote the request body in
-    error messages), so the original exception object is NEVER re-raised
-    to the caller and never attached as a visible cause or context:
+    hex AND credential material — provider API keys, credential-bearing
+    RPC URLs, user information, query tokens, authorization values — in
+    shapes no sanitizer can reliably recognize. The PREFERRED containment
+    is therefore applied to every FOREIGN (non-gate) exception:
 
       * a gate-constructed TestnetSafetyError (whose text is sanitized by
         construction) is re-raised as the SAME object — same type, same
         message, exact failure classification preserved — with any cause
-        or context detached;
+        or context detached; as defense in depth the message must survive
+        the structural sanitizer unchanged, otherwise the sanitized
+        message is used with the same type;
       * anything else is replaced by a fresh TestnetSafetyError carrying
-        only the failure classification, the original exception CLASS
-        NAME and the sanitized diagnostic (forbidden strings and long hex
-        redacted, truncated).
+        ONLY the failure classification, the original exception CLASS
+        NAME and the safe stage — the raw exception text is never passed
+        to the caller or the audit log, because provider/HTTP text cannot
+        be trusted to any redaction heuristic.
 
     The returned exception must be raised OUTSIDE the failing except
     block so Python's implicit exception chaining cannot attach the
@@ -855,18 +973,25 @@ def _clean_raise_candidate(
     exception.
     """
     err: TestnetSafetyError
-    if isinstance(exc, TestnetSafetyError) and not _LONG_HEX_RE.search(
-        str(exc)
-    ):
-        # Gate-constructed refusal: text is sanitized by construction;
-        # re-raising the same object preserves the exact type and message.
-        err = exc
+    if isinstance(exc, TestnetSafetyError):
+        text = _sanitize_error(str(exc), *forbidden)
+        if text == str(exc):
+            # Gate-constructed refusal: sanitized by construction;
+            # re-raising the same object preserves the exact type and
+            # message.
+            err = exc
+        else:
+            # Defense in depth: a gate message that somehow embeds
+            # credential-shaped material is redacted, not trusted.
+            err = TestnetSafetyError(text)
     else:
-        detail = _sanitize_error(exc, *forbidden)
+        # Foreign transport/HTTP/provider/evaluation exception: expose
+        # only the classification, the exception class name and the safe
+        # stage — never the exception text (DSS-WO-ENG-008 Finding A,
+        # preferred approach).
         err = TestnetSafetyError(
-            f"{classification}: {type(exc).__name__}: {detail}"
-            if detail
-            else f"{classification}: {type(exc).__name__}"
+            f"{classification}: {type(exc).__name__}"
+            + (f" during {stage}" if stage else "")
         )
     # Detach EVERY reference to the original failure. These must be set
     # before the raise, and the raise itself must happen outside any
@@ -884,6 +1009,7 @@ def evaluate_bundle_simulation(
     simulation: object,
     *,
     expected_tx_count: Optional[int] = None,
+    forbidden: Sequence[str] = (),
 ) -> dict:
     """Check a Flashbots eth_callBundle simulation result for failure.
 
@@ -898,9 +1024,12 @@ def evaluate_bundle_simulation(
 
     Relay-provided error text (top-level error, firstRevert,
     per-transaction error) is SANITIZED before it is embedded in the
-    raised exception (DSS-WO-ENG-007 Finding A): a relay response can
-    quote the submitted signed transactions, so the refusal must not
-    propagate that text verbatim to the caller.
+    raised exception (DSS-WO-ENG-007 Finding A; credential rules per
+    DSS-WO-ENG-008 Finding A): a relay response can quote the submitted
+    signed transactions AND credential material, so the refusal is
+    sanitized against `forbidden` (the configured credential material)
+    plus the structural rules before it reaches any caller-visible
+    exception or the audit log.
     """
     if not isinstance(simulation, dict) or not simulation:
         raise TestnetSafetyError(
@@ -909,14 +1038,14 @@ def evaluate_bundle_simulation(
     if simulation.get("error"):
         raise TestnetSafetyError(
             f"bundle simulation failed: "
-            f"{_sanitize_error(simulation['error'])}"
+            f"{_sanitize_error(simulation['error'], *forbidden)}"
         )
     result = simulation.get("result")
     result = result if isinstance(result, dict) else simulation
     if result.get("firstRevert"):
         raise TestnetSafetyError(
             f"bundle simulation reports firstRevert: "
-            f"{_sanitize_error(result['firstRevert'])}"
+            f"{_sanitize_error(result['firstRevert'], *forbidden)}"
         )
     results = result.get("results")
     if not results or not isinstance(results, list):
@@ -1509,13 +1638,25 @@ class FlashbotsBundleSession:
     # ── binding verification ────────────────────────────────────────────────
 
     def _payload_hexes(self) -> tuple:
-        """Exact signed payload hex (with and without 0x) for error
-        redaction — these strings must never reach the audit log."""
+        """Exact signed payload hex forms (lowercase with and without 0x,
+        UPPERCASE with and without 0X) for exact-match error redaction —
+        these strings must never reach the audit log or a caller-visible
+        exception. The structural sanitizer rule catches any other casing
+        anyway (DSS-WO-ENG-008 Finding A); the exact forms make the
+        redaction deterministic."""
         hexes = []
         for raw in self._prepared._state.signed_payload:
             h = bytes(raw).hex()
-            hexes.extend((h, "0x" + h))
+            hexes.extend((h, "0x" + h, h.upper(), "0X" + h.upper()))
         return tuple(hexes)
+
+    def _forbidden_material(self) -> tuple:
+        """Every exact string that must never reach a caller-visible
+        exception or the audit log (DSS-WO-ENG-008 Finding A): the signed
+        payload hexes plus the configured credential-bearing URL material
+        (RPC/relay URLs, user information, path-embedded provider keys,
+        query-string tokens)."""
+        return self._payload_hexes() + _registered_secrets(self._config)
 
     def _verify_payload_signers(self) -> None:
         """Wallet-identity binding: every signed transaction in the
@@ -1741,16 +1882,22 @@ class FlashbotsBundleSession:
         Every outcome — success, failure or refusal — is audited; error
         text is sanitized and never contains the signed payload.
 
-        CALLER-SAFE FAILURES (DSS-WO-ENG-007 Finding A): a transport or
-        evaluation exception can embed the exact signed payload hex, so
-        the original exception is never re-raised and never attached as a
-        visible cause or context. Callers receive a TestnetSafetyError
-        carrying the classification ("bundle simulation refused" for
-        preflight refusals, "bundle simulation failed" for relay/evaluation
-        failures), the original exception class name and a sanitized
-        diagnostic; gate-raised TestnetSafetyErrors keep their exact type
-        and message. Sanitized failures are raised OUTSIDE the failing
-        except block so implicit chaining cannot leak the original.
+        CALLER-SAFE FAILURES (DSS-WO-ENG-007 Finding A; DSS-WO-ENG-008
+        Finding A): a transport or evaluation exception can embed the
+        exact signed payload hex AND credential material (provider API
+        keys, credential-bearing RPC URLs, authorization values), so the
+        original exception is never re-raised, never attached as a visible
+        cause or context, and its TEXT never reaches the caller or the
+        audit log. Callers receive a TestnetSafetyError carrying the
+        classification ("bundle simulation refused" for preflight
+        refusals, "bundle simulation failed" for relay/evaluation
+        failures), the original exception CLASS NAME and the safe stage.
+        Relay-provided error text — the only detail ever retained — is
+        sanitized against the configured credential material and the
+        structural rules before it reaches the caller or the audit log.
+        Gate-raised TestnetSafetyErrors keep their exact type and message.
+        Sanitized failures are raised OUTSIDE the failing except block so
+        implicit chaining cannot leak the original.
         """
         p = self._prepared
         st = p._state
@@ -1771,17 +1918,18 @@ class FlashbotsBundleSession:
             # Every refusal is audited — including infrastructure/RPC
             # failures raised during preflight: once an attempt has been
             # initiated it must not silently escape the audit path
-            # (DSS-WO-ENG-006 §6). The caller-visible exception is a
-            # SANITIZED replacement (DSS-WO-ENG-007 Finding A): the
-            # original transport exception can embed the signed payload,
-            # so it is never re-raised and never attached as a visible
-            # cause or context.
+            # (DSS-WO-ENG-006 §6). The caller-visible exception — and the
+            # audit diagnostic — carry ONLY the classification, the
+            # exception class name and the safe stage (DSS-WO-ENG-008
+            # Finding A): foreign transport text can embed credential-
+            # bearing URLs and API keys, so it is never forwarded.
+            pending = _clean_raise_candidate(
+                exc, "bundle simulation refused",
+                *self._forbidden_material(), stage="relay preflight",
+            )
             self._record(
                 "simulation_refused",
-                error=_sanitize_error(exc, *self._payload_hexes()),
-            )
-            pending = _clean_raise_candidate(
-                exc, "bundle simulation refused", *self._payload_hexes()
+                error=_sanitize_error(pending, *self._forbidden_material()),
             )
         if pending is not None:
             # Raised OUTSIDE the except block: no implicit chaining.
@@ -1792,19 +1940,24 @@ class FlashbotsBundleSession:
                 p.target_block,
             )
             evaluate_bundle_simulation(
-                simulation, expected_tx_count=len(st.signed_payload)
+                simulation,
+                expected_tx_count=len(st.signed_payload),
+                forbidden=self._forbidden_material(),
             )
         except Exception as exc:
             # Failed simulations are audited too: top-level relay errors,
             # reverts, firstRevert, malformed responses, missing results
             # and result-count mismatches (DSS-WO-ENG-005 §4). Same
-            # caller-safe exception replacement (DSS-WO-ENG-007 Finding A).
+            # caller-safe exception replacement (DSS-WO-ENG-007 Finding
+            # A); foreign transport text is never forwarded (DSS-WO-ENG-
+            # 008 Finding A).
+            pending = _clean_raise_candidate(
+                exc, "bundle simulation failed",
+                *self._forbidden_material(), stage="relay simulation call",
+            )
             self._record(
                 "simulation_failed",
-                error=_sanitize_error(exc, *self._payload_hexes()),
-            )
-            pending = _clean_raise_candidate(
-                exc, "bundle simulation failed", *self._payload_hexes()
+                error=_sanitize_error(pending, *self._forbidden_material()),
             )
         if pending is not None:
             raise pending
@@ -1848,18 +2001,21 @@ class FlashbotsBundleSession:
         uncertain or refused — is audited; error text is sanitized and
         never contains the signed payload or any other secret material.
 
-        CALLER-SAFE FAILURES (DSS-WO-ENG-007 Finding A): transport
-        exceptions from eth_sendBundle can embed the exact signed payload
-        hex, so the original exception is never re-raised and never
-        attached as a visible cause or context. Callers receive a
-        TestnetSafetyError carrying the classification ("bundle submission
-        refused" / "bundle submission rejected" / "bundle submission
-        uncertain"), the original exception class name and a sanitized
-        diagnostic; relay-provided rejection text is sanitized before it
-        is incorporated into the raised exception; gate-raised
-        TestnetSafetyErrors keep their exact type and message. Sanitized
-        failures are raised OUTSIDE the failing except block so implicit
-        chaining cannot leak the original.
+        CALLER-SAFE FAILURES (DSS-WO-ENG-007 Finding A; DSS-WO-ENG-008
+        Finding A): transport exceptions from eth_sendBundle can embed the
+        exact signed payload hex AND credential material (provider API
+        keys, credential-bearing RPC URLs, authorization values), so the
+        original exception is never re-raised, never attached as a visible
+        cause or context, and its TEXT never reaches the caller or the
+        audit log. Callers receive a TestnetSafetyError carrying the
+        classification ("bundle submission refused" / "bundle submission
+        rejected" / "bundle submission uncertain"), the original exception
+        class name and the safe stage; relay-provided rejection text — the
+        only detail ever retained — is sanitized before it is incorporated
+        into the raised exception; gate-raised TestnetSafetyErrors keep
+        their exact type and message. Sanitized failures are raised
+        OUTSIDE the failing except block so implicit chaining cannot leak
+        the original.
         """
         p = self._prepared
         st = p._state
@@ -1897,14 +2053,16 @@ class FlashbotsBundleSession:
             # initiated it must not silently escape the audit path
             # (DSS-WO-ENG-006 §6). The one-use authorization is NOT
             # consumed here: the relay submission attempt never started.
-            # The caller-visible exception is a SANITIZED replacement
-            # (DSS-WO-ENG-007 Finding A).
+            # The caller-visible exception — and the audit diagnostic —
+            # carry ONLY the classification, the exception class name and
+            # the safe stage (DSS-WO-ENG-008 Finding A).
+            pending = _clean_raise_candidate(
+                exc, "bundle submission refused",
+                *self._forbidden_material(), stage="relay preflight",
+            )
             self._record(
                 "submission_refused",
-                error=_sanitize_error(exc, *self._payload_hexes()),
-            )
-            pending = _clean_raise_candidate(
-                exc, "bundle submission refused", *self._payload_hexes()
+                error=_sanitize_error(pending, *self._forbidden_material()),
             )
         if pending is not None:
             # Raised OUTSIDE the except block: no implicit chaining.
@@ -1923,17 +2081,23 @@ class FlashbotsBundleSession:
             # the bundle may still have landed. Either way the consumed
             # authorization is NOT restored: retries need a new
             # successful simulation. The original exception — which can
-            # embed the exact signed payload — is audited sanitized and
-            # then REPLACED by a caller-safe exception (DSS-WO-ENG-007
-            # Finding A); it is never re-raised or chained.
+            # embed the exact signed payload or credential material — is
+            # REPLACED by a caller-safe exception carrying only the
+            # classification, the class name and the safe stage
+            # (DSS-WO-ENG-007 Finding A; DSS-WO-ENG-008 Finding A); it is
+            # never re-raised or chained and its text never reaches the
+            # caller or the audit log.
             outcome = "rejected" if isinstance(exc, ValueError) else "uncertain"
+            submission_failure = _clean_raise_candidate(
+                exc, f"bundle submission {outcome}",
+                *self._forbidden_material(), stage="relay submission call",
+            )
             self._record(
                 outcome,
-                error=_sanitize_error(exc, *self._payload_hexes()),
+                error=_sanitize_error(
+                    submission_failure, *self._forbidden_material()
+                ),
                 estimated_gas=(auth or {}).get("total_gas_used"),
-            )
-            submission_failure = _clean_raise_candidate(
-                exc, f"bundle submission {outcome}", *self._payload_hexes()
             )
         if submission_failure is not None:
             # Raised OUTSIDE the except block: no implicit chaining.
@@ -1945,20 +2109,23 @@ class FlashbotsBundleSession:
             # The relay explicitly rejected the bundle (error in a 200
             # response body instead of a raised error). The relay-provided
             # error text is SANITIZED before it reaches the caller
-            # (DSS-WO-ENG-007 Finding A, item 3): a relay error can quote
-            # the submitted signed transactions. This raise is not inside
-            # any except block, so no implicit chaining occurs.
+            # (DSS-WO-ENG-007 Finding A, item 3; credential rules per
+            # DSS-WO-ENG-008 Finding A): a relay error can quote the
+            # submitted signed transactions or credential material. This
+            # raise is not inside any except block, so no implicit
+            # chaining occurs.
+            sanitized_relay_error = _sanitize_error(
+                relay_error, *self._forbidden_material()
+            )
             self._record(
                 "rejected",
-                error=_sanitize_error(
-                    f"relay error: {relay_error}", *self._payload_hexes()
-                ),
+                error=f"relay error: {sanitized_relay_error}",
                 tx_hash=bundle_hash,
                 estimated_gas=auth.get("total_gas_used"),
             )
             raise TestnetSafetyError(
                 "relay rejected the bundle submission: "
-                f"{_sanitize_error(relay_error, *self._payload_hexes())}"
+                f"{sanitized_relay_error}"
             )
         if bundle_hash is None:
             self._record(
@@ -2124,13 +2291,34 @@ def sign_and_submit_testnet_tx(
     )
 
     # 4. Decrypt the agent wallet; bind it to the recorded identity.
-    account = load_agent_wallet(cfg)
+    # Caller-safe failures (DSS-WO-ENG-008 Finding A): custody and signing
+    # failures are local crypto errors, but no library exception text is
+    # forwarded — the caller receives only the classification, the class
+    # name and the safe stage. Gate-raised custody refusals
+    # (TestnetSafetyError) keep their exact type and message.
+    custody_failure: Optional[TestnetSafetyError] = None
+    try:
+        account = load_agent_wallet(cfg)
+    except Exception as exc:
+        custody_failure = _clean_raise_candidate(
+            exc, "agent wallet custody failed", stage="wallet decryption",
+        )
+    if custody_failure is not None:
+        raise custody_failure
 
     check_chain_id(  # 5a: still the expected chain immediately before signing
         int(w3.eth.chain_id), cfg.expected_chain_id, cfg.effective_allowlist()
     )
-    signed = account.sign_transaction(tx)  # 5b
-    raw = _raw_signed_bytes(signed)
+    signing_failure: Optional[TestnetSafetyError] = None
+    try:
+        signed = account.sign_transaction(tx)  # 5b
+        raw = _raw_signed_bytes(signed)
+    except Exception as exc:
+        signing_failure = _clean_raise_candidate(
+            exc, "transaction signing failed", stage="transaction signing",
+        )
+    if signing_failure is not None:
+        raise signing_failure
 
     check_chain_id(  # 6: pre-submission
         int(w3.eth.chain_id), cfg.expected_chain_id, cfg.effective_allowlist()
@@ -2147,8 +2335,12 @@ def sign_and_submit_testnet_tx(
 
     # The exact signed payload must never appear in the audit log, even if
     # a transport error embeds it (DSS-WO-ENG-005 §4), and never in a
-    # caller-visible exception (DSS-WO-ENG-007 Finding A).
+    # caller-visible exception (DSS-WO-ENG-007 Finding A). Nor may any
+    # credential material from the configuration — the RPC/relay URLs and
+    # their user information, path-embedded provider keys and query-string
+    # tokens (DSS-WO-ENG-008 Finding A).
     raw_hexes = (raw.hex(), "0x" + raw.hex())
+    forbidden_material = _registered_secrets(cfg) + raw_hexes
     submission_failure: Optional[TestnetSafetyError] = None
     try:
         tx_hash = w3.eth.send_raw_transaction(raw)  # 7
@@ -2157,11 +2349,17 @@ def sign_and_submit_testnet_tx(
         # a JSON-RPC error response is a deterministic REJECTION by the
         # node; anything else (timeout, transport failure) leaves the
         # outcome UNCERTAIN — the transaction may still have been received.
-        # The original exception can embed the exact signed payload hex,
-        # so the caller receives a SANITIZED replacement raised OUTSIDE
-        # this except block — no bare re-raise, no cause/context chaining
-        # (DSS-WO-ENG-007 Finding A).
+        # The original exception can embed the exact signed payload hex OR
+        # credential-bearing provider material, so the caller receives a
+        # SANITIZED replacement raised OUTSIDE this except block — no bare
+        # re-raise, no cause/context chaining, and no provider/HTTP text
+        # in the caller-visible exception or the audit record
+        # (DSS-WO-ENG-007 Finding A; DSS-WO-ENG-008 Finding A).
         outcome = "rejected" if isinstance(exc, ValueError) else "uncertain"
+        submission_failure = _clean_raise_candidate(
+            exc, f"testnet submission {outcome}",
+            *forbidden_material, stage="direct-RPC submission",
+        )
         record_testnet_tx(
             cfg.tx_log_path,
             purpose=purpose,
@@ -2172,11 +2370,8 @@ def sign_and_submit_testnet_tx(
             actual_gas_used=None,
             tx_hash=None,
             outcome=outcome,
-            error=_sanitize_error(exc, *raw_hexes),
+            error=_sanitize_error(submission_failure, *forbidden_material),
             max_fee_exposure_wei=fee_exposure,
-        )
-        submission_failure = _clean_raise_candidate(
-            exc, f"testnet submission {outcome}", *raw_hexes
         )
     if submission_failure is not None:
         raise submission_failure
@@ -2194,7 +2389,13 @@ def sign_and_submit_testnet_tx(
         outcome = "mined" if int(status) == 1 else "reverted"
     except Exception as exc:  # receipt timeout — submission already happened
         outcome = "receipt_unavailable"
-        error = _sanitize_error(exc, *raw_hexes)
+        # Foreign transport text is never recorded (DSS-WO-ENG-008 Finding
+        # A): the audit carries the classification, class name and stage.
+        receipt_failure = _clean_raise_candidate(
+            exc, "receipt unavailable",
+            *forbidden_material, stage="receipt wait",
+        )
+        error = _sanitize_error(receipt_failure, *forbidden_material)
 
     record = record_testnet_tx(
         cfg.tx_log_path,
@@ -2303,12 +2504,36 @@ def prepare_flashbots_bundle(
         max_total_fee_wei=cfg.max_total_fee_wei,
     )
 
-    account = load_agent_wallet(cfg)  # 4
+    # 4. Decrypt the agent wallet; bind it to the recorded identity.
+    # Caller-safe failures (DSS-WO-ENG-008 Finding A): no custody or
+    # signing exception text is forwarded — the caller receives only the
+    # classification, the class name and the safe stage. Gate-raised
+    # custody refusals (TestnetSafetyError) keep their exact type and
+    # message.
+    custody_failure: Optional[TestnetSafetyError] = None
+    try:
+        account = load_agent_wallet(cfg)  # 4
+    except Exception as exc:
+        custody_failure = _clean_raise_candidate(
+            exc, "agent wallet custody failed", stage="wallet decryption",
+        )
+    if custody_failure is not None:
+        raise custody_failure
 
     check_chain_id(  # 5a: still the expected chain immediately before signing
         int(w3.eth.chain_id), cfg.expected_chain_id, cfg.effective_allowlist()
     )
-    signed = [_raw_signed_bytes(account.sign_transaction(tx)) for tx in txs]  # 5b
+    signing_failure: Optional[TestnetSafetyError] = None
+    try:
+        signed = [  # 5b
+            _raw_signed_bytes(account.sign_transaction(tx)) for tx in txs
+        ]
+    except Exception as exc:
+        signing_failure = _clean_raise_candidate(
+            exc, "transaction signing failed", stage="transaction signing",
+        )
+    if signing_failure is not None:
+        raise signing_failure
 
     if relay_factory is None:
         def relay_factory(url: str, auth_account, relay_url: str):

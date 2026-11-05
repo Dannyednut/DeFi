@@ -1,6 +1,8 @@
 # DSS Testnet Policy (DSS-WO-ENG-003 D; unified per DSS-WO-ENG-004;
 capability-gated per DSS-WO-ENG-005; payload-containment and
-capability-integrity hardened per DSS-WO-ENG-006)
+capability-integrity hardened per DSS-WO-ENG-006; exception containment
+and access-list fail-closure per DSS-WO-ENG-007; provider-credential
+containment and access-list type consistency per DSS-WO-ENG-008)
 
 Status: ACTIVE — enforced by `executor/testnet_gate.py`.
 The gate is **disabled by default** (`DSS_TESTNET_EXEC` unset/empty). Nothing
@@ -164,51 +166,79 @@ A caller can request preparation, simulation and controlled,
 authorization-checked submission — but cannot obtain the raw signed
 payload from the preparation API or any public session surface.
 
-**Caller-visible exception containment (DSS-WO-ENG-007 Finding A).**
+**Caller-visible exception containment (DSS-WO-ENG-007 Finding A;
+provider-credential containment per DSS-WO-ENG-008 Finding A).**
 Relay and HTTP transports routinely quote the request body in exception
 messages, so a transport failure during simulate/submit would otherwise
-carry the exact signed payload hex to the CALLER even though the audit
-record is sanitized. The session therefore never re-raises an original
-transport or evaluation exception and never attaches one as a visible
-cause or context (`__cause__` and `__context__` are detached and the
-sanitized failure is raised outside the failing except block, so
-implicit chaining cannot re-attach it either). Callers receive a
-`TestnetSafetyError` whose message, args, repr and formatted traceback
-contain only the failure classification (refused / failed / rejected /
-uncertain), the original exception CLASS NAME and a sanitized
-diagnostic (long hex redacted, truncated). Relay-provided error text —
-the top-level simulation error, `firstRevert`, per-transaction errors
-and the explicit `eth_sendBundle` rejection body — is sanitized before
-it is incorporated into any caller-visible exception, and relay-supplied
-hash fields are held against the same long-hex rule before they reach
-the audit log. Sanitized audit coverage, failure-path logging and the
-one-use submission authorization are unchanged. Gate-raised
-`TestnetSafetyError` refusals keep their exact type and message with
-cause and context detached. Python exceptions are an in-process
-interface only: this is containment against accidental leakage through
-error paths, not a barrier against hostile same-process code (see the
-honest threat model above).
+carry the exact signed payload hex — AND credential material — to the
+CALLER even though the audit record is sanitized. The session therefore
+never re-raises an original transport or evaluation exception and never
+attaches one as a visible cause or context (`__cause__` and
+`__context__` are detached and the sanitized failure is raised outside
+the failing except block, so implicit chaining cannot re-attach it
+either).
 
-**Access-list policy (DSS-WO-ENG-007 Finding B — Option A, fail
-closed).** The supported transaction policy covers plain legacy and
-EIP-1559 value-and-calldata intents only; access lists are OUT OF
-POLICY at this execution boundary. Any supplied non-empty `accessList`
-is rejected by `validate_transaction()` BEFORE anything is signed (and
-before wallet decryption for bundles; one rejected transaction rejects
-the whole bundle), a malformed (non-list) `accessList` is rejected, and
-the intent minting refuses an access list independently as defense in
-depth. The signed-transaction decoder independently refuses any
-non-empty access list in the signed EIP-1559 envelope (field 8) and
-refuses EIP-2930 envelopes outright, so a signed transaction that
-differs from its validated intent by an access list fails closed before
-any relay interaction. No access-list field is captured in the intent
-records: an absent, `None` or EMPTY accessList is accepted — eth_account
-signs an empty list either way, so the only accepted form is exactly
-one: none. Full binding (Option B: normalizing the access list into the
-intent and comparing it exactly) was considered and rejected as the
-strictly larger change with no policy gain — the gate's own preparation
-path can never mint an access-list intent, so there is no legitimate
-access-list payload to bind.
+Per DSS-WO-ENG-008 (preferred containment), a FOREIGN (non-gate)
+exception's TEXT is never forwarded to the caller or the audit log at
+all: provider/HTTP exception text can embed credential-bearing RPC URLs,
+provider API keys, URL user information, query-string tokens, Basic/
+Bearer authorization values and signed transaction bytes in shapes no
+redaction heuristic can reliably recognize. Callers — and the audit
+record — receive only the failure classification (refused / failed /
+rejected / uncertain), the original exception CLASS NAME and the safe
+stage (e.g. `bundle submission uncertain: RuntimeError during relay
+submission call`).
+
+The only detail ever RETAINED is relay-provided error text (the
+top-level simulation error, `firstRevert`, per-transaction errors and
+the explicit `eth_sendBundle` rejection body), because it is needed to
+diagnose relay refusals. Before it reaches any caller-visible exception
+or the audit log it is sanitized in layers: (1) exact-match redaction of
+the registered credential material — the configured RPC and relay URLs
+verbatim plus their user information, path-embedded provider keys and
+query-string token values; (2) structural rules — any `scheme://…` URL
+replaced wholesale, Bearer/Basic scheme tokens redacted,
+credential-shaped assignments (api key / token / secret / password /
+passphrase / authorization / credentials = value) redacted; (3) any
+100+ character hex blob — with a lower- or uppercase `0x`/`0X` prefix
+or none — redacted as potential raw signed transaction bytes.
+Relay-supplied hash fields are held against the same long-hex rule
+before they reach the audit log. **Generic long-hex redaction alone is
+explicitly NOT credential protection** — provider credentials are
+typically short and non-hex, which is why the foreign-text drop and the
+registered-secrets/structural layers exist. Sanitized audit coverage,
+failure-path logging and the one-use submission authorization are
+unchanged. Gate-raised `TestnetSafetyError` refusals keep their exact
+type and message with cause and context detached. Custody and signing
+failures in both orchestration paths are contained the same way
+(classification + class name + stage; gate-raised custody refusals keep
+their exact message). Python exceptions are an in-process interface
+only: this is containment against accidental leakage through error
+paths, not a barrier against hostile same-process code (see the honest
+threat model above).
+
+**Access-list policy (DSS-WO-ENG-007 Finding B — Option A, fail closed;
+type consistency per DSS-WO-ENG-008 Finding B).** The supported
+transaction policy covers plain legacy and EIP-1559 value-and-calldata
+intents only; access lists are OUT OF POLICY at this execution
+boundary. Any supplied non-empty `accessList` is rejected by
+`validate_transaction()` BEFORE anything is signed (and before wallet
+decryption for bundles; one rejected transaction rejects the whole
+bundle), a malformed (non-list — including tuples, empty or not)
+`accessList` is rejected, and the intent minting refuses an access list
+independently as defense in depth. The accepted types are exactly:
+absent, `None` and an empty LIST. The signed-transaction decoder
+independently refuses any non-empty access list in the signed EIP-1559
+envelope (field 8) and refuses EIP-2930 envelopes outright, so a signed
+transaction that differs from its validated intent by an access list
+fails closed before any relay interaction. No access-list field is
+captured in the intent records: an absent, `None` or EMPTY accessList
+is accepted — eth_account signs an empty list either way, so the only
+accepted form is exactly one: none. Full binding (Option B: normalizing
+the access list into the intent and comparing it exactly) was
+considered and rejected as the strictly larger change with no policy
+gain — the gate's own preparation path can never mint an access-list
+intent, so there is no legitimate access-list payload to bind.
 
 **Capability immutability (DSS-WO-ENG-006 §3).** Prepared-bundle state
 is a frozen dataclass (`_PreparedBundleState`) held behind a single
@@ -267,9 +297,13 @@ runtime (see §3 residual risk).
    `submission_refused` for pre-check refusals). Preflight
    infrastructure/RPC failures are audited too: once an attempt has
    been initiated it cannot silently escape the audit path
-   (DSS-WO-ENG-006 §6). Error text is sanitized: the exact signed
-   payload hex is redacted and any long hex blob (potential raw
-   transaction bytes or key material) never reaches the log.
+   (DSS-WO-ENG-006 §6). Error text is contained (DSS-WO-ENG-008
+   Finding A): foreign transport/HTTP/provider exceptions contribute
+   ONLY the classification, the exception class name and the safe
+   stage; retained relay-provided text is sanitized against the
+   configured credential material plus the structural rules, and any
+   long hex blob (potential raw transaction bytes or key material)
+   never reaches the log.
 
 The Flashbots relay therefore remains a transport only and never
 constitutes an independent wallet-loading, authorization or
@@ -302,9 +336,14 @@ or bundle hash, outcome (`simulated` / `simulation_failed` /
 `simulation_refused` / `accepted` / `rejected` / `uncertain` /
 `submission_refused` / `submitted` / `mined` / `reverted` /
 `receipt_unavailable`), maximum fee exposure (aggregate for bundles) and
-a sanitized error field. No private credentials are ever recorded; the
-exact signed payload bytes are redacted from error text by construction
-and relay responses are scrubbed of raw-transaction material before they
-are returned to callers (DSS-WO-ENG-006 §4/§6). Preflight refusals —
-including infrastructure/RPC failures — are recorded with the sanitized
-cause once an attempt has been initiated.
+a contained error field. No private credentials are ever recorded: for
+foreign transport/HTTP/provider exceptions the error field carries only
+the classification, the exception class name and the safe stage
+(DSS-WO-ENG-008 Finding A); retained relay-provided text is sanitized
+against the configured credential material and the structural rules; the
+exact signed payload bytes are redacted by construction and relay
+responses are scrubbed of raw-transaction material AND credential-shaped
+strings before they are returned to callers (DSS-WO-ENG-006 §4/§6;
+DSS-WO-ENG-008 Finding A). Preflight refusals — including
+infrastructure/RPC failures — are recorded with the contained cause once
+an attempt has been initiated.

@@ -83,28 +83,39 @@ Design invariants (all fail closed):
     during preflight — including infrastructure/RPC failures — are
     audited as well: once an attempt has been initiated it cannot
     silently escape the audit path (DSS-WO-ENG-006 §6). Relay responses
-    returned to callers are scrubbed of raw-transaction-shaped keys and
-    long hex blobs before they leave the session (DSS-WO-ENG-006 §4).
+    returned to callers are scrubbed of raw-transaction-shaped keys,
+    broadcastable byte strings, long hex blobs AND every exact configured
+    secret value — wherever it occurs, including nested metadata and
+    unlabelled values, and including keys that embed a secret (DSS-WO-
+    ENG-006 §4; completed per DSS-WO-ENG-009 Findings C/D) — before they
+    leave the session; legitimate relay metadata survives.
   * Caller-visible EXCEPTIONS never carry secret material (DSS-WO-ENG-007
-    Finding A; hardened per DSS-WO-ENG-008 Finding A): transport and
-    evaluation failures can embed the exact signed payload hex AND
-    credential material — provider API keys, credential-bearing RPC URLs,
-    user information, query-string tokens, authorization values — in
-    shapes no sanitizer can reliably recognize. Foreign (non-gate)
-    exceptions are therefore NEVER re-raised, never attached as a visible
-    cause or context, and their TEXT never reaches the caller or the
-    audit log: callers receive a TestnetSafetyError carrying ONLY the
-    failure classification (refused / failed / rejected / uncertain), the
-    original exception CLASS NAME and the safe stage. The only detail
-    ever retained is RELAY-PROVIDED error text, which is sanitized
-    against the configured credential material (RPC/relay URLs and their
-    user information, path-embedded provider keys and query-string
-    tokens) plus structural rules (any URL, Bearer/Basic values,
+    Finding A; hardened per DSS-WO-ENG-008 Finding A; completed per
+    DSS-WO-ENG-009 Findings A/B): transport and evaluation failures can
+    embed the exact signed payload hex AND credential material — provider
+    API keys, credential-bearing RPC URLs, user information, query-string
+    tokens, authorization values — in shapes no sanitizer can reliably
+    recognize. Foreign (non-gate) exceptions are therefore NEVER
+    re-raised, never attached as a visible cause or context, and their
+    TEXT never reaches the caller or the audit log: callers receive a
+    TestnetSafetyError carrying ONLY the failure classification
+    (refused / failed / rejected / uncertain), the original exception
+    CLASS NAME and the safe stage. The containment boundary covers EVERY
+    external RPC/relay operation of both orchestrations — provider
+    construction, the connectivity check, every chain-ID read, the
+    RPC-backed transaction-default fill, the block-number read, relay
+    transport construction and session-construction verification — not
+    only the signing/submission/simulation calls. The only detail ever
+    retained is RELAY-PROVIDED error text, which is sanitized against the
+    configured credential material (RPC/relay URLs and their user
+    information, path-embedded provider keys and query-string tokens)
+    plus structural rules (any URL, Bearer/Basic values,
     credential-shaped assignments, and 100+ char hex blobs with a lower-
     or uppercase 0x/0X prefix or none) before it reaches a caller-visible
     exception or the audit log. Generic long-hex redaction alone is NOT
     claimed to be credential protection. Gate-raised TestnetSafetyErrors
-    keep their exact type and message with cause and context detached.
+    keep their exact type and message with cause and context detached;
+    policy refusals are never converted into transport failures.
   * Access lists are OUT OF POLICY (DSS-WO-ENG-007 Finding B, Option A —
     fail closed): any supplied non-empty accessList is rejected by the
     transaction policy BEFORE signing, the signed-transaction decoder
@@ -907,17 +918,32 @@ _RESULT_RAW_TX_KEYS = frozenset({
 _SCRUB_MAX_DEPTH = 24
 
 
-def _scrub_transport_payload(obj: object, depth: int = 0):
+def _scrub_transport_payload(
+    obj: object,
+    depth: int = 0,
+    forbidden: Sequence[str] = (),
+):
     """Scrub a relay response before it leaves the session
-    (DSS-WO-ENG-006 §2/§4; hardened per DSS-WO-ENG-008 Finding A): values
+    (DSS-WO-ENG-006 §2/§4; hardened per DSS-WO-ENG-008 Finding A;
+    configured-secret propagation per DSS-WO-ENG-009 Finding D): values
     under raw-transaction-shaped keys are replaced with a redaction
     marker, byte strings of broadcastable size (a signed transaction is
     ≥ ~100 bytes; 32-byte hashes pass) are redacted, and every STRING is
-    passed through the structural credential-containment rules — any
-    URL, Bearer/Basic value, credential-shaped assignment and long hex
-    blob (lower- or uppercase 0x/0X prefix or none) is redacted, while
-    legitimate relay metadata — hashes, gas figures, statuses — survives
-    untouched."""
+    first stripped of every exact configured secret (`forbidden` — the
+    registered RPC/relay URL material and the signed payload hexes) and
+    then passed through the structural credential-containment rules —
+    any URL, Bearer/Basic value, credential-shaped assignment and long
+    hex blob (lower- or uppercase 0x/0X prefix or none) is redacted,
+    while legitimate relay metadata — hashes, gas figures, statuses —
+    survives untouched. A secret is contained wherever it occurs: under
+    an expected key, under an unexpected JSON key, inside nested
+    metadata, or as a bare unlabelled value — and a KEY that itself
+    embeds an exact configured secret is redacted along with its value
+    (the key name is credential material too).
+
+    No truncation is applied: relay responses are data, not diagnostics —
+    legitimate metadata is returned intact.
+    """
     if depth > _SCRUB_MAX_DEPTH:
         return "<redacted:too-deep>"
     if isinstance(obj, dict):
@@ -925,16 +951,33 @@ def _scrub_transport_payload(obj: object, depth: int = 0):
         for key, value in obj.items():
             if isinstance(key, str) and key.lower() in _RESULT_RAW_TX_KEYS:
                 out[key] = "<redacted>"
+            elif isinstance(key, str) and any(
+                secret and secret in key for secret in forbidden
+            ):
+                # DSS-WO-ENG-009 Finding D: the key name embeds an exact
+                # configured secret — the whole entry is credential
+                # material. The value is still scrubbed and kept under a
+                # redacted key (two hostile keys may collide; losing a
+                # hostile field is the fail-closed direction).
+                out["<redacted-key>"] = _scrub_transport_payload(
+                    value, depth + 1, forbidden
+                )
             else:
-                out[key] = _scrub_transport_payload(value, depth + 1)
+                out[key] = _scrub_transport_payload(value, depth + 1, forbidden)
         return out
     if isinstance(obj, (list, tuple)):
-        items = [_scrub_transport_payload(v, depth + 1) for v in obj]
+        items = [
+            _scrub_transport_payload(v, depth + 1, forbidden) for v in obj
+        ]
         return tuple(items) if isinstance(obj, tuple) else items
     if isinstance(obj, (bytes, bytearray)):
         return "<redacted-bytes>" if len(obj) >= 100 else bytes(obj)
     if isinstance(obj, str):
-        return _sanitize_text(obj)
+        text = obj
+        for secret in forbidden:
+            if secret:
+                text = text.replace(secret, "<redacted>")
+        return _sanitize_text(text)
     return obj
 
 
@@ -1003,6 +1046,47 @@ def _clean_raise_candidate(
     return err
 
 
+def _guarded(
+    op: Callable[[], object],
+    *,
+    classification: str,
+    forbidden: Sequence[str] = (),
+    stage: str,
+):
+    """Run ONE external operation under foreign-exception containment
+    (DSS-WO-ENG-009 Findings A/B): every RPC/relay/provider call of the
+    orchestrations — provider construction, connectivity, chain-ID reads,
+    transaction-default fills, the block-number read, relay transport
+    construction, session-construction verification — is executed here,
+    and a FOREIGN (non-gate) exception is replaced by the caller-safe
+    diagnostic from _clean_raise_candidate (classification + exception
+    class name + fixed safe stage). The original exception is never
+    re-raised, never chained, and its text never reaches the caller or
+    the audit log.
+
+    Returns `(failure, value)`:
+      * `op()` succeeded  -> `(None, op())` — value may legitimately be
+        None, so callers MUST branch on `failure`;
+      * `op()` raised     -> `(TestnetSafetyError, None)`.
+
+    The caller MUST raise `failure` OUTSIDE any except block (the
+    established raise-outside discipline, DSS-WO-ENG-007 Finding A):
+    every call site in this module raises at orchestration top level,
+    where no handler is active, so implicit chaining cannot attach the
+    original as __context__. Gate-raised TestnetSafetyErrors passing
+    through here keep their exact type and message (cause/context
+    detached) — a policy refusal is never converted into a transport
+    failure.
+    """
+    try:
+        return None, op()
+    except Exception as exc:  # noqa: BLE001 — containment IS the contract
+        return (
+            _clean_raise_candidate(exc, classification, *forbidden, stage=stage),
+            None,
+        )
+
+
 # ── Simulation gate (DSS-WO-ENG-004 §4) ──────────────────────────────────────
 
 def evaluate_bundle_simulation(
@@ -1025,11 +1109,13 @@ def evaluate_bundle_simulation(
     Relay-provided error text (top-level error, firstRevert,
     per-transaction error) is SANITIZED before it is embedded in the
     raised exception (DSS-WO-ENG-007 Finding A; credential rules per
-    DSS-WO-ENG-008 Finding A): a relay response can quote the submitted
-    signed transactions AND credential material, so the refusal is
-    sanitized against `forbidden` (the configured credential material)
-    plus the structural rules before it reaches any caller-visible
-    exception or the audit log.
+    DSS-WO-ENG-008 Finding A; per-transaction configured-material
+    redaction per DSS-WO-ENG-009 Finding C): a relay response can quote
+    the submitted signed transactions AND credential material — including
+    a bare provider key with no URL or label in ANY of the error
+    branches — so the refusal is sanitized against `forbidden` (the
+    configured credential material) plus the structural rules before it
+    reaches any caller-visible exception or the audit log.
     """
     if not isinstance(simulation, dict) or not simulation:
         raise TestnetSafetyError(
@@ -1065,9 +1151,15 @@ def evaluate_bundle_simulation(
                 f"simulation result entry {i} is malformed — failing closed"
             )
         if entry.get("error"):
+            # DSS-WO-ENG-009 Finding C: the per-transaction branch receives
+            # the SAME configured `forbidden` material as the top-level
+            # error and firstRevert branches — a relay can quote a
+            # credential (a bare provider key, no URL, no label) in any
+            # per-transaction error, and the exact-match redaction is the
+            # only reliable containment for such values.
             raise TestnetSafetyError(
                 f"simulation: bundle tx[{i}] would fail: "
-                f"{_sanitize_error(entry['error'])}"
+                f"{_sanitize_error(entry['error'], *forbidden)}"
             )
         gas_used = entry.get("gasUsed", 0)
         try:
@@ -1979,8 +2071,12 @@ class FlashbotsBundleSession:
         )
         # The relay response is scrubbed before it leaves the session: no
         # signed bytes (or anything shaped like them) can leak through a
-        # result object (DSS-WO-ENG-006 §2/§4).
-        return _scrub_transport_payload(simulation)
+        # result object (DSS-WO-ENG-006 §2/§4), and — per DSS-WO-ENG-009
+        # Finding D — every exact configured secret is redacted wherever
+        # it occurs, including nested metadata and unlabelled values.
+        return _scrub_transport_payload(
+            simulation, forbidden=self._forbidden_material()
+        )
 
     def submit(self) -> dict:
         """Submit the PREPARED bundle via eth_sendBundle.
@@ -2146,9 +2242,13 @@ class FlashbotsBundleSession:
             estimated_gas=auth.get("total_gas_used"),
         )
         # Scrubbed result object: no signed bytes leave the session
-        # (DSS-WO-ENG-006 §2/§4).
+        # (DSS-WO-ENG-006 §2/§4); per DSS-WO-ENG-009 Finding D the
+        # scrubber also redacts every exact configured secret wherever it
+        # occurs in returned strings, nested metadata and keys.
         return {
-            "relay_result": _scrub_transport_payload(result),
+            "relay_result": _scrub_transport_payload(
+                result, forbidden=self._forbidden_material()
+            ),
             "audit": record,
         }
 
@@ -2254,6 +2354,19 @@ def sign_and_submit_testnet_tx(
       6. re-verify the RPC chain ID (pre-submission);
       7. submit, wait for the receipt, and record the outcome.
 
+    PREFLIGHT CONTAINMENT (DSS-WO-ENG-009 Finding A): EVERY external RPC
+    operation of this orchestration — provider construction, the
+    connectivity check, the initial chain-ID read, the RPC-backed
+    transaction-default fill and the pre-sign/pre-submission chain-ID
+    reads — runs under foreign-exception containment. A provider/HTTP
+    failure at any of those points can embed the credential-bearing RPC
+    URL, a provider API key or other sensitive diagnostic material; the
+    caller receives ONLY the classification, the exception class name and
+    the fixed safe stage, raised outside the failing except block. Gate
+    refusals (disabled gate, unreachable RPC, chain-policy rejections)
+    keep their exact type and message — a policy refusal is never
+    converted into a transport failure.
+
     Returns the audit record. Never returns or logs key material.
     """
     cfg = config or TestnetExecutionConfig.from_env()
@@ -2264,17 +2377,64 @@ def sign_and_submit_testnet_tx(
             from web3 import Web3, HTTPProvider
             return Web3(HTTPProvider(url))
 
-    w3 = web3_factory(cfg.rpc_url)  # 2
-    if not getattr(w3, "is_connected", lambda: True)():
+    # Credential material registered from THIS configuration (DSS-WO-008
+    # Finding A): the RPC URL and its credential-bearing components.
+    # The signed payload does not exist yet at preflight time; it joins
+    # the forbidden material before submission.
+    forbidden_config = _registered_secrets(cfg)
+
+    # 2a. Provider construction (DSS-WO-ENG-009 Finding A).
+    rpc_failure, w3 = _guarded(
+        lambda: web3_factory(cfg.rpc_url),
+        classification="testnet RPC preflight failed",
+        forbidden=forbidden_config,
+        stage="RPC provider initialization",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure  # outside the failing except: no chaining
+
+    # 2b. Connectivity check: a RAISING check is a foreign transport
+    # failure (contained); returning False is the gate refusal (kept).
+    rpc_failure, reachable = _guarded(
+        lambda: getattr(w3, "is_connected", lambda: True)(),
+        classification="testnet RPC preflight failed",
+        forbidden=forbidden_config,
+        stage="RPC connectivity check",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
+    if not reachable:
         raise TestnetSafetyError("testnet RPC is not reachable")
-    reported = int(w3.eth.chain_id)
+
+    # 2c. Initial chain-ID read: the RPC READ is contained (a provider
+    # exception can quote the credential-bearing URL); the chain-POLICY
+    # verdict below is a gate decision and propagates unchanged.
+    rpc_failure, reported = _guarded(
+        lambda: int(w3.eth.chain_id),
+        classification="testnet RPC preflight failed",
+        forbidden=forbidden_config,
+        stage="RPC chain-ID read",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
     check_chain_id(reported, cfg.expected_chain_id, cfg.effective_allowlist())
 
     chain_id = reported
     tx = dict(tx)
     tx["chainId"] = chain_id
     sender = cfg.load_agent_address()
-    _fill_tx_defaults(w3, [tx], sender)  # 3a
+    # 3a. RPC-backed transaction-default fill (nonce, gas, fee and block
+    # queries — DSS-WO-ENG-009 Finding A). Policy validation below stays
+    # OUTSIDE the containment: it is a gate decision, never a transport
+    # failure.
+    rpc_failure, _ = _guarded(
+        lambda: _fill_tx_defaults(w3, [tx], sender),
+        classification="testnet RPC preflight failed",
+        forbidden=forbidden_config,
+        stage="RPC transaction-default read",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
     validate_transaction(
         tx, sender=sender, chain_id=chain_id,
         max_value_wei=cfg.max_value_wei, max_gas_units=cfg.max_gas_units,
@@ -2306,8 +2466,19 @@ def sign_and_submit_testnet_tx(
     if custody_failure is not None:
         raise custody_failure
 
-    check_chain_id(  # 5a: still the expected chain immediately before signing
-        int(w3.eth.chain_id), cfg.expected_chain_id, cfg.effective_allowlist()
+    # 5a. Pre-sign chain verification (DSS-WO-ENG-009 Finding A): the RPC
+    # read is contained under its own stage; the policy verdict propagates
+    # unchanged.
+    rpc_failure, reported_now = _guarded(
+        lambda: int(w3.eth.chain_id),
+        classification="testnet RPC preflight failed",
+        forbidden=forbidden_config,
+        stage="pre-sign chain verification",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
+    check_chain_id(  # still the expected chain immediately before signing
+        reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
     )
     signing_failure: Optional[TestnetSafetyError] = None
     try:
@@ -2320,8 +2491,18 @@ def sign_and_submit_testnet_tx(
     if signing_failure is not None:
         raise signing_failure
 
-    check_chain_id(  # 6: pre-submission
-        int(w3.eth.chain_id), cfg.expected_chain_id, cfg.effective_allowlist()
+    # 6. Pre-submission chain verification (DSS-WO-ENG-009 Finding A):
+    # same containment split — contained RPC read, unchanged gate verdict.
+    rpc_failure, reported_now = _guarded(
+        lambda: int(w3.eth.chain_id),
+        classification="testnet RPC preflight failed",
+        forbidden=forbidden_config,
+        stage="pre-submission chain verification",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
+    check_chain_id(  # pre-submission
+        reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
     )
 
     selector = "transfer"
@@ -2467,6 +2648,22 @@ def prepare_flashbots_bundle(
     The Flashbots relay never becomes an independent authorization path:
     the session only transports the exact payload that already passed
     every gate above.
+
+    PREFLIGHT CONTAINMENT (DSS-WO-ENG-009 Finding B): EVERY external
+    RPC/relay operation of the preparation path — provider construction,
+    the connectivity check, the initial and pre-sign chain-ID reads, the
+    RPC-backed transaction-default fill, the block-number read for the
+    target block, relay transport construction and session-construction
+    verification — runs under foreign-exception containment. A failing
+    relay factory or provider call cannot expose credentials contained in
+    either the configured RPC URL or the relay URL: the caller receives
+    only the classification, the exception class name and the fixed safe
+    stage. Gate refusals (disabled gate, unreachable RPC, chain-policy
+    and transaction-policy rejections) keep their exact type and message
+    — a policy refusal is never converted into a foreign transport
+    failure. On success this path still returns the controlled
+    FlashbotsBundleSession ONLY; no signed raw transaction bytes,
+    capability internals or mutable authorization state are exposed.
     """
     cfg = config or TestnetExecutionConfig.from_env()
     cfg.require_ready()  # 1 — SAME explicit gate as direct RPC (ENG-005 §2)
@@ -2476,10 +2673,45 @@ def prepare_flashbots_bundle(
             from web3 import Web3, HTTPProvider
             return Web3(HTTPProvider(url))
 
-    w3 = web3_factory(cfg.rpc_url)  # 2
-    if not getattr(w3, "is_connected", lambda: True)():
+    # Credential material registered from THIS configuration (DSS-WO-008
+    # Finding A): the RPC URL and the relay URL plus their
+    # credential-bearing components. A relay/provider failure at ANY
+    # preparation stage must not be able to expose either URL's secrets.
+    forbidden_config = _registered_secrets(cfg)
+
+    # 2a. Provider construction (DSS-WO-ENG-009 Finding B).
+    rpc_failure, w3 = _guarded(
+        lambda: web3_factory(cfg.rpc_url),
+        classification="bundle preparation failed",
+        forbidden=forbidden_config,
+        stage="RPC provider initialization",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure  # outside the failing except: no chaining
+
+    # 2b. Connectivity check: raising = contained transport failure;
+    # returning False = the gate refusal (kept verbatim).
+    rpc_failure, reachable = _guarded(
+        lambda: getattr(w3, "is_connected", lambda: True)(),
+        classification="bundle preparation failed",
+        forbidden=forbidden_config,
+        stage="RPC connectivity check",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
+    if not reachable:
         raise TestnetSafetyError("testnet RPC is not reachable")
-    reported = int(w3.eth.chain_id)
+
+    # 2c. Initial chain-ID read: contained RPC read, unchanged gate
+    # verdict below.
+    rpc_failure, reported = _guarded(
+        lambda: int(w3.eth.chain_id),
+        classification="bundle preparation failed",
+        forbidden=forbidden_config,
+        stage="RPC chain-ID read",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
     check_chain_id(reported, cfg.expected_chain_id, cfg.effective_allowlist())
 
     txs = [dict(t) for t in unsigned_txs]
@@ -2488,7 +2720,16 @@ def prepare_flashbots_bundle(
     sender = cfg.load_agent_address()
     for tx in txs:
         tx["chainId"] = reported
-    _fill_tx_defaults(w3, txs, sender)  # 3a
+    # 3a. RPC-backed transaction-default fill (DSS-WO-ENG-009 Finding B);
+    # bundle policy validation below stays OUTSIDE the containment.
+    rpc_failure, _ = _guarded(
+        lambda: _fill_tx_defaults(w3, txs, sender),
+        classification="bundle preparation failed",
+        forbidden=forbidden_config,
+        stage="RPC transaction-default read",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
     validated = validate_bundle(
         txs, sender=sender, chain_id=reported,
         max_value_wei=cfg.max_value_wei, max_gas_units=cfg.max_gas_units,
@@ -2520,8 +2761,18 @@ def prepare_flashbots_bundle(
     if custody_failure is not None:
         raise custody_failure
 
-    check_chain_id(  # 5a: still the expected chain immediately before signing
-        int(w3.eth.chain_id), cfg.expected_chain_id, cfg.effective_allowlist()
+    # 5a. Pre-sign chain verification (DSS-WO-ENG-009 Finding B): the RPC
+    # read is contained; the policy verdict propagates unchanged.
+    rpc_failure, reported_now = _guarded(
+        lambda: int(w3.eth.chain_id),
+        classification="bundle preparation failed",
+        forbidden=forbidden_config,
+        stage="pre-sign chain verification",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
+    check_chain_id(  # still the expected chain immediately before signing
+        reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
     )
     signing_failure: Optional[TestnetSafetyError] = None
     try:
@@ -2543,8 +2794,34 @@ def prepare_flashbots_bundle(
             flashbot(relay_w3, auth_account, relay_url)
             return relay_w3
 
-    relay_w3 = relay_factory(cfg.rpc_url, account, cfg.relay_url)  # 6a
-    target_block = int(w3.eth.block_number) + 1
+    # 6a. Relay transport construction (DSS-WO-ENG-009 Finding B): a
+    # failing relay factory or provider call must not expose credentials
+    # from either the configured RPC URL or the relay URL. The signed
+    # payload hexes exist by now and join the forbidden material as
+    # defense in depth.
+    forbidden_material = forbidden_config + tuple(
+        h for raw in signed for h in (bytes(raw).hex(), "0x" + bytes(raw).hex())
+    )
+    rpc_failure, relay_w3 = _guarded(
+        lambda: relay_factory(cfg.rpc_url, account, cfg.relay_url),
+        classification="bundle preparation failed",
+        forbidden=forbidden_material,
+        stage="relay transport construction",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
+
+    # 6a'. Block-number retrieval for the target block (DSS-WO-ENG-009
+    # Finding B).
+    rpc_failure, head_block = _guarded(
+        lambda: int(w3.eth.block_number),
+        classification="bundle preparation failed",
+        forbidden=forbidden_material,
+        stage="RPC block-number read",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
+    target_block = head_block + 1
     prepared = PreparedFlashbotsBundle._mint(  # 6b: the ONLY minting path
         sender=sender,
         chain_id=reported,
@@ -2562,4 +2839,17 @@ def prepare_flashbots_bundle(
     # gate-controlled implementation; the session constructor independently
     # re-verifies every binding (signer recovery, chain, fingerprint,
     # signed-intent fields, fee exposure) before returning it.
-    return FlashbotsBundleSession(relay_w3, prepared)
+    # Session construction and its live RPC verification are contained
+    # (DSS-WO-ENG-009 Finding B): a foreign exception from the
+    # constructor's live chain verification is replaced by the safe
+    # diagnostic; gate refusals (binding mismatches, forged capabilities)
+    # keep their exact type and message.
+    rpc_failure, session = _guarded(
+        lambda: FlashbotsBundleSession(relay_w3, prepared),
+        classification="bundle preparation failed",
+        forbidden=forbidden_material,
+        stage="session construction verification",
+    )
+    if rpc_failure is not None:
+        raise rpc_failure
+    return session

@@ -33,22 +33,35 @@ Every safety invariant of the gate is pinned here:
     bytes, relay responses are scrubbed before they leave the session and
     the capability has no signed-payload property;
   * caller-visible exception containment (ENG-007 Finding A; provider-
-    credential containment per ENG-008 Finding A): a transport or
-    evaluation exception that embeds the exact signed payload hex is
-    NEVER re-raised to the caller and never attached as a visible cause
-    or context — and, hardened per ENG-008, its TEXT never reaches the
-    caller or the audit log at all: callers receive a TestnetSafetyError
-    carrying the failure classification, the original exception class
-    name and the safe stage. Relay-provided error text (top-level
-    simulation error, firstRevert, per-transaction errors, explicit
-    eth_sendBundle rejection bodies) is the only detail ever retained;
-    it is sanitized against the configured credential material (RPC/relay
-    URLs, user information, path-embedded provider keys, query-string
-    tokens) plus structural rules (any URL, Bearer/Basic values,
-    credential-shaped assignments, 100+ char hex with any 0x/0X prefix
-    casing or none) before it reaches any caller-visible exception or
-    the audit record; the audit record keeps the correct outcome; the
-    one-use authorization consumption and retry rules are unchanged;
+    credential containment per ENG-008 Finding A; completed preflight
+    coverage per ENG-009 Findings A/B): a transport or evaluation
+    exception that embeds the exact signed payload hex is NEVER re-raised
+    to the caller and never attached as a visible cause or context — and,
+    hardened per ENG-008, its TEXT never reaches the caller or the audit
+    log at all: callers receive a TestnetSafetyError carrying the failure
+    classification, the original exception class name and the safe stage.
+    ENG-009 extends the containment boundary to EVERY external RPC/relay
+    operation of both orchestrations — provider construction,
+    connectivity, chain-ID reads (initial, pre-sign, pre-submission),
+    RPC-backed transaction-default fills, the block-number read, relay
+    transport construction and session-construction verification — while
+    gate refusals keep their exact type and message. Relay-provided error
+    text (top-level simulation error, firstRevert, per-transaction
+    errors, explicit eth_sendBundle rejection bodies) is the only detail
+    ever retained; it is sanitized against the configured credential
+    material (RPC/relay URLs, user information, path-embedded provider
+    keys, query-string tokens) plus structural rules (any URL,
+    Bearer/Basic values, credential-shaped assignments, 100+ char hex
+    with any 0x/0X prefix casing or none) before it reaches any
+    caller-visible exception or the audit record; the audit record keeps
+    the correct outcome; the one-use authorization consumption and retry
+    rules are unchanged;
+  * relay-response scrubbing (ENG-006 §2/§4; completed per ENG-009
+    Findings C/D): scrubbed relay responses additionally redact every
+    exact configured secret — including bare unlabelled values, nested
+    metadata and per-transaction error fields — and secret-bearing KEY
+    names, while ordinary metadata (hashes, gas figures, statuses)
+    survives;
   * capability immutability and integrity (ENG-006 §3): prepared state is
     frozen (frozen dataclasses + refused attribute assignment), intents
     are frozen records, the minting token is a class-private name-mangled
@@ -124,6 +137,7 @@ from executor.testnet_gate import (
     _payload_fingerprint,
     _registered_secrets,
     _sanitize_error,
+    _scrub_transport_payload,
     check_chain_id,
     evaluate_bundle_simulation,
     load_agent_wallet,
@@ -611,6 +625,10 @@ class _EthStub:
     def chain_id(self):
         value = self._values[min(self._i, len(self._values) - 1)]
         self._i += 1
+        # ENG-009: an Exception entry models a provider that raises on the
+        # chain-ID read; it raises whenever it is the current value.
+        if isinstance(value, Exception):
+            raise value
         return value
 
     @property
@@ -783,7 +801,8 @@ def _minted_capability(tmp, *, intent_tx, signed_tx,
 def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
                      fee_price_gwei=2, chain_values=(SEPOLIA,), head=99,
                      purpose="capability session test",
-                     rpc_url="https://sepolia.example"):
+                     rpc_url="https://sepolia.example",
+                     relay_url="https://relay-sepolia.flashbots.net"):
     """Prepare a REAL bundle through the sanctioned path with a throwaway
     wallet. Returns (session, cfg, target, acct).
 
@@ -791,7 +810,8 @@ def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
     signed raw payload — tests that need the white-box payload read it
     from session._prepared._state.signed_payload directly. The rpc_url
     parameter lets credential-containment tests (ENG-008) configure a
-    credential-bearing fake provider URL."""
+    credential-bearing fake provider URL; the relay_url parameter lets
+    ENG-009 tests register credential-bearing RELAY URL material too."""
     info = _tmp_keystore(tmp)
     acct = info["account"]
     cfg = TestnetExecutionConfig(
@@ -802,6 +822,7 @@ def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
         address_path=os.path.join(tmp, "address"),
         tx_log_path=os.path.join(tmp, "txlog.jsonl"),
         allowlist=allowlist,
+        relay_url=relay_url,
     )
     w3 = _PrepareW3(chain_values=chain_values, head=head)
     txs = [
@@ -3257,6 +3278,798 @@ class TestSanitizerCredentialRulesENG008(unittest.TestCase):
         # short components are NOT registered individually: registering
         # the username "agent" would over-redact ordinary words
         self.assertNotIn("agent", registered)
+
+
+# ── DSS-WO-ENG-009: complete RPC/relay preflight exception containment ───────
+
+FAKE_RELAY_KEY = "SK-FAKE-RELAY-KEY-9876543210fedcba"     # non-hex, 38 chars
+FAKE_RELAY_TOKEN = "fake-relay-token-55"
+CRED_RELAY_URL = (
+    "https://relay-agent:" + FAKE_RELAY_KEY
+    + "@relay.sepolia.invalid/v2/submit?secret=" + FAKE_RELAY_TOKEN
+)
+CRED_RELAY_MATERIAL = (
+    CRED_RELAY_URL,                 # the credential-bearing relay URL
+    FAKE_RELAY_KEY,                 # relay API key (URL user information)
+    "relay-agent:" + FAKE_RELAY_KEY,  # relay URL user information
+    FAKE_RELAY_TOKEN,               # relay query-string secret
+)
+CRED_SECRET_MATERIAL_ALL = CRED_SECRET_MATERIAL + CRED_RELAY_MATERIAL
+
+
+def _read_audit(log_path):
+    with open(log_path) as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+def _assert_log_free_of(testcase, log_path, forbidden):
+    """The audit JSONL (if any records exist) must be free of every
+    forbidden string. ENG-009 preflight failures write no record at all —
+    nothing was initiated — which is asserted separately."""
+    if not os.path.exists(log_path):
+        return
+    with open(log_path) as f:
+        log = f.read()
+    for secret in forbidden:
+        testcase.assertNotIn(secret, log)
+
+
+class _FailingW3:
+    """Web3 stub for the ENG-009 preflight-containment tests: EVERY
+    external RPC surface can be made to raise a FOREIGN exception
+    carrying credential material (fabricated). chain_id advances through
+    `chain_values` on each read (sticking at the last value); an
+    Exception entry raises whenever it is the current value. No network
+    is ever touched."""
+
+    def __init__(self, chain_values=(SEPOLIA,), head=99, *,
+                 connect_exc=None, nonce_exc=None, head_exc=None,
+                 block_exc=None):
+        self._values = list(chain_values)
+        self._i = 0
+        self._head = head
+        self._connect_exc = connect_exc
+        self._nonce_exc = nonce_exc
+        self._head_exc = head_exc      # block_number property (target block)
+        self._block_exc = block_exc    # get_block() (fee defaults)
+        self.sent = []
+        self.submitted = 0
+
+    def is_connected(self):
+        if self._connect_exc is not None:
+            raise self._connect_exc
+        return True
+
+    @property
+    def eth(self):
+        return self
+
+    @property
+    def chain_id(self):
+        value = self._values[min(self._i, len(self._values) - 1)]
+        self._i += 1
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    @property
+    def block_number(self):
+        if self._head_exc is not None:
+            raise self._head_exc
+        return self._head
+
+    @property
+    def gas_price(self):
+        return 10**9
+
+    def get_transaction_count(self, addr):
+        if self._nonce_exc is not None:
+            raise self._nonce_exc
+        return 7
+
+    def get_block(self, tag):
+        if self._block_exc is not None:
+            raise self._block_exc
+        return {"baseFeePerGas": 10**9}
+
+    def to_wei(self, v, u):
+        return int(v * 10**9) if u == "gwei" else v
+
+    def send_raw_transaction(self, raw):
+        self.submitted += 1
+        self.sent.append(raw)
+        return b"\xab" * 32
+
+    def wait_for_transaction_receipt(self, h, timeout=None):
+        return {"status": 1, "gasUsed": 21000}
+
+
+class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
+    """DSS-WO-ENG-009 Finding A: EVERY external RPC operation of
+    sign_and_submit_testnet_tx() — provider construction, the
+    connectivity check, the initial chain-ID read, the RPC-backed
+    transaction-default fill and the pre-sign/pre-submission chain-ID
+    rechecks — is under foreign-exception containment. A foreign
+    exception carrying credential material (fabricated provider key in a
+    fake RPC URL) is replaced, outside the failing except block, by a
+    TestnetSafetyError carrying ONLY the classification, the exception
+    class name and the fixed safe stage; it is never re-raised and never
+    chained. No audit record exists for preflight failures (nothing was
+    initiated), so nothing can leak through the audit path either. Policy
+    refusals keep their exact type and message."""
+
+    def _cfg(self, tmp):
+        info = _tmp_keystore(tmp)
+        return (
+            TestnetExecutionConfig(
+                enabled=True,
+                rpc_url=CRED_RPC_URL,
+                keystore_path=os.path.join(tmp, "keystore.json"),
+                passphrase_path=os.path.join(tmp, "pass"),
+                address_path=os.path.join(tmp, "address"),
+                tx_log_path=os.path.join(tmp, "txlog.jsonl"),
+            ),
+            info["account"].address,
+        )
+
+    @staticmethod
+    def _tx(sender):
+        return {"to": sender, "value": 0, "gas": 21000, "data": b""}
+
+    def _assert_contained(self, ctx, foreign, *, classification, stage):
+        exc = ctx.exception
+        self.assertIsNot(exc, foreign)  # not re-raised
+        _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL)
+        self.assertIn(classification, str(exc))
+        self.assertIn(type(foreign).__name__, str(exc))
+        self.assertIn(stage, str(exc))
+        # preferred containment: NO arbitrary provider text
+        self.assertNotIn("unauthorized", str(exc))
+        self.assertNotIn("401", str(exc))
+        return exc
+
+    def test_provider_factory_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = RuntimeError(
+                f"cannot open provider {CRED_RPC_URL}: unauthorized (401)")
+
+            def _boom(url):
+                raise foreign
+
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    self._tx(sender), purpose="ENG-009 factory failure",
+                    config=cfg, web3_factory=_boom,
+                )
+            self._assert_contained(
+                ctx, foreign,
+                classification="testnet RPC preflight failed",
+                stage="RPC provider initialization",
+            )
+            # no attempt was initiated: no audit record exists at all
+            self.assertFalse(os.path.exists(cfg.tx_log_path))
+
+    def test_connectivity_check_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = IOError(
+                f"connect() to {CRED_RPC_URL} timed out: unauthorized")
+            w3 = _FailingW3(connect_exc=foreign)
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    self._tx(sender), purpose="ENG-009 connectivity failure",
+                    config=cfg, web3_factory=lambda url: w3,
+                )
+            self._assert_contained(
+                ctx, foreign,
+                classification="testnet RPC preflight failed",
+                stage="RPC connectivity check",
+            )
+            self.assertFalse(os.path.exists(cfg.tx_log_path))
+
+    def test_chain_id_read_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = ConnectionError(
+                f"provider {CRED_RPC_URL} reset the connection (401)")
+            w3 = _FailingW3(chain_values=[foreign])
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    self._tx(sender), purpose="ENG-009 chain read failure",
+                    config=cfg, web3_factory=lambda url: w3,
+                )
+            self._assert_contained(
+                ctx, foreign,
+                classification="testnet RPC preflight failed",
+                stage="RPC chain-ID read",
+            )
+            self.assertFalse(os.path.exists(cfg.tx_log_path))
+
+    def test_transaction_defaults_rpc_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = RuntimeError(
+                f"eth_getTransactionCount to {CRED_RPC_URL} failed: "
+                "unauthorized")
+            w3 = _FailingW3(nonce_exc=foreign)
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    self._tx(sender), purpose="ENG-009 defaults failure",
+                    config=cfg, web3_factory=lambda url: w3,
+                )
+            self._assert_contained(
+                ctx, foreign,
+                classification="testnet RPC preflight failed",
+                stage="RPC transaction-default read",
+            )
+            # the failure fired before any signing/submission
+            self.assertEqual(w3.submitted, 0)
+            self.assertFalse(os.path.exists(cfg.tx_log_path))
+
+    def test_pre_sign_chain_verification_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = ConnectionError(
+                f"{CRED_RPC_URL} dropped the connection before signing")
+            w3 = _FailingW3(chain_values=[SEPOLIA, foreign])
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    self._tx(sender), purpose="ENG-009 pre-sign failure",
+                    config=cfg, web3_factory=lambda url: w3,
+                )
+            self._assert_contained(
+                ctx, foreign,
+                classification="testnet RPC preflight failed",
+                stage="pre-sign chain verification",
+            )
+            self.assertEqual(w3.submitted, 0)  # signed, but never submitted
+            self.assertFalse(os.path.exists(cfg.tx_log_path))
+
+    def test_pre_submission_chain_verification_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = ConnectionError(
+                f"{CRED_RPC_URL} refused the pre-submission check: 401")
+            w3 = _FailingW3(chain_values=[SEPOLIA, SEPOLIA, foreign])
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    self._tx(sender), purpose="ENG-009 pre-submit failure",
+                    config=cfg, web3_factory=lambda url: w3,
+                )
+            self._assert_contained(
+                ctx, foreign,
+                classification="testnet RPC preflight failed",
+                stage="pre-submission chain verification",
+            )
+            self.assertEqual(w3.submitted, 0)  # never sent
+            self.assertFalse(os.path.exists(cfg.tx_log_path))
+
+    def test_gate_refusals_are_not_converted_to_transport_failures(self):
+        """Requirement 4/5: gate-raised TestnetSafetyErrors keep their
+        exact type and message through the new containment boundaries —
+        the unreachable-RPC refusal and both chain-policy refusals
+        (initial and pre-sign) are byte-identical to the gate's own
+        verdicts, and the policy refusal keeps its message shape (no
+        `during <stage>` transport diagnostic is mixed in)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            # connectivity returns False: the gate refusal, unchanged
+            w3 = _FailingW3()
+            w3.is_connected = lambda: False
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    self._tx(sender), purpose="ENG-009 unreachable refusal",
+                    config=cfg, web3_factory=lambda url: w3,
+                )
+            self.assertEqual(str(ctx.exception),
+                             "testnet RPC is not reachable")
+
+            # initial chain read reports mainnet: the chain-policy refusal
+            w3 = _FailingW3(chain_values=[MAINNET_CHAIN_ID])
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    self._tx(sender), purpose="ENG-009 mainnet refusal",
+                    config=cfg, web3_factory=lambda url: w3,
+                )
+            self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
+            self.assertNotIn("during", str(ctx.exception))
+
+            # pre-sign recheck reports mainnet: same gate verdict
+            w3 = _FailingW3(chain_values=[SEPOLIA, MAINNET_CHAIN_ID])
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                sign_and_submit_testnet_tx(
+                    self._tx(sender), purpose="ENG-009 pre-sign mainnet",
+                    config=cfg, web3_factory=lambda url: w3,
+                )
+            self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
+            self.assertNotIn("during", str(ctx.exception))
+            self.assertEqual(w3.submitted, 0)
+
+
+class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
+    """DSS-WO-ENG-009 Finding B: the Flashbots preparation path gets the
+    same foreign-exception containment for EVERY external operation —
+    provider construction, connectivity, chain-ID reads, the
+    transaction-default fill, the block-number read for the target block,
+    relay transport construction and session construction with its live
+    RPC verification. A failing relay factory or provider call cannot
+    expose credentials from EITHER the configured RPC URL or the relay
+    URL. Gate refusals are never converted into transport failures, and
+    success still returns the controlled session only."""
+
+    def _cfg(self, tmp):
+        info = _tmp_keystore(tmp)
+        return (
+            TestnetExecutionConfig(
+                enabled=True,
+                rpc_url=CRED_RPC_URL,
+                keystore_path=os.path.join(tmp, "keystore.json"),
+                passphrase_path=os.path.join(tmp, "pass"),
+                address_path=os.path.join(tmp, "address"),
+                tx_log_path=os.path.join(tmp, "txlog.jsonl"),
+            ),
+            info["account"].address,
+        )
+
+    @staticmethod
+    def _txs(sender):
+        return [{
+            "to": sender, "value": 0, "gas": 21000,
+            "maxFeePerGas": 2 * 10**9, "maxPriorityFeePerGas": 10**9,
+            "data": b"",
+        }]
+
+    def _assert_contained(self, ctx, foreign, *, stage):
+        exc = ctx.exception
+        self.assertIsNot(exc, foreign)
+        _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL_ALL)
+        self.assertIn("bundle preparation failed", str(exc))
+        self.assertIn(type(foreign).__name__, str(exc))
+        self.assertIn(stage, str(exc))
+        self.assertNotIn("unauthorized", str(exc))
+        return exc
+
+    def test_rpc_factory_failure_contained_and_relay_never_touched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = RuntimeError(
+                f"cannot open {CRED_RPC_URL}: unauthorized (401)")
+            relay_calls = []
+
+            def _boom(url):
+                raise foreign
+
+            def _relay(url, auth, relay_url):
+                relay_calls.append(url)
+                return _RelayStub()
+
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    self._txs(sender), purpose="ENG-009 prepare factory",
+                    config=cfg, web3_factory=_boom, relay_factory=_relay,
+                )
+            self._assert_contained(
+                ctx, foreign, stage="RPC provider initialization")
+            self.assertEqual(relay_calls, [])  # relay transport never built
+            self.assertFalse(os.path.exists(cfg.tx_log_path))
+
+    def test_connectivity_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = IOError(
+                f"connect() to {CRED_RPC_URL} timed out: unauthorized")
+            w3 = _FailingW3(connect_exc=foreign)
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    self._txs(sender), purpose="ENG-009 prepare connectivity",
+                    config=cfg, web3_factory=lambda url: w3,
+                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
+                )
+            self._assert_contained(ctx, foreign, stage="RPC connectivity check")
+
+    def test_chain_id_read_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = ConnectionError(
+                f"provider {CRED_RPC_URL} reset the connection (401)")
+            w3 = _FailingW3(chain_values=[foreign])
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    self._txs(sender), purpose="ENG-009 prepare chain read",
+                    config=cfg, web3_factory=lambda url: w3,
+                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
+                )
+            self._assert_contained(ctx, foreign, stage="RPC chain-ID read")
+
+    def test_transaction_defaults_failure_contained_before_custody(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = RuntimeError(
+                f"eth_getTransactionCount to {CRED_RPC_URL} failed: 401")
+            w3 = _FailingW3(nonce_exc=foreign)
+            with patch(
+                "executor.testnet_gate.load_agent_wallet",
+                side_effect=AssertionError("wallet must never be decrypted"),
+            ):
+                with self.assertRaises(TestnetSafetyError) as ctx:
+                    prepare_flashbots_bundle(
+                        self._txs(sender),
+                        purpose="ENG-009 prepare defaults failure",
+                        config=cfg, web3_factory=lambda url: w3,
+                        relay_factory=lambda url, auth, relay_url: _RelayStub(),
+                    )
+            self._assert_contained(
+                ctx, foreign, stage="RPC transaction-default read")
+
+    def test_pre_sign_chain_verification_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = ConnectionError(
+                f"{CRED_RPC_URL} dropped before bundle signing")
+            w3 = _FailingW3(chain_values=[SEPOLIA, foreign])
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    self._txs(sender), purpose="ENG-009 prepare pre-sign",
+                    config=cfg, web3_factory=lambda url: w3,
+                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
+                )
+            self._assert_contained(
+                ctx, foreign, stage="pre-sign chain verification")
+
+    def test_block_number_read_failure_contained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = ConnectionError(
+                f"head query to {CRED_RPC_URL} returned 401")
+            w3 = _FailingW3(head_exc=foreign)
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    self._txs(sender), purpose="ENG-009 prepare block read",
+                    config=cfg, web3_factory=lambda url: w3,
+                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
+                )
+            self._assert_contained(
+                ctx, foreign, stage="RPC block-number read")
+
+    def test_relay_factory_failure_contained(self):
+        """A failing relay factory must not expose credentials from EITHER
+        the configured RPC URL or the relay URL."""
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            sender = info["account"].address
+            cfg = TestnetExecutionConfig(
+                enabled=True,
+                rpc_url=CRED_RPC_URL,
+                keystore_path=os.path.join(tmp, "keystore.json"),
+                passphrase_path=os.path.join(tmp, "pass"),
+                address_path=os.path.join(tmp, "address"),
+                tx_log_path=os.path.join(tmp, "txlog.jsonl"),
+                relay_url=CRED_RELAY_URL,
+            )
+            foreign = RuntimeError(
+                f"relay {CRED_RELAY_URL} rejected auth key "
+                f"{FAKE_RELAY_KEY} for {CRED_RPC_URL}: unauthorized")
+
+            def _boom(url, auth, relay_url):
+                raise foreign
+
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    self._txs(sender), purpose="ENG-009 relay factory",
+                    config=cfg, web3_factory=lambda url: _FailingW3(),
+                    relay_factory=_boom,
+                )
+            exc = ctx.exception
+            self.assertIsNot(exc, foreign)
+            _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL_ALL)
+            self.assertIn("bundle preparation failed", str(exc))
+            self.assertIn("RuntimeError", str(exc))
+            self.assertIn("relay transport construction", str(exc))
+            self.assertFalse(os.path.exists(cfg.tx_log_path))
+
+    def test_session_construction_verification_failure_contained(self):
+        """The constructor's LIVE RPC verification runs inside the
+        containment boundary: a foreign exception from the relay
+        transport's chain read is replaced by the safe diagnostic."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            foreign = ConnectionError(
+                f"relay provider {CRED_RPC_URL} closed mid-verification")
+            relay = _RelayStub(chain_values=[foreign], head=99)
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    self._txs(sender),
+                    purpose="ENG-009 session verification",
+                    config=cfg, web3_factory=lambda url: _FailingW3(),
+                    relay_factory=lambda url, auth, relay_url: relay,
+                )
+            self._assert_contained(
+                ctx, foreign, stage="session construction verification")
+            self.assertFalse(os.path.exists(cfg.tx_log_path))
+
+    def test_gate_refusals_survive_preparation_boundaries(self):
+        """Chain-policy and transaction-policy refusals keep their exact
+        gate messages — a policy refusal is never converted into a
+        foreign transport failure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, sender = self._cfg(tmp)
+            w3 = _FailingW3(chain_values=[MAINNET_CHAIN_ID])
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    self._txs(sender), purpose="ENG-009 prepare mainnet",
+                    config=cfg, web3_factory=lambda url: w3,
+                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
+                )
+            self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
+            self.assertNotIn("during", str(ctx.exception))
+
+            # transaction-policy refusal: an arbitrary EOA transfer is
+            # still refused by the bundle policy with its own message
+            w3 = _FailingW3()
+            stranger = "0x" + "cc" * 20
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepare_flashbots_bundle(
+                    [{"to": stranger, "value": 10**15, "gas": 21000,
+                      "maxFeePerGas": 2 * 10**9,
+                      "maxPriorityFeePerGas": 10**9, "data": b""}],
+                    purpose="ENG-009 prepare policy refusal",
+                    config=cfg, web3_factory=lambda url: w3,
+                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
+                )
+            self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
+            self.assertNotIn("during", str(ctx.exception))
+
+
+class TestRelayResponseScrubbingENG009(unittest.TestCase):
+    """DSS-WO-ENG-009 Findings C & D: per-transaction relay errors AND
+    returned relay responses receive the configured exact-match secret
+    redaction. A bare, unlabelled configured provider key (no URL, no
+    token=, no apikey=, no authorization label) cannot be recovered from
+    any exposed diagnostic surface — caller-visible exceptions, the audit
+    JSONL or returned relay responses — while ordinary relay metadata
+    survives."""
+
+    def _session(self, tmp, *, relay_url="https://relay-sepolia.flashbots.net"):
+        relay = _RelayStub(head=99)
+        session, cfg, target, acct = _prepared_bundle(
+            tmp, relay, rpc_url=CRED_RPC_URL, relay_url=relay_url)
+        return session, cfg, relay
+
+    # ── Finding C: per-transaction error redaction ───────────────────────
+
+    def test_per_transaction_error_bare_configured_key_redacted(self):
+        """The regression the work order mandates: a per-transaction error
+        carrying the configured provider key as a BARE token — no URL, no
+        `token=`, no `apikey=`, no authorization label — cannot be
+        recovered from any exposed surface."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp)
+            relay._sim_result = {
+                "result": {"results": [
+                    {
+                        "txHash": "0x" + "ee" * 32,
+                        "gasUsed": 21000,
+                        "error": "execution reverted: " + FAKE_PROVIDER_KEY,
+                    },
+                ]},
+            }
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL)
+            # classification and outcome preserved; the relay text is the
+            # only retained detail, sanitized
+            self.assertIn("simulation: bundle tx[0] would fail", str(exc))
+            self.assertIn("execution reverted", str(exc))
+            self.assertNotIn(FAKE_PROVIDER_KEY, str(exc))
+            # proof the containment came from the configured-secret match:
+            # the structural rules alone do NOT catch this bare token
+            self.assertIn(
+                FAKE_PROVIDER_KEY,
+                _sanitize_error("x " + FAKE_PROVIDER_KEY),
+            )
+            # audit: failure outcome kept; bare key absent from the JSONL
+            recs = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in recs],
+                             ["simulation_failed"])
+            self.assertNotIn(FAKE_PROVIDER_KEY, json.dumps(recs))
+            # a failed simulation authorizes nothing (unchanged)
+            with self.assertRaises(TestnetSafetyError):
+                session.submit()
+            self.assertEqual(relay.send_calls, [])
+
+    def test_per_transaction_error_redaction_covers_relay_url_material(self):
+        """The registered material includes the RELAY URL's credentials:
+        a per-transaction error embedding the fabricated relay key (bare)
+        is contained as well."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp, relay_url=CRED_RELAY_URL)
+            relay._sim_result = {
+                "result": {"results": [
+                    {"txHash": "0x" + "ee" * 32, "gasUsed": 21000,
+                     "error": "relay auth degraded: " + FAKE_RELAY_KEY},
+                ]},
+            }
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            _assert_exception_clean(self, ctx.exception,
+                                    CRED_SECRET_MATERIAL_ALL)
+            recs = _read_audit(cfg.tx_log_path)
+            for secret in CRED_SECRET_MATERIAL_ALL:
+                self.assertNotIn(secret, json.dumps(recs))
+
+    # ── Finding D: returned relay-response scrubbing ─────────────────────
+
+    def test_nested_response_metadata_exact_secret_redacted(self):
+        """A SUCCESSFUL simulation response carrying configured secrets in
+        nested metadata (bare and URL-shaped) is scrubbed before it
+        leaves the session; ordinary metadata survives."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp)
+            relay._sim_result = dict(
+                _ok_simulation(),
+                debug={
+                    "note": "served by " + FAKE_PROVIDER_KEY,
+                    "endpoint": CRED_RPC_URL,
+                    "nested": {"hint": "token " + FAKE_QUERY_TOKEN},
+                },
+            )
+            out = session.simulate()
+            blob = json.dumps(out)
+            for secret in CRED_SECRET_MATERIAL:
+                self.assertNotIn(secret, blob)
+            self.assertNotIn(FAKE_PROVIDER_KEY, str(out))
+            # legitimate metadata survives untouched
+            self.assertEqual(out["bundleHash"], "0x" + "cd" * 32)
+            self.assertEqual(out["totalGasUsed"], 21000)
+            self.assertEqual(out["coinbaseDiff"], "0x1")
+            self.assertEqual(out["results"][0]["txHash"], "0x" + "ee" * 32)
+            self.assertEqual(out["results"][0]["gasUsed"], 21000)
+            self.assertEqual(out["results"][0]["value"], "0x0")
+            # the hostile fields are redacted, not dropped wholesale
+            self.assertIn("<redacted>", out["debug"]["note"])
+            # the full URL is a registered secret, so the exact-match layer
+            # redacts it wholesale (the structural URL rule would too)
+            self.assertIn(out["debug"]["endpoint"], ("<redacted>",
+                                                     "<redacted-url>"))
+            self.assertIn("<redacted>", out["debug"]["nested"]["hint"])
+            # success outcome and one-use authorization unchanged
+            recs = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in recs], ["simulated"])
+            for secret in CRED_SECRET_MATERIAL:
+                self.assertNotIn(secret, json.dumps(recs))
+            out_submit = session.submit()
+            self.assertEqual(
+                out_submit["audit"]["outcome"], "accepted")
+
+    def test_credential_structured_fields_under_unexpected_keys(self):
+        """Credential-bearing structured fields cannot return their secret
+        values merely because the secret sits under an unexpected JSON
+        key."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp)
+            relay._sim_result = dict(
+                _ok_simulation(),
+                provider_auth={
+                    "endpoint": CRED_RPC_URL,
+                    "key": FAKE_PROVIDER_KEY,
+                    "nested": {"token": FAKE_QUERY_TOKEN},
+                },
+            )
+            out = session.simulate()
+            blob = json.dumps(out)
+            for secret in CRED_SECRET_MATERIAL:
+                self.assertNotIn(secret, blob)
+            self.assertIn(
+                out["provider_auth"]["endpoint"], ("<redacted>",
+                                                   "<redacted-url>"))
+            self.assertEqual(out["provider_auth"]["key"], "<redacted>")
+            self.assertEqual(
+                out["provider_auth"]["nested"]["token"], "<redacted>")
+            # the safe parts of the same response are untouched
+            self.assertEqual(out["bundleHash"], "0x" + "cd" * 32)
+
+    def test_submit_relay_response_scrubbed_before_return(self):
+        """The eth_sendBundle return path gets the same configured-secret
+        scrubbing; the audit record stays clean and the outcome is
+        preserved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp)
+            session.simulate()
+
+            def _leaky(bundle, target_block_number=None, **kw):
+                return {
+                    "bundleHash": "0x" + "77" * 32,
+                    "meta": {
+                        "served_by": FAKE_PROVIDER_KEY,
+                        "url": CRED_RPC_URL,
+                    },
+                }
+
+            relay.send_bundle = _leaky
+            out = session.submit()
+            blob = json.dumps(out["relay_result"])
+            for secret in CRED_SECRET_MATERIAL:
+                self.assertNotIn(secret, blob)
+            self.assertEqual(
+                out["relay_result"]["bundleHash"], "0x" + "77" * 32)
+            self.assertIn("<redacted>", out["relay_result"]["meta"]["served_by"])
+            self.assertIn(
+                out["relay_result"]["meta"]["url"], ("<redacted>",
+                                                     "<redacted-url>"))
+            recs = _read_audit(cfg.tx_log_path)
+            self.assertEqual(recs[-1]["outcome"], "accepted")
+            for secret in CRED_SECRET_MATERIAL:
+                self.assertNotIn(secret, json.dumps(recs))
+
+    # ── Finding D: scrubber unit behaviour ────────────────────────────────
+
+    def test_scrubber_redacts_secret_bearing_keys(self):
+        """A KEY that itself embeds an exact configured secret is
+        credential material: the entry is returned under a redacted key
+        with its value still scrubbed; clean keys are untouched."""
+        out = _scrub_transport_payload(
+            {
+                "diagnostic_for_" + FAKE_PROVIDER_KEY: "upstream 401",
+                "ok": "fine",
+                "count": 3,
+            },
+            forbidden=(FAKE_PROVIDER_KEY,),
+        )
+        self.assertNotIn(FAKE_PROVIDER_KEY, json.dumps(out))
+        self.assertEqual(out["ok"], "fine")
+        self.assertEqual(out["count"], 3)
+        self.assertEqual(out["<redacted-key>"], "upstream 401")
+
+    def test_scrubber_preserves_ordinary_metadata(self):
+        resp = {
+            "bundleHash": "0x" + "cd" * 32,
+            "totalGasUsed": 21000,
+            "status": "ok",
+            "results": [{"txHash": "0x" + "ee" * 32, "gasUsed": 21000}],
+            "diag": "retried against " + FAKE_PROVIDER_KEY + " upstream",
+        }
+        out = _scrub_transport_payload(resp, forbidden=(FAKE_PROVIDER_KEY,))
+        self.assertEqual(out["bundleHash"], resp["bundleHash"])
+        self.assertEqual(out["totalGasUsed"], 21000)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["results"], resp["results"])
+        self.assertNotIn(FAKE_PROVIDER_KEY, out["diag"])
+        self.assertIn("<redacted>", out["diag"])
+
+    def test_scrubber_keeps_raw_tx_and_byte_redactions(self):
+        """The ENG-006 redactions are unchanged under the new parameter."""
+        raw = bytes(range(256)) * 2  # 512 bytes — broadcastable size
+        out = _scrub_transport_payload(
+            {
+                "signed_transaction": "0x" + "ab" * 120,
+                "signedTransaction": "0x" + "ab" * 120,
+                "blob": raw,
+                "small": b"\x01" * 8,
+            },
+            forbidden=(),
+        )
+        self.assertEqual(out["signed_transaction"], "<redacted>")
+        self.assertEqual(out["signedTransaction"], "<redacted>")
+        self.assertEqual(out["blob"], "<redacted-bytes>")
+        self.assertEqual(out["small"], b"\x01" * 8)
+
+    def test_scrubber_tuples_and_long_hex_still_redacted(self):
+        long_hex = "ab" * 120
+        out = _scrub_transport_payload(
+            {"results": ({"gasUsed": 21000, "note": long_hex},)},
+            forbidden=(FAKE_QUERY_TOKEN,),
+        )
+        self.assertEqual(out["results"][0]["gasUsed"], 21000)
+        self.assertEqual(out["results"][0]["note"], "0x<redacted-hex>")
+        # exact-match redaction works inside tuples too
+        out = _scrub_transport_payload(
+            ("plain " + FAKE_QUERY_TOKEN, 7),
+            forbidden=(FAKE_QUERY_TOKEN,),
+        )
+        self.assertNotIn(FAKE_QUERY_TOKEN, str(out))
+        self.assertEqual(out[1], 7)
 
 
 if __name__ == "__main__":

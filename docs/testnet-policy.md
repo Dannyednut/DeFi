@@ -2,7 +2,9 @@
 capability-gated per DSS-WO-ENG-005; payload-containment and
 capability-integrity hardened per DSS-WO-ENG-006; exception containment
 and access-list fail-closure per DSS-WO-ENG-007; provider-credential
-containment and access-list type consistency per DSS-WO-ENG-008)
+containment and access-list type consistency per DSS-WO-ENG-008;
+complete RPC/relay preflight containment and relay-response secret
+redaction per DSS-WO-ENG-009)
 
 Status: ACTIVE — enforced by `executor/testnet_gate.py`.
 The gate is **disabled by default** (`DSS_TESTNET_EXEC` unset/empty). Nothing
@@ -216,6 +218,46 @@ their exact message). Python exceptions are an in-process interface
 only: this is containment against accidental leakage through error
 paths, not a barrier against hostile same-process code (see the honest
 threat model above).
+
+**Complete preflight containment (DSS-WO-ENG-009 Findings A/B).** The
+ENG-008 boundary covered the signing, simulation, submission and receipt
+stages. ENG-009 closes the remaining surface: EVERY external RPC/relay
+operation of BOTH orchestrations now runs under the same
+foreign-exception containment — provider construction (`RPC provider
+initialization`), the connectivity check (`RPC connectivity check`), the
+initial chain-ID read (`RPC chain-ID read`), the RPC-backed
+transaction-default fill (`RPC transaction-default read`), the pre-sign
+and pre-submission chain-ID rechecks (`pre-sign chain verification`,
+`pre-submission chain verification`), the block-number read for the
+bundle's target block (`RPC block-number read`), relay transport
+construction (`relay transport construction`) and session construction
+with its live RPC verification (`session construction verification`). A
+provider or relay failure at any of those points therefore cannot expose
+a credential-bearing RPC URL, a relay URL, a provider API key or any
+other provider diagnostic text: the caller receives only the failure
+classification, the exception class name and the fixed safe stage,
+raised outside the failing except block. The contained READS are
+separated from the policy verdicts: chain-identity and
+transaction-policy refusals are gate decisions, not transport failures,
+and keep their exact gate messages. Nothing about the success paths
+changed — preparation still returns only the controlled session, and
+the direct-RPC path still distinguishes policy refusals from uncertain
+submission outcomes.
+
+**Per-transaction error and relay-response redaction (DSS-WO-ENG-009
+Findings C/D).** The per-transaction simulation-error branch now
+receives the SAME registered credential material as the top-level error
+and `firstRevert` branches, so a relay can no longer surface a bare,
+unlabelled provider key (no URL, no `token=`/`apikey=` label) through an
+individual transaction result. The recursive relay-response scrubber
+likewise receives the registered exact-match secret list: every returned
+string — including nested metadata and otherwise unlabelled values — is
+stripped of every configured secret value, and a KEY that itself embeds
+an exact configured secret is redacted along with its value. The
+pre-existing redactions (raw-transaction-shaped keys, broadcastable byte
+strings, long hex blobs) are unchanged, and legitimate relay metadata —
+hashes, gas figures, statuses — is preserved: responses are redacted,
+never discarded.
 
 **Access-list policy (DSS-WO-ENG-007 Finding B — Option A, fail closed;
 type consistency per DSS-WO-ENG-008 Finding B).** The supported

@@ -868,21 +868,91 @@ def _sanitize_error(message: object, *forbidden: str) -> str:
     return _sanitize_text(text)[:300]
 
 
+# DSS-WO-ENG-010 Finding B: query-parameter NAMES that clearly indicate
+# credential material. A parameter whose name matches has its VALUE
+# registered regardless of length: the URL structure itself identifies
+# the value as a credential, so the old >=16-character heuristic must
+# not gate it. Matching is case-insensitive and separator-insensitive —
+# `api_key`, `api-key`, `apikey` and `apiKey` all normalize to the same
+# form (lowercase, `_`/`-`/whitespace stripped). Compound names whose
+# normalized form ENDS with an unambiguous credential noun (access_token,
+# client_secret, auth_token, db_password, ...) are covered too; bare
+# "auth" is matched EXACTLY only, so an ordinary word ending in "-auth"
+# cannot trigger registration. Ordinary non-sensitive parameters
+# (network=, env=, project=, chainid=, v2=, ...) match none of these.
+_CRED_QUERY_PARAM_NAMES = frozenset({
+    "token", "apikey", "accesskey", "secret", "password", "passwd",
+    "pwd", "passphrase", "authorization", "auth", "credential",
+    "credentials",
+})
+_CRED_QUERY_PARAM_SUFFIXES = (
+    "token", "secret", "apikey", "accesskey", "password", "passwd",
+    "pwd", "passphrase", "authorization", "credential", "credentials",
+)
+
+
+def _query_param_name_is_credential(name: object) -> bool:
+    """True when a query-parameter NAME clearly indicates credential
+    material (DSS-WO-ENG-010 Finding B): case-insensitive and
+    separator-insensitive exact names (`token`, `api_key`/`api-key`/
+    `apikey`/`apiKey`, `access_key`, `secret`, `password`/`passwd`/`pwd`,
+    `passphrase`, `authorization`, `auth`, `credential`/`credentials`)
+    plus compound names ending in an unambiguous credential noun
+    (`access_token`, `client_secret`, `auth_token`, ...). Ordinary names
+    — network, environment, project or route identifiers — never match."""
+    if not isinstance(name, str):
+        return False
+    normalized = re.sub(r"[\s_\-]+", "", name).lower()
+    if not normalized:
+        return False
+    return normalized in _CRED_QUERY_PARAM_NAMES or normalized.endswith(
+        _CRED_QUERY_PARAM_SUFFIXES
+    )
+
+
 def _registered_secrets(config: object) -> tuple:
     """Exact credential strings tied to THIS configuration that must
-    never reach a caller-visible exception or the audit log
-    (DSS-WO-ENG-008 Finding A): the configured RPC and relay URLs
-    verbatim plus their credential-bearing components — user information
-    ("user:password"), the password itself, path segments that carry
-    provider API keys and query-string token values.
+    never reach a caller-visible exception or the audit log (DSS-WO-ENG-
+    008 Finding A; short-credential and encoded-value containment per
+    DSS-WO-ENG-010 Findings A–C): the configured RPC and relay URLs
+    verbatim plus their credential-bearing components.
 
-    Components shorter than 16 characters are NOT registered
-    individually: they are ordinary words whose exact-match redaction
-    would over-redact benign text (the verbatim URL and the structural
-    rules cover those shapes). Components are matched verbatim only —
-    percent-encoded variants are handled by the structural URL rule
-    instead."""
+    Components EXPLICITLY identified as credentials by the URL structure
+    are registered REGARDLESS of length — the old >=16-character
+    heuristic must not gate a genuine short password or query token:
+
+      * Finding A (user information): the complete user-information pair
+        ("user:password") and the password ITSELF, each in its raw form
+        and its safely URL-decoded form (they differ only when
+        percent-encoding is present; both echo shapes are contained).
+        An ordinary short username is NOT registered individually —
+        exact-match redaction of a common word such as "agent" would
+        over-redact benign diagnostics — and long usernames keep the
+        existing >=16-character rule;
+      * Finding B (credential-bearing query parameters): the value of
+        any query parameter whose NAME clearly indicates credential
+        material (case-insensitive, separator-variant and compound
+        matching — see _query_param_name_is_credential), raw and
+        percent-decoded. Ordinary non-sensitive query values (network
+        names, environment labels, project identifiers) are NOT newly
+        registered; the existing >=16-character rule for them is
+        preserved so no protection is weakened;
+      * Finding C (URL path components): the existing >=16-character
+        protection for long path-embedded provider keys is PRESERVED
+        (registering every short route component such as "v2" would
+        over-redact), with decoded forms added."""
     secrets: list[str] = []
+
+    def _register(value: str) -> None:
+        """Register a credential value in its raw form AND its safely
+        URL-decoded form (identical when no percent-encoding is
+        present); both are deduplicated."""
+        if not value:
+            return
+        for form in (value, urllib.parse.unquote(value)):
+            if form and form not in secrets:
+                secrets.append(form)
+
     for url in (
         getattr(config, "rpc_url", None),
         getattr(config, "relay_url", None),
@@ -894,16 +964,27 @@ def _registered_secrets(config: object) -> tuple:
             parts = urllib.parse.urlsplit(url)
         except ValueError:
             continue
+        # Finding A: user information — the complete pair (as before) and
+        # now the password independently of its length.
         if parts.username and parts.password:
-            secrets.append(f"{parts.username}:{parts.password}")
-        candidates = [parts.username, parts.password]
-        candidates.extend(parts.path.split("/"))
-        candidates.extend(
-            pair.partition("=")[2] for pair in parts.query.split("&") if pair
-        )
-        for component in candidates:
-            if component and len(component) >= 16 and component not in secrets:
-                secrets.append(component)
+            _register(f"{parts.username}:{parts.password}")
+        if parts.password:
+            _register(parts.password)
+        if parts.username and len(parts.username) >= 16:
+            _register(parts.username)
+        # Finding C: path-embedded provider keys (length rule preserved).
+        for segment in parts.path.split("/"):
+            if segment and len(segment) >= 16:
+                _register(segment)
+        # Finding B: credential-bearing query parameters.
+        for pair in parts.query.split("&"):
+            if not pair:
+                continue
+            name, _, value = pair.partition("=")
+            if not value:
+                continue
+            if _query_param_name_is_credential(name) or len(value) >= 16:
+                _register(value)
     return tuple(secrets)
 
 
@@ -1746,8 +1827,10 @@ class FlashbotsBundleSession:
         """Every exact string that must never reach a caller-visible
         exception or the audit log (DSS-WO-ENG-008 Finding A): the signed
         payload hexes plus the configured credential-bearing URL material
-        (RPC/relay URLs, user information, path-embedded provider keys,
-        query-string tokens)."""
+        (RPC/relay URLs, user information and the password regardless of
+        length, path-embedded provider keys, credential-named query-
+        string token values — short-credential registration per
+        DSS-WO-ENG-010)."""
         return self._payload_hexes() + _registered_secrets(self._config)
 
     def _verify_payload_signers(self) -> None:

@@ -1,5 +1,6 @@
 # DSS Testnet Policy (DSS-WO-ENG-003 D; unified per DSS-WO-ENG-004;
-capability-gated per DSS-WO-ENG-005)
+capability-gated per DSS-WO-ENG-005; payload-containment and
+capability-integrity hardened per DSS-WO-ENG-006)
 
 Status: ACTIVE — enforced by `executor/testnet_gate.py`.
 The gate is **disabled by default** (`DSS_TESTNET_EXEC` unset/empty). Nothing
@@ -17,7 +18,9 @@ this document is met.
 | Gate disabled unless `DSS_TESTNET_EXEC=1` | `TestnetExecutionConfig.from_env`; EVERY operation that decrypts the wallet and signs — direct RPC and Flashbots preparation alike — requires it (`require_ready`); bundle submission re-checks it inside `FlashbotsBundleSession.submit` (DSS-WO-ENG-005 §2) |
 | Missing RPC / keystore / passphrase / address fails closed | `require_ready` (signing paths) / `require_provisioned` (read-only chain/RPC checks) |
 | ONE wallet-loading path for every signing operation | `load_agent_wallet` (see §3); the Flashbots transport has no wallet logic of its own |
-| Only the sanctioned preparation path creates a submission session | `PreparedFlashbotsBundle` capability minted exclusively by `prepare_flashbots_bundle`; `FlashbotsBundleSession` refuses forged, duck-typed or subclassed objects and re-verifies every binding (wallet identity via signer recovery, chain ID, validated intent, exact signed payload, target block) at construction and before every relay interaction (DSS-WO-ENG-005 §3) |
+| Only the sanctioned preparation path creates a submission session | `PreparedFlashbotsBundle` capability minted exclusively by `prepare_flashbots_bundle`; `FlashbotsBundleSession` refuses forged, duck-typed or subclassed objects and re-verifies every binding (wallet identity via signer recovery, chain ID, validated intent, exact signed payload, target block) at construction and before every relay interaction (DSS-WO-ENG-005 §3; DSS-WO-ENG-006 §3) |
+| Signed raw transaction bytes never leave the gate-controlled implementation | `prepare_flashbots_bundle` returns ONLY the session; the capability has no signed-payload property; `simulate()`/`submit()` accept no payload and return scrubbed relay responses; audit records never contain the payload (DSS-WO-ENG-006 §2/§4) |
+| Prepared-bundle state is immutable after creation; every signed transaction must match its validated intent field-by-field | frozen state dataclass behind a single slot with refused `__setattr__`/`__delattr__`; frozen `ValidatedTransactionIntent` records; decoded signed transactions compared against intents (sender, chain ID, recipient, nonce, value, calldata, gas limit, fee envelope) at construction and before every relay interaction (DSS-WO-ENG-006 §3) |
 | Chain ID verified before signing AND immediately before submission | both transports: `sign_and_submit_testnet_tx` and `prepare_flashbots_bundle` + `FlashbotsBundleSession.verify_chain` |
 | No arbitrary EOA transfers | `validate_transaction`: recipient = agent wallet or reviewed target |
 | No unlimited token approvals | approval selectors decoded; amount capped at `MAX_TOKEN_APPROVAL_AMOUNT` |
@@ -121,7 +124,7 @@ be assumed to fit the same budget. The aggregate bundle check
 worst-case transactions is rejected before wallet decryption.
 Raising any cap is a reviewed code change, never an environment setting.
 
-## 5. Simulation-before-submission and the capability boundary (DSS-WO-ENG-004 §4; DSS-WO-ENG-005 §3–§4)
+## 5. Simulation-before-submission and the capability boundary (DSS-WO-ENG-004 §4; DSS-WO-ENG-005 §3–§4; DSS-WO-ENG-006 §2–§5)
 
 `prepare_flashbots_bundle` performs the gate checks (it signs, so the
 full execution gate is required — same as direct RPC), chain
@@ -129,13 +132,67 @@ verification, transaction policy including the aggregate bundle fee cap,
 wallet custody binding and signing — it never calls the relay. It then
 mints a `PreparedFlashbotsBundle` capability (the ONLY minting path;
 external construction is refused at runtime) binding the verified wallet
-identity, chain ID, validated transaction intent, EXACT signed payload,
-EXACT target block and their order-sensitive fingerprint, and returns a
-`FlashbotsBundleSession` built on that capability. The session
-constructor refuses every other object (exact-type check) and
-re-verifies every binding — including recovering the signer of each
-signed transaction — at construction and before every relay
-interaction.
+identity, chain ID, the frozen normalized transaction-intent records,
+the EXACT signed payload, the EXACT target block and their
+order-sensitive fingerprint, and returns the `FlashbotsBundleSession`
+built on that capability — and NOTHING else (DSS-WO-ENG-006 §2): no
+tuple, no signed raw transaction bytes, no capability object, no target
+block. The session constructor refuses every other object (exact-type
+check) and re-verifies every binding — including recovering the signer
+of each signed transaction and comparing each DECODED signed transaction
+field-by-field against its validated intent (recovered sender, chain ID,
+recipient, nonce, value, calldata, gas limit, EIP-1559/legacy fee
+envelope) — at construction and before every relay interaction. Any
+mismatch fails closed before simulation or submission.
+
+**Signed-payload containment (DSS-WO-ENG-006 §2/§4).** The exact signed
+transaction bytes exist ONLY inside the gate-controlled implementation:
+
+1. the preparation API returns the controlled session ONLY;
+2. the capability exposes NO signed-payload property (and no
+   validated-transaction-dict property — intents are exposed as frozen
+   records only);
+3. `simulate()` and `submit()` accept NO arguments, operate only on the
+   privately held prepared payload, and return relay responses SCRUBBED
+   of raw-transaction material (raw-transaction-shaped keys redacted,
+   byte strings of broadcastable size redacted, long hex blobs redacted)
+   before they leave the session;
+4. nothing in the module writes signed bytes to the audit log, test
+   output, JSON artifacts or console output.
+
+A caller can request preparation, simulation and controlled,
+authorization-checked submission — but cannot obtain the raw signed
+payload from the preparation API or any public session surface.
+
+**Capability immutability (DSS-WO-ENG-006 §3).** Prepared-bundle state
+is a frozen dataclass (`_PreparedBundleState`) held behind a single
+`__slots__` slot on the capability; attribute assignment and deletion on
+the capability are refused; the transaction intents are frozen
+`ValidatedTransactionIntent` records (never mutable dictionaries); the
+minting token is a name-mangled class-private object (`__MINT_AUTHORITY`
+→ `_PreparedFlashbotsBundle__MINT_AUTHORITY`), not a module-level public
+name. Exact-type and signer-recovery checks are retained, and the
+per-transaction and AGGREGATE fee exposure is re-derived from the frozen
+intents and held against the configured caps and the recorded total
+before every relay interaction (DSS-WO-ENG-006 §5).
+
+**Honest threat model (DSS-WO-ENG-006 §3).** This boundary is an
+APPLICATION-LEVEL authorization boundary. It is NOT independent hardware
+or process isolation. Python private attributes, name mangling, frozen
+dataclasses and the runtime authority check deter accidental and
+ordinary misuse — but arbitrary hostile code executing inside the same
+interpreter can defeat all of them (`object.__setattr__`, mangled-name
+lookup, monkeypatching, reading module globals). The gate therefore does
+NOT claim cryptographic unforgeability against same-process hostile
+code, and its defense in depth (exact-type checks, signer recovery,
+fingerprint binding, decoded signed-intent comparison, fee rechecks,
+fail-closed defaults) is what actually refuses forged or tampered
+content. If a stronger isolation model is ever required — a separate
+signing process with a narrow IPC interface, OS sandboxing, or
+HSM/KMS-backed keys — that is a FUTURE ARCHITECTURE REQUIREMENT to be
+specified and reviewed separately; it is deliberately NOT invented here,
+and no keyring/KMS/HSM mechanism is claimed to exist in the current
+runtime (see §3 residual risk).
 
 1. `simulate()` takes NO payload: it simulates the exact prepared
    payload for the exact prepared target block via `eth_callBundle`
@@ -143,7 +200,8 @@ interaction.
    error, `firstRevert`, per-transaction errors, result-count
    mismatches and zero-gas entries; anything unsuccessful fails closed.
    A successful simulation stores a ONE-USE authorization keyed by the
-   payload/target fingerprint.
+   payload/target fingerprint. The response returned to the caller is
+   scrubbed (see containment above).
 2. `submit()` takes NO payload: an arbitrary signed bundle cannot gain
    submission authority by being passed to either method. It refuses to
    call `eth_sendBundle` unless ALL of the following hold, checked in
@@ -154,15 +212,18 @@ interaction.
    and a successful simulation exists for the exact fingerprint. The
    authorization is consumed BEFORE the relay call — a relay timeout or
    any other submission failure cannot silently authorize unlimited
-   retries; a retry requires a NEW successful simulation.
+   retries; a retry requires a NEW successful simulation. The returned
+   result object is scrubbed (see containment above).
 3. Outcomes are classified and audited for every attempt: simulations
    (`simulated`, `simulation_failed`, `simulation_refused`) and
    submissions (`accepted`, `rejected` for explicit relay errors,
    `uncertain` for timeouts/transport failures or hashless responses,
-   `submission_refused` for pre-check refusals). Error text is
-   sanitized: the exact signed payload hex is redacted and any long hex
-   blob (potential raw transaction bytes or key material) never reaches
-   the log.
+   `submission_refused` for pre-check refusals). Preflight
+   infrastructure/RPC failures are audited too: once an attempt has
+   been initiated it cannot silently escape the audit path
+   (DSS-WO-ENG-006 §6). Error text is sanitized: the exact signed
+   payload hex is redacted and any long hex blob (potential raw
+   transaction bytes or key material) never reaches the log.
 
 The Flashbots relay therefore remains a transport only and never
 constitutes an independent wallet-loading, authorization or
@@ -196,4 +257,8 @@ or bundle hash, outcome (`simulated` / `simulation_failed` /
 `submission_refused` / `submitted` / `mined` / `reverted` /
 `receipt_unavailable`), maximum fee exposure (aggregate for bundles) and
 a sanitized error field. No private credentials are ever recorded; the
-exact signed payload bytes are redacted from error text by construction.
+exact signed payload bytes are redacted from error text by construction
+and relay responses are scrubbed of raw-transaction material before they
+are returned to callers (DSS-WO-ENG-006 §4/§6). Preflight refusals —
+including infrastructure/RPC failures — are recorded with the sanitized
+cause once an attempt has been initiated.

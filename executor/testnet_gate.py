@@ -43,11 +43,31 @@ Design invariants (all fail closed):
     bundle, checked before wallet decryption; fee-price inputs that are
     missing, negative, malformed or above MAX_TESTNET_MAX_FEE_PER_GAS_WEI
     are rejected (DSS-WO-ENG-005 §5).
-  * Flashbots submission authority is an unforgeable capability: only
+  * Flashbots submission authority is a capability-gated boundary: only
     prepare_flashbots_bundle can mint a PreparedFlashbotsBundle, and the
-    session re-verifies EVERY binding — wallet identity, chain ID,
-    validated intent, exact signed payload, target block — at
-    construction and before every relay interaction (DSS-WO-ENG-005 §3).
+    session re-verifies EVERY binding — wallet identity (recovered
+    signers), chain ID, validated intent (field-by-field against the
+    DECODED signed transaction), exact signed payload, target block — at
+    construction and before every relay interaction (DSS-WO-ENG-005 §3;
+    signed-intent field comparison per DSS-WO-ENG-006 §3).
+  * Signed raw transaction bytes NEVER leave the gate-controlled
+    implementation (DSS-WO-ENG-006 §2/§4): prepare_flashbots_bundle
+    returns ONLY the controlled session; the capability has no
+    signed-payload property; simulate()/submit() accept no payload and
+    return relay responses scrubbed of raw-transaction material; the
+    audit log never contains the payload.
+  * Prepared-bundle state is FROZEN after creation (DSS-WO-ENG-006 §3):
+    the capability wraps an immutable state record behind a single slot
+    whose assignment is refused; the transaction intents are frozen
+    dataclass records, never mutable dicts; the minting token is a
+    name-mangled class-private object, not a module-level public name.
+    HONEST BOUNDARY: this is an application-level authorization boundary
+    only. Arbitrary hostile code executing inside the same interpreter
+    can defeat Python-level protections (object.__setattr__, mangled-name
+    lookup, monkeypatching) — no cryptographic unforgeability against
+    same-process code is claimed. Stronger isolation, if ever required,
+    is a future architecture requirement (docs/testnet-policy.md §5),
+    not something invented here.
   * No arbitrary EOA transfers: the only permitted recipient without an
     entry in KNOWN_TARGETS is the agent wallet itself (self-transfer).
   * No unlimited token approvals: approve/increaseAllowance calldata is
@@ -59,7 +79,12 @@ Design invariants (all fail closed):
     or of uncertain outcome — is recorded (purpose, chain ID, target,
     function, estimated/actual gas, hash, outcome, fee exposure) to a
     JSONL log that never contains credentials, raw signed transaction
-    bytes or any other secret material (DSS-WO-ENG-005 §4).
+    bytes or any other secret material (DSS-WO-ENG-005 §4). Refusals
+    during preflight — including infrastructure/RPC failures — are
+    audited as well: once an attempt has been initiated it cannot
+    silently escape the audit path (DSS-WO-ENG-006 §6). Relay responses
+    returned to callers are scrubbed of raw-transaction-shaped keys and
+    long hex blobs before they leave the session (DSS-WO-ENG-006 §4).
 
 This module holds NO key material. The agent wallet is decrypted from
 the DSS secret store (encrypted keystore + passphrase file) only inside
@@ -718,6 +743,45 @@ def _sanitize_error(message: object, *forbidden: str) -> str:
     return _LONG_HEX_RE.sub("0x<redacted-hex>", text)[:300]
 
 
+# Response keys that could carry raw signed transaction bytes out of the
+# session. Any value stored under such a key is redacted before a relay
+# response reaches a caller (DSS-WO-ENG-006 §2/§4).
+_RESULT_RAW_TX_KEYS = frozenset({
+    "signed_transaction", "signedtransaction", "signed_tx", "signedtx",
+    "raw_transaction", "rawtransaction", "raw_tx", "rawtx", "raw",
+})
+
+_SCRUB_MAX_DEPTH = 24
+
+
+def _scrub_transport_payload(obj: object, depth: int = 0):
+    """Scrub a relay response before it leaves the session
+    (DSS-WO-ENG-006 §2/§4): values under raw-transaction-shaped keys are
+    replaced with a redaction marker, byte strings of broadcastable size
+    (a signed transaction is ≥ ~100 bytes; 32-byte hashes pass) are
+    redacted, and any long hex blob that could be raw signed bytes is
+    redacted from strings. Legitimate relay metadata — hashes, gas
+    figures, statuses — survives untouched."""
+    if depth > _SCRUB_MAX_DEPTH:
+        return "<redacted:too-deep>"
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            if isinstance(key, str) and key.lower() in _RESULT_RAW_TX_KEYS:
+                out[key] = "<redacted>"
+            else:
+                out[key] = _scrub_transport_payload(value, depth + 1)
+        return out
+    if isinstance(obj, (list, tuple)):
+        items = [_scrub_transport_payload(v, depth + 1) for v in obj]
+        return tuple(items) if isinstance(obj, tuple) else items
+    if isinstance(obj, (bytes, bytearray)):
+        return "<redacted-bytes>" if len(obj) >= 100 else bytes(obj)
+    if isinstance(obj, str):
+        return _LONG_HEX_RE.sub("0x<redacted-hex>", obj)
+    return obj
+
+
 # ── Simulation gate (DSS-WO-ENG-004 §4) ──────────────────────────────────────
 
 def evaluate_bundle_simulation(
@@ -800,15 +864,290 @@ def _payload_fingerprint(signed_txs: Sequence[bytes], target_block: int) -> str:
     return h.hexdigest()
 
 
-# ── Flashbots transport session (capability-gated, DSS-WO-ENG-005 §3) ─────────
+# ── Flashbots capability, intent records and signed-payload verification ─────
+#    (DSS-WO-ENG-005 §3; DSS-WO-ENG-006 §2–§4)
+#
+# Containment (DSS-WO-ENG-006 §2): the signed raw transaction bytes exist
+# ONLY inside this implementation. prepare_flashbots_bundle returns the
+# controlled session ONLY; the capability exposes no signed-payload
+# accessor; simulate()/submit() accept no payload and return scrubbed
+# relay responses; nothing here writes signed bytes to the audit log.
+#
+# HONEST THREAT MODEL (DSS-WO-ENG-006 §3): this is an application-level
+# authorization boundary, NOT independent hardware or process isolation.
+# Python private attributes, name mangling and frozen dataclasses deter
+# accidental and ordinary misuse; arbitrary hostile code executing inside
+# the same interpreter can still defeat them (object.__setattr__,
+# mangled-name lookup, monkeypatching). No cryptographic unforgeability
+# against same-process hostile code is claimed. A stronger isolation
+# model, if ever required, is a future architecture requirement — see
+# docs/testnet-policy.md §5 — not something invented in this work order.
 
-# Unforgeable in-process minting authority: the only live reference is
-# held by prepare_flashbots_bundle below. Any OTHER code path — including
-# tests — that tries to construct a PreparedFlashbotsBundle fails this
-# runtime authority check. This is enforced behavior, not a naming
-# convention; the session additionally re-verifies every binding of every
-# capability it is given (exact type, signer recovery, fingerprint).
-_PREPARATION_AUTHORITY = object()
+
+@dataclass(frozen=True)
+class ValidatedTransactionIntent:
+    """Immutable, normalized record of ONE policy-validated transaction
+    intent (DSS-WO-ENG-006 §3).
+
+    Built ONLY from an already-validated transaction dict at capability
+    minting time; the mutable input dict is consumed and never retained.
+    Every field needed to re-verify the SIGNED transaction against the
+    validated intent is captured here (recipient, value, gas, calldata,
+    nonce, chain ID and the exact fee envelope). Instances are frozen
+    dataclasses — attribute assignment raises — so the capability never
+    exposes a mutable dictionary through its properties.
+    """
+
+    to: str                       # recipient, lowercase hex string
+    value: int
+    gas: int
+    data: bytes
+    nonce: int
+    chain_id: int
+    fee_kind: str                 # "eip1559" | "legacy"
+    max_fee_per_gas: Optional[int]
+    max_priority_fee_per_gas: Optional[int]
+    gas_price: Optional[int]
+
+
+def _intent_from_validated_tx(tx: dict, chain_id: int) -> ValidatedTransactionIntent:
+    """Normalize ONE policy-validated transaction dict into an immutable
+    intent record. Strict: missing, negative, malformed or contradictory
+    fields fail closed. The input must be the FINAL validated form —
+    nonce/gas/fee defaults are filled and the policy applied BEFORE this
+    runs, never after."""
+    to = tx.get("to")
+    if not to or not str(to).strip():
+        raise TestnetSafetyError("validated intent is missing a recipient")
+    to = str(to).lower()
+    tx_chain = tx.get("chainId")
+    if tx_chain is not None and int(tx_chain) != int(chain_id):
+        raise TestnetSafetyError(
+            f"validated intent chain mismatch: transaction says {tx_chain}, "
+            f"capability binds {chain_id}"
+        )
+    value = _uint_field(tx.get("value", 0), "value")
+    gas = _uint_field(tx.get("gas"), "gas")
+    if gas <= 0:
+        raise TestnetSafetyError("validated intent has no positive gas limit")
+    nonce = _uint_field(tx.get("nonce"), "nonce")
+    data = tx.get("data") or b""
+    if isinstance(data, str):
+        try:
+            data = bytes.fromhex(data[2:] if data.startswith("0x") else data)
+        except ValueError as exc:
+            raise TestnetSafetyError(
+                "validated intent calldata is not valid hex"
+            ) from exc
+    if not isinstance(data, (bytes, bytearray)):
+        raise TestnetSafetyError("validated intent calldata must be bytes")
+    data = bytes(data)
+
+    has_1559 = tx.get("maxFeePerGas") is not None
+    has_legacy = tx.get("gasPrice") is not None
+    if has_1559 and has_legacy:
+        raise TestnetSafetyError(
+            "malformed fee inputs: intent carries both EIP-1559 "
+            "(maxFeePerGas) and legacy (gasPrice) fee fields"
+        )
+    if has_1559:
+        max_fee = _uint_field(tx["maxFeePerGas"], "maxFeePerGas")
+        prio = tx.get("maxPriorityFeePerGas")
+        prio = _uint_field(prio, "maxPriorityFeePerGas") if prio is not None else None
+        return ValidatedTransactionIntent(
+            to=to, value=value, gas=gas, data=data, nonce=nonce,
+            chain_id=int(chain_id), fee_kind="eip1559",
+            max_fee_per_gas=max_fee, max_priority_fee_per_gas=prio,
+            gas_price=None,
+        )
+    if has_legacy:
+        return ValidatedTransactionIntent(
+            to=to, value=value, gas=gas, data=data, nonce=nonce,
+            chain_id=int(chain_id), fee_kind="legacy",
+            max_fee_per_gas=None, max_priority_fee_per_gas=None,
+            gas_price=_uint_field(tx["gasPrice"], "gasPrice"),
+        )
+    raise TestnetSafetyError(
+        "missing fee input: validated intent has neither maxFeePerGas "
+        "(EIP-1559) nor gasPrice (legacy) — refusing to bind"
+    )
+
+
+def _rlp_decode_item(buf: bytes):
+    """Decode ONE RLP item from `buf`; return (item, consumed) where item
+    is bytes (an RLP string) or a list of decoded items. Minimal strict
+    decoder covering the full RLP grammar — exactly enough to decode the
+    transactions this gate signs; short reads and trailing bytes fail
+    closed. Implemented here (instead of relying on library internals) so
+    the signed-intent comparison stays self-contained and version-stable."""
+    if not buf:
+        raise TestnetSafetyError("malformed signed transaction: empty RLP input")
+    b0 = buf[0]
+    if b0 <= 0x7F:  # single byte encodes itself
+        return buf[0:1], 1
+    if b0 <= 0xB7:  # short string
+        n = b0 - 0x80
+        if len(buf) < 1 + n:
+            raise TestnetSafetyError(
+                "malformed signed transaction: truncated RLP string"
+            )
+        return buf[1:1 + n], 1 + n
+    if b0 <= 0xBF:  # long string
+        ll = b0 - 0xB7
+        if len(buf) < 1 + ll:
+            raise TestnetSafetyError(
+                "malformed signed transaction: truncated RLP length"
+            )
+        n = int.from_bytes(buf[1:1 + ll], "big")
+        if len(buf) < 1 + ll + n:
+            raise TestnetSafetyError(
+                "malformed signed transaction: truncated RLP string"
+            )
+        return buf[1 + ll:1 + ll + n], 1 + ll + n
+    if b0 <= 0xF7:  # short list
+        n = b0 - 0xC0
+        header = 1
+    else:            # long list
+        ll = b0 - 0xF7
+        if len(buf) < 1 + ll:
+            raise TestnetSafetyError(
+                "malformed signed transaction: truncated RLP length"
+            )
+        n = int.from_bytes(buf[1:1 + ll], "big")
+        header = 1 + ll
+    if len(buf) < header + n:
+        raise TestnetSafetyError(
+            "malformed signed transaction: truncated RLP list"
+        )
+    payload = buf[header:header + n]
+    items = []
+    pos = 0
+    while pos < len(payload):
+        item, used = _rlp_decode_item(payload[pos:])
+        items.append(item)
+        pos += used
+    if pos != len(payload):
+        raise TestnetSafetyError(
+            "malformed signed transaction: trailing RLP data"
+        )
+    return items, header + n
+
+
+def _int_from_rlp(item: object, field: str) -> int:
+    if isinstance(item, list):
+        raise TestnetSafetyError(
+            f"malformed signed transaction: {field} is not a scalar"
+        )
+    return int.from_bytes(bytes(item), "big")
+
+
+def _decode_signed_tx(raw: bytes) -> dict:
+    """Decode a SIGNED transaction into its consensus fields
+    (DSS-WO-ENG-006 §3). The gate produces ONLY two envelopes — legacy
+    EIP-155 and EIP-1559 typed — and decoding anything else fails closed.
+    This is the decoding half of the signed-intent verification: the
+    session compares these fields against the validated intent of the
+    capability and any mismatch refuses simulation and submission. Never
+    includes the raw bytes in error messages."""
+    raw = bytes(raw)
+    if not raw:
+        raise TestnetSafetyError("malformed signed transaction: empty payload")
+    if raw[0] == 0x02:
+        # EIP-1559: 0x02 || rlp([chainId, nonce, maxPriorityFeePerGas,
+        # maxFeePerGas, gas, to, value, data, accessList, yParity, r, s])
+        body, used = _rlp_decode_item(raw[1:])
+        if used != len(raw) - 1:
+            raise TestnetSafetyError(
+                "malformed signed transaction: trailing bytes after "
+                "EIP-1559 body"
+            )
+        if not isinstance(body, list) or len(body) != 12:
+            raise TestnetSafetyError(
+                "malformed signed transaction: unexpected EIP-1559 field count"
+            )
+        to = body[5]
+        if not isinstance(to, (bytes, bytearray)) or (to and len(to) != 20):
+            raise TestnetSafetyError(
+                "malformed signed transaction: recipient is not an address"
+            )
+        return {
+            "kind": "eip1559",
+            "chain_id": _int_from_rlp(body[0], "chainId"),
+            "nonce": _int_from_rlp(body[1], "nonce"),
+            "max_priority_fee_per_gas": _int_from_rlp(
+                body[2], "maxPriorityFeePerGas"
+            ),
+            "max_fee_per_gas": _int_from_rlp(body[3], "maxFeePerGas"),
+            "gas": _int_from_rlp(body[4], "gas"),
+            "to": bytes(to) if to else None,
+            "value": _int_from_rlp(body[6], "value"),
+            "data": bytes(body[7]),
+        }
+    if raw[0] == 0x01:
+        raise TestnetSafetyError(
+            "unsupported signed transaction envelope (EIP-2930): the gate "
+            "signs only legacy or EIP-1559 — refusing"
+        )
+    if raw[0] < 0xC0:
+        raise TestnetSafetyError(
+            f"unsupported signed transaction envelope type 0x{raw[0]:02x}: "
+            "refusing"
+        )
+    # Legacy: rlp([nonce, gasPrice, gas, to, value, data, v, r, s])
+    body, used = _rlp_decode_item(raw)
+    if used != len(raw):
+        raise TestnetSafetyError(
+            "malformed signed transaction: trailing bytes after legacy body"
+        )
+    if not isinstance(body, list) or len(body) != 9:
+        raise TestnetSafetyError(
+            "malformed signed transaction: unexpected legacy field count"
+        )
+    to = body[3]
+    if not isinstance(to, (bytes, bytearray)) or (to and len(to) != 20):
+        raise TestnetSafetyError(
+            "malformed signed transaction: recipient is not an address"
+        )
+    v = _int_from_rlp(body[6], "v")
+    if v >= 35:  # EIP-155 replay protection
+        chain_id: Optional[int] = (v - 35) // 2
+    else:
+        # pre-EIP-155 signature — no chain binding; the intent comparison
+        # refuses (this gate always signs with a chain ID)
+        chain_id = None
+    return {
+        "kind": "legacy",
+        "chain_id": chain_id,
+        "nonce": _int_from_rlp(body[0], "nonce"),
+        "max_priority_fee_per_gas": None,
+        "max_fee_per_gas": None,
+        "gas": _int_from_rlp(body[2], "gas"),
+        "to": bytes(to) if to else None,
+        "value": _int_from_rlp(body[4], "value"),
+        "data": bytes(body[5]),
+        "gas_price": _int_from_rlp(body[1], "gasPrice"),
+    }
+
+
+@dataclass(frozen=True)
+class _PreparedBundleState:
+    """The FROZEN content of one prepared Flashbots bundle
+    (DSS-WO-ENG-006 §3). Created once by PreparedFlashbotsBundle.__init__
+    under the minting authority and never mutated afterwards: the
+    dataclass is frozen, the capability blocks attribute assignment, and
+    every field is itself immutable (str/int/bytes, tuples, frozen intent
+    records, the frozen TestnetExecutionConfig). The signed payload lives
+    ONLY here — there is no public accessor for it."""
+
+    sender: str
+    chain_id: int
+    intents: tuple                       # tuple[ValidatedTransactionIntent, ...]
+    signed_payload: tuple                # tuple[bytes, ...] — gate-internal only
+    target_block: int
+    fingerprint: str
+    total_fee_exposure_wei: int
+    purpose: str
+    config: "TestnetExecutionConfig"
 
 
 class PreparedFlashbotsBundle:
@@ -817,26 +1156,44 @@ class PreparedFlashbotsBundle:
     Minted exclusively by prepare_flashbots_bundle (via _mint) AFTER the
     execution gate, chain verification, full transaction policy (including
     the aggregate bundle fee cap), wallet-custody binding and signing have
-    all succeeded. It is immutable and binds together the verified wallet
-    identity (sender), the allowlisted chain ID, the validated transaction
-    intent, the EXACT signed payload, the EXACT target block and their
-    order-sensitive fingerprint.
+    all succeeded. It is IMMUTABLE after creation (DSS-WO-ENG-006 §3): the
+    content is a frozen `_PreparedBundleState` held behind a single
+    `__slots__` slot, attribute assignment and deletion on the capability
+    are refused, the transaction intents are frozen
+    ValidatedTransactionIntent records (never mutable dicts), and the
+    minting token is a name-mangled class-private object — not a
+    module-level public name. There is deliberately NO signed-payload
+    property (DSS-WO-ENG-006 §2): the exact signed bytes stay inside the
+    gate-controlled implementation.
 
-    FlashbotsBundleSession re-verifies every one of these bindings at
-    construction and again before every relay interaction — a mismatch
-    refuses the operation. An arbitrary signed bundle can never gain
-    submission authority, because no code path outside prepare_
-    flashbots_bundle can produce this capability.
+    FlashbotsBundleSession re-verifies every binding at construction and
+    again before every relay interaction — wallet identity (signer
+    recovery), chain ID, exact-payload/target fingerprint, the
+    field-by-field correspondence between each DECODED signed transaction
+    and its validated intent, and the fee exposure — and refuses on any
+    mismatch.
+
+    HONEST BOUNDARY (DSS-WO-ENG-006 §3): this is an application-level
+    authorization boundary. Same-process hostile code can defeat it
+    (object.__setattr__, the mangled token name, monkeypatching); no
+    cryptographic unforgeability is claimed. See the module docstring and
+    docs/testnet-policy.md §5.
     """
 
     # Not a pytest test class despite the Test prefix.
     __test__ = False
 
-    __slots__ = (
-        "_sender", "_chain_id", "_validated_txs", "_signed_payload",
-        "_target_block", "_fingerprint", "_total_fee_exposure_wei",
-        "_purpose", "_config",
-    )
+    __slots__ = ("_state",)
+
+    # Minting authority: a name-mangled CLASS-PRIVATE token
+    # (DSS-WO-ENG-006 §3) — not a module-level public name. Its only
+    # sanctioned use is the _mint classmethod, whose only sanctioned
+    # caller is prepare_flashbots_bundle in this module. Honest boundary:
+    # same-process code could still reach this attribute via its mangled
+    # name; the session's independent re-verification (exact type, signer
+    # recovery, fingerprint, signed-intent fields, fee exposure) is the
+    # defense in depth that actually refuses forged content.
+    __MINT_AUTHORITY = object()
 
     def __init__(
         self,
@@ -852,63 +1209,99 @@ class PreparedFlashbotsBundle:
         purpose: str,
         config: "TestnetExecutionConfig",
     ):
-        if _authority is not _PREPARATION_AUTHORITY:
+        if _authority is not type(self).__MINT_AUTHORITY:
             raise TestnetSafetyError(
                 "PreparedFlashbotsBundle is an internal capability minted "
                 "EXCLUSIVELY by prepare_flashbots_bundle(); external "
                 "construction is refused"
             )
-        self._sender = str(sender).lower()
-        self._chain_id = int(chain_id)
-        self._validated_txs = tuple(dict(t) for t in validated_txs)
-        self._signed_payload = tuple(bytes(r) for r in signed_payload)
-        self._target_block = int(target_block)
-        self._fingerprint = str(fingerprint)
-        self._total_fee_exposure_wei = int(total_fee_exposure_wei)
-        self._purpose = str(purpose)
-        self._config = config
+        validated = tuple(dict(t) for t in validated_txs)
+        payload = tuple(bytes(r) for r in signed_payload)
+        if len(validated) != len(payload):
+            raise TestnetSafetyError(
+                "capability minting refused: transaction count does not "
+                "match signed payload count"
+            )
+        if int(target_block) <= 0 or not str(fingerprint):
+            raise TestnetSafetyError(
+                "capability minting refused: malformed target block or "
+                "fingerprint"
+            )
+        # Normalize the validated transactions into IMMUTABLE intent
+        # records (DSS-WO-ENG-006 §3): the mutable dicts are consumed here
+        # and never stored on the capability.
+        intents = tuple(
+            _intent_from_validated_tx(t, int(chain_id)) for t in validated
+        )
+        object.__setattr__(self, "_state", _PreparedBundleState(
+            sender=str(sender).lower(),
+            chain_id=int(chain_id),
+            intents=intents,
+            signed_payload=payload,
+            target_block=int(target_block),
+            fingerprint=str(fingerprint),
+            total_fee_exposure_wei=int(total_fee_exposure_wei),
+            purpose=str(purpose),
+            config=config,
+        ))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TestnetSafetyError(
+            "PreparedFlashbotsBundle is immutable after creation "
+            "(DSS-WO-ENG-006 §3): attribute assignment is refused"
+        )
+
+    def __delattr__(self, name: str) -> None:
+        raise TestnetSafetyError(
+            "PreparedFlashbotsBundle is immutable after creation "
+            "(DSS-WO-ENG-006 §3): attribute deletion is refused"
+        )
 
     @classmethod
     def _mint(cls, **fields) -> "PreparedFlashbotsBundle":
-        """The ONLY minting path — the private authority token is held by
-        prepare_flashbots_bundle in this module."""
-        return cls(_authority=_PREPARATION_AUTHORITY, **fields)
+        """The ONLY minting path — the minting token is a class-private,
+        name-mangled object held by this class; prepare_flashbots_bundle
+        (same module) is its only sanctioned caller."""
+        return cls(_authority=cls.__MINT_AUTHORITY, **fields)
+
+    # Read-only, non-sensitive views. There is deliberately NO
+    # signed_payload or raw-payload property and NO validated-tx-dict
+    # property (DSS-WO-ENG-006 §2/§3): the exact signed bytes stay inside
+    # the gate-controlled implementation and the intents are exposed as
+    # frozen records only.
 
     @property
     def sender(self) -> str:
-        return self._sender
+        return self._state.sender
 
     @property
     def chain_id(self) -> int:
-        return self._chain_id
+        return self._state.chain_id
 
     @property
-    def validated_txs(self) -> tuple:
-        return self._validated_txs
-
-    @property
-    def signed_payload(self) -> tuple:
-        return self._signed_payload
+    def intents(self) -> tuple:
+        """The immutable normalized transaction-intent records."""
+        return self._state.intents
 
     @property
     def target_block(self) -> int:
-        return self._target_block
+        return self._state.target_block
 
     @property
     def fingerprint(self) -> str:
-        return self._fingerprint
+        return self._state.fingerprint
 
     @property
     def total_fee_exposure_wei(self) -> int:
-        return self._total_fee_exposure_wei
+        return self._state.total_fee_exposure_wei
 
     @property
     def purpose(self) -> str:
-        return self._purpose
+        return self._state.purpose
 
     @property
     def config(self) -> "TestnetExecutionConfig":
-        return self._config
+        return self._state.config
 
 
 def _recover_signer(raw: bytes) -> str:
@@ -928,21 +1321,28 @@ class FlashbotsBundleSession:
     check) — so session construction can never bypass transaction policy
     or wallet-identity validation (DSS-WO-ENG-005 §3).
 
-    simulate() and submit() take NO payload: they operate exclusively on
-    the bound capability. An arbitrary signed bundle can therefore never
-    gain submission authority merely by being passed around.
+    The PUBLIC SURFACE is minimal (DSS-WO-ENG-006 §4): simulate() and
+    submit() accept NO arguments, operate exclusively on the privately
+    held prepared payload, and return SCRUBBED relay responses — no raw
+    signed transaction bytes can leave through them, through a result
+    object, or through any other public method or property. An arbitrary
+    bundle can never gain submission authority merely by being passed
+    around, and callers cannot substitute payloads or target blocks.
 
     ENFORCEMENT (in production code, never only in tests): every binding —
-    wallet identity (recovered signers), chain ID, validated intent,
-    exact signed payload fingerprint, target block — is re-verified at
-    construction and again before every relay interaction. submit()
-    refuses to call the relay unless THIS session previously recorded a
-    SUCCESSFUL simulation of the exact prepared payload for the exact
-    target block, the target block is still in the future, the execution
-    gate flag is set, and the RPC chain ID still matches the expected
-    allowlisted chain — re-verified immediately before the submission
-    call. The one-use authorization is consumed BEFORE the relay call so
-    a relay timeout cannot silently authorize unlimited retries.
+    wallet identity (recovered signers), chain ID, validated intent
+    (DECODED signed transaction compared field-by-field against the
+    frozen intent records), exact signed payload fingerprint, target
+    block, and the per-transaction and aggregate fee exposure — is
+    re-verified at construction and again before every relay interaction
+    (DSS-WO-ENG-006 §3/§5). submit() refuses to call the relay unless
+    THIS session previously recorded a SUCCESSFUL simulation of the exact
+    prepared payload for the exact target block, the target block is
+    still in the future, the execution gate flag is set, and the RPC
+    chain ID still matches the expected allowlisted chain — re-verified
+    immediately before the submission call. The one-use authorization is
+    consumed BEFORE the relay call so a relay timeout cannot silently
+    authorize unlimited retries.
     """
 
     # Not a pytest test class despite the Test prefix.
@@ -974,7 +1374,7 @@ class FlashbotsBundleSession:
         """Exact signed payload hex (with and without 0x) for error
         redaction — these strings must never reach the audit log."""
         hexes = []
-        for raw in self._prepared.signed_payload:
+        for raw in self._prepared._state.signed_payload:
             h = bytes(raw).hex()
             hexes.extend((h, "0x" + h))
         return tuple(hexes)
@@ -982,7 +1382,7 @@ class FlashbotsBundleSession:
     def _verify_payload_signers(self) -> None:
         """Wallet-identity binding: every signed transaction in the
         capability must have been signed by the verified agent wallet."""
-        for i, raw in enumerate(self._prepared.signed_payload):
+        for i, raw in enumerate(self._prepared._state.signed_payload):
             try:
                 signer = _recover_signer(raw)
             except Exception as exc:
@@ -996,11 +1396,137 @@ class FlashbotsBundleSession:
                     "not the verified agent wallet — refusing"
                 )
 
+    def _verify_signed_intents(self) -> None:
+        """Signed-intent correspondence (DSS-WO-ENG-006 §3): decode every
+        signed transaction and compare its consensus fields against the
+        validated intent record it was prepared from — recovered sender
+        is checked by _verify_payload_signers; this comparison covers
+        chain ID, recipient, nonce, value, calldata, gas limit and the
+        exact EIP-1559/legacy fee envelope. ANY mismatch fails closed
+        before simulation or submission."""
+        st = self._prepared._state
+        for i, (raw, intent) in enumerate(zip(st.signed_payload, st.intents)):
+            try:
+                decoded = _decode_signed_tx(raw)
+            except TestnetSafetyError as exc:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] failed signed-intent "
+                    f"verification: {exc}"
+                ) from exc
+            if decoded["kind"] != intent.fee_kind:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] fee envelope mismatch: signed "
+                    f"transaction is {decoded['kind']}, validated intent is "
+                    f"{intent.fee_kind} — refusing"
+                )
+            if decoded["chain_id"] != intent.chain_id:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] chain mismatch: signed "
+                    f"transaction targets chain {decoded['chain_id']}, "
+                    f"validated intent binds {intent.chain_id} — refusing"
+                )
+            recipient = decoded["to"]
+            if recipient is None or ("0x" + recipient.hex()) != intent.to:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] recipient mismatch: signed "
+                    f"transaction does not match the validated intent — "
+                    "refusing"
+                )
+            if decoded["nonce"] != intent.nonce:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] nonce mismatch: signed "
+                    f"transaction does not match the validated intent — "
+                    "refusing"
+                )
+            if decoded["value"] != intent.value:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] value mismatch: signed "
+                    "transaction does not match the validated intent — "
+                    "refusing"
+                )
+            if decoded["data"] != intent.data:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] calldata mismatch: signed "
+                    "transaction does not match the validated intent — "
+                    "refusing"
+                )
+            if decoded["gas"] != intent.gas:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] gas limit mismatch: signed "
+                    "transaction does not match the validated intent — "
+                    "refusing"
+                )
+            if intent.fee_kind == "eip1559":
+                if (
+                    decoded["max_fee_per_gas"] != intent.max_fee_per_gas
+                    or decoded["max_priority_fee_per_gas"]
+                    != intent.max_priority_fee_per_gas
+                ):
+                    raise TestnetSafetyError(
+                        f"prepared bundle tx[{i}] fee fields mismatch: signed "
+                        "transaction does not match the validated intent — "
+                        "refusing"
+                    )
+            else:
+                if decoded["gas_price"] != intent.gas_price:
+                    raise TestnetSafetyError(
+                        f"prepared bundle tx[{i}] gas price mismatch: signed "
+                        "transaction does not match the validated intent — "
+                        "refusing"
+                    )
+
+    def _recheck_fee_exposure(self) -> None:
+        """Fee-exposure recheck (DSS-WO-ENG-006 §5): before EVERY relay
+        interaction, re-derive the per-transaction and AGGREGATE
+        worst-case fee exposure from the frozen signed intents and hold
+        them against the configured caps AND the recorded total. Fail
+        closed — never clip, never re-price."""
+        st = self._prepared._state
+        cfg = self._config
+        total = 0
+        for i, intent in enumerate(st.intents):
+            price = (
+                intent.max_fee_per_gas
+                if intent.fee_kind == "eip1559"
+                else intent.gas_price
+            )
+            if price is None:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] carries no fee price — refusing"
+                )
+            if price > cfg.max_fee_per_gas_wei:
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] fee price exceeds the testnet "
+                    "cap — refusing before relay interaction"
+                )
+            if (
+                intent.fee_kind == "eip1559"
+                and intent.max_priority_fee_per_gas is not None
+                and intent.max_priority_fee_per_gas > cfg.max_priority_fee_wei
+            ):
+                raise TestnetSafetyError(
+                    f"prepared bundle tx[{i}] priority fee exceeds the "
+                    "testnet cap — refusing before relay interaction"
+                )
+            total += intent.gas * price
+        if total > cfg.max_total_fee_wei:
+            raise TestnetSafetyError(
+                f"aggregate bundle fee exposure {total} wei exceeds the "
+                f"testnet cap {cfg.max_total_fee_wei} wei — refusing before "
+                "relay interaction"
+            )
+        if total != st.total_fee_exposure_wei:
+            raise TestnetSafetyError(
+                "recorded fee exposure does not match the frozen signed "
+                "intents — refusing"
+            )
+
     def _verify_bindings(self) -> None:
         """Re-verify EVERY capability binding before any relay interaction:
         chain identity (allowlist + expectation + capability match),
-        wallet identity (signer recovery) and the exact-payload/target
-        fingerprint."""
+        wallet identity (signer recovery), the exact-payload/target
+        fingerprint, the field-by-field signed-intent correspondence and
+        the fee-exposure recheck (DSS-WO-ENG-006 §3/§5)."""
         p = self._prepared
         reported = self.verify_chain()  # allowlist + expected chain (live RPC)
         if reported != p.chain_id:
@@ -1009,11 +1535,15 @@ class FlashbotsBundleSession:
                 f"{p.chain_id} but the transport now reports {reported}"
             )
         self._verify_payload_signers()
-        if _payload_fingerprint(p.signed_payload, p.target_block) != p.fingerprint:
+        if _payload_fingerprint(
+            p._state.signed_payload, p.target_block
+        ) != p.fingerprint:
             raise TestnetSafetyError(
                 "payload binding mismatch: the prepared signed payload does "
                 "not match its recorded fingerprint — refusing"
             )
+        self._verify_signed_intents()
+        self._recheck_fee_exposure()
 
     def verify_chain(self) -> int:
         """Verify the transport RPC's reported chain ID against the
@@ -1057,19 +1587,24 @@ class FlashbotsBundleSession:
         text is sanitized and never contains the signed payload.
         """
         p = self._prepared
+        st = p._state
         try:
             if not self._config.rpc_url:
                 raise TestnetSafetyError(
                     "relay RPC URL is required for bundle simulation"
                 )
-            self._verify_bindings()  # chain + wallet + payload bindings
+            self._verify_bindings()  # chain + wallet + payload + intents + fees
             head = int(self._w3.eth.block_number)
             if p.target_block <= head:
                 raise TestnetSafetyError(
                     f"stale simulation refused: target block {p.target_block} "
                     f"already reached (head {head}) — refusing to simulate"
                 )
-        except TestnetSafetyError as exc:
+        except Exception as exc:
+            # Every refusal is audited — including infrastructure/RPC
+            # failures raised during preflight: once an attempt has been
+            # initiated it must not silently escape the audit path
+            # (DSS-WO-ENG-006 §6).
             self._record(
                 "simulation_refused",
                 error=_sanitize_error(exc, *self._payload_hexes()),
@@ -1077,11 +1612,11 @@ class FlashbotsBundleSession:
             raise
         try:
             simulation = self._w3.flashbots.simulate(
-                [{"signed_transaction": raw} for raw in p.signed_payload],
+                [{"signed_transaction": raw} for raw in st.signed_payload],
                 p.target_block,
             )
             evaluate_bundle_simulation(
-                simulation, expected_tx_count=len(p.signed_payload)
+                simulation, expected_tx_count=len(st.signed_payload)
             )
         except Exception as exc:
             # Failed simulations are audited too: top-level relay errors,
@@ -1108,7 +1643,10 @@ class FlashbotsBundleSession:
             tx_hash=simulation.get("bundleHash"),
             estimated_gas=total_gas,
         )
-        return simulation
+        # The relay response is scrubbed before it leaves the session: no
+        # signed bytes (or anything shaped like them) can leak through a
+        # result object (DSS-WO-ENG-006 §2/§4).
+        return _scrub_transport_payload(simulation)
 
     def submit(self) -> dict:
         """Submit the PREPARED bundle via eth_sendBundle.
@@ -1130,6 +1668,7 @@ class FlashbotsBundleSession:
         never contains the signed payload or any other secret material.
         """
         p = self._prepared
+        st = p._state
         auth = None
         try:
             if not self._config.enabled:
@@ -1157,7 +1696,12 @@ class FlashbotsBundleSession:
                     "simulate() must succeed first, and the submitted "
                     "payload and target block must match it exactly"
                 )
-        except TestnetSafetyError as exc:
+        except Exception as exc:
+            # Every refusal is audited — including infrastructure/RPC
+            # failures raised during preflight: once an attempt has been
+            # initiated it must not silently escape the audit path
+            # (DSS-WO-ENG-006 §6). The one-use authorization is NOT
+            # consumed here: the relay submission attempt never started.
             self._record(
                 "submission_refused",
                 error=_sanitize_error(exc, *self._payload_hexes()),
@@ -1166,7 +1710,7 @@ class FlashbotsBundleSession:
 
         try:
             result = self._w3.flashbots.send_bundle(
-                [{"signed_transaction": raw} for raw in p.signed_payload],
+                [{"signed_transaction": raw} for raw in st.signed_payload],
                 target_block_number=p.target_block,
             )
         except Exception as exc:
@@ -1218,7 +1762,12 @@ class FlashbotsBundleSession:
             tx_hash=bundle_hash,
             estimated_gas=auth.get("total_gas_used"),
         )
-        return {"relay_result": result, "audit": record}
+        # Scrubbed result object: no signed bytes leave the session
+        # (DSS-WO-ENG-006 §2/§4).
+        return {
+            "relay_result": _scrub_transport_payload(result),
+            "audit": record,
+        }
 
 
 def _relay_error(result: object) -> Optional[str]:
@@ -1447,7 +1996,7 @@ def prepare_flashbots_bundle(
     web3_factory: Optional[Callable[[str], object]] = None,
     relay_factory: Optional[Callable[[str, object, str], object]] = None,
     known_targets: Optional[dict[int, dict[str, str]]] = None,
-) -> tuple["FlashbotsBundleSession", list[bytes], int]:
+) -> "FlashbotsBundleSession":
     """The ONLY sanctioned preparation path for Flashbots bundle operations.
 
     Gate → verify chain → policy-validate the FINAL transactions (including
@@ -1455,6 +2004,15 @@ def prepare_flashbots_bundle(
     the authorization capability → build the session. NO relay call happens
     here; simulation and submission are separate, explicit operations on
     the returned session.
+
+    CONTAINMENT (DSS-WO-ENG-006 §2): returns the CONTROLLED SESSION ONLY.
+    The signed raw transaction bytes are NEVER returned, exposed through a
+    property, iterator, debug helper or result object, or written to any
+    log — they stay inside the gate-controlled implementation for
+    simulation and relay submission. A caller can request preparation
+    (this call), simulation (session.simulate()) and controlled,
+    authorization-checked submission (session.submit()); a caller CANNOT
+    obtain the raw signed payload from the preparation API.
 
     Sequence (every step fails closed):
       1. the testnet execution gate must be ENABLED and the config fully
@@ -1472,11 +2030,12 @@ def prepare_flashbots_bundle(
          it to the recorded agent address;
       5. re-verify the chain ID, sign every transaction;
       6. build the relay transport (Flashbots middleware attached by the
-         factory; the agent wallet is the relay auth signer), MINT the
+         factory; the agent wallet is the relay auth signer) and MINT the
          PreparedFlashbotsBundle capability — binding wallet identity,
-         chain ID, validated intent, exact signed payload, target block
-         and fingerprint — and return (session, signed_raw_txs,
-         target_block). No other code path can mint the capability.
+         chain ID, the frozen normalized transaction-intent records, the
+         exact signed payload, the target block and their fingerprint —
+         then build the session on it. No other code path can mint the
+         capability or create a session.
 
     The Flashbots relay never becomes an independent authorization path:
     the session only transports the exact payload that already passed
@@ -1546,5 +2105,10 @@ def prepare_flashbots_bundle(
         purpose=purpose,
         config=cfg,
     )
-    session = FlashbotsBundleSession(relay_w3, prepared)
-    return session, list(signed), target_block
+    # 6c — CONTAINMENT (DSS-WO-ENG-006 §2): return the CONTROLLED SESSION
+    # ONLY. No tuple, no signed raw transaction bytes, no capability
+    # object, no target block. The signed payload stays inside the
+    # gate-controlled implementation; the session constructor independently
+    # re-verifies every binding (signer recovery, chain, fingerprint,
+    # signed-intent fields, fee exposure) before returning it.
+    return FlashbotsBundleSession(relay_w3, prepared)

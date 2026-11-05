@@ -3,7 +3,8 @@ tests/test_testnet_gate.py
 ==========================
 Offline, deterministic tests for the DSS testnet-only execution boundary
 (executor/testnet_gate.py, DSS-WO-ENG-003 D; unified per DSS-WO-ENG-004;
-capability-gated per DSS-WO-ENG-005).
+capability-gated per DSS-WO-ENG-005; payload-containment and
+capability-integrity hardened per DSS-WO-ENG-006).
 
 Every safety invariant of the gate is pinned here:
 
@@ -18,14 +19,24 @@ Every safety invariant of the gate is pinned here:
     Flashbots preparation alike — first passes the SAME explicit testnet
     execution gate (ENG-005 §2): with the gate disabled, Flashbots
     preparation never decrypts the wallet and never signs;
-  * Flashbots submission authority is an unforgeable capability
-    (ENG-005 §3): only prepare_flashbots_bundle can mint a
+  * Flashbots submission authority is a capability-gated boundary
+    (ENG-005 §3; ENG-006 §3): only prepare_flashbots_bundle can mint a
     PreparedFlashbotsBundle; directly constructed, forged or subclassed
     session/capability objects are refused; simulate()/submit() take no
     payload, so an arbitrary bundle can never gain submission authority;
     every binding (wallet identity via signer recovery, chain ID,
     validated intent, exact signed payload fingerprint, target block) is
     re-verified at construction and before every relay interaction;
+  * signed payload containment (ENG-006 §2/§4): preparation returns the
+    CONTROLLED SESSION ONLY, no public API exposes broadcastable signed
+    bytes, relay responses are scrubbed before they leave the session and
+    the capability has no signed-payload property;
+  * capability immutability and integrity (ENG-006 §3): prepared state is
+    frozen (frozen dataclasses + refused attribute assignment), intents
+    are frozen records, the minting token is a class-private name-mangled
+    object, and every DECODED signed transaction must match its validated
+    intent field-by-field (wrong signer, chain, recipient, nonce, value,
+    calldata, gas limit or fee envelope all fail closed);
   * transaction policy: no deployments, no arbitrary EOA transfers, no
     unverified contract targets, hard value/gas caps, monetary fee
     exposure caps for EIP-1559 and legacy transactions (missing,
@@ -47,6 +58,7 @@ Every safety invariant of the gate is pinned here:
     relay call so a timeout cannot authorize unlimited retries;
   * every simulation and submission — success, failure, refusal or
     uncertain outcome — is audited without leaking secrets (ENG-005 §4);
+    preflight infrastructure/RPC failures are audited too (ENG-006 §6);
   * EXECUTE_ONCHAIN (the production guard) stays false and untouched;
   * the audit log records the required fields and can never contain
     credentials;
@@ -79,6 +91,8 @@ from executor.testnet_gate import (
     PreparedFlashbotsBundle,
     TestnetExecutionConfig,
     TestnetSafetyError,
+    ValidatedTransactionIntent,
+    _decode_signed_tx,
     _payload_fingerprint,
     check_chain_id,
     evaluate_bundle_simulation,
@@ -92,6 +106,8 @@ from executor.testnet_gate import (
     validate_transaction,
     verify_secret_store,
 )
+import dataclasses
+import inspect
 
 SEPOLIA = 11155111
 HOLESKY = 17000
@@ -668,7 +684,11 @@ def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
                      fee_price_gwei=2, chain_values=(SEPOLIA,), head=99,
                      purpose="capability session test"):
     """Prepare a REAL bundle through the sanctioned path with a throwaway
-    wallet. Returns (session, cfg, signed, target, acct)."""
+    wallet. Returns (session, cfg, target, acct).
+
+    ENG-006 §2 containment: this helper deliberately does NOT return the
+    signed raw payload — tests that need the white-box payload read it
+    from session._prepared._state.signed_payload directly."""
     info = _tmp_keystore(tmp)
     acct = info["account"]
     cfg = TestnetExecutionConfig(
@@ -689,12 +709,13 @@ def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
         }
         for _ in range(n_txs)
     ]
-    session, signed, target = prepare_flashbots_bundle(
+    session = prepare_flashbots_bundle(
         txs, purpose=purpose, config=cfg,
         web3_factory=lambda url: w3,
         relay_factory=lambda url, auth, relay_url: relay,
     )
-    return session, cfg, signed, target, acct
+    target = session._prepared.target_block
+    return session, cfg, target, acct
 
 
 class TestFlashbotsCapabilitySession(unittest.TestCase):
@@ -725,16 +746,19 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_preparation_with_gate_proceeds_after_policy_checks(self):
         """With the gate enabled, preparation signs only after the RPC
         chain check, the full transaction policy and the custody checks
-        have passed — and the relay is never contacted during prepare."""
+        have passed — and the relay is never contacted during prepare.
+        The signed payload is read white-box (ENG-006 §2: no helper hands
+        it out)."""
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub()
-            session, cfg, signed, target, acct = self._prepare(tmp, relay)
+            session, cfg, target, acct = self._prepare(tmp, relay)
             relay.assert_not_called()
             self.assertEqual(target, 100)
-            self.assertEqual(len(signed), 1)
+            payload = session._prepared._state.signed_payload
+            self.assertEqual(len(payload), 1)
             from eth_account import Account as _A
             self.assertEqual(
-                _A.recover_transaction(signed[0]).lower(), acct.address.lower()
+                _A.recover_transaction(payload[0]).lower(), acct.address.lower()
             )
 
     def test_both_transports_use_same_gate_and_wallet_identity(self):
@@ -807,7 +831,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
                 web3_factory=lambda url: w3,
             )
             from eth_account import Account as _A
-            _, fb_signed, fb_target = prepare_flashbots_bundle(
+            fb_session = prepare_flashbots_bundle(
                 [{"to": acct.address, "value": 0}],
                 purpose="gate parity", config=enabled,
                 web3_factory=lambda url: _PrepareW3(),
@@ -816,8 +840,9 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertEqual(
                 _A.recover_transaction(sent[0]).lower(), acct.address.lower()
             )
+            fb_payload = fb_session._prepared._state.signed_payload
             self.assertEqual(
-                _A.recover_transaction(fb_signed[0]).lower(), acct.address.lower()
+                _A.recover_transaction(fb_payload[0]).lower(), acct.address.lower()
             )
 
     # ── §3: the session cannot be forged outside the preparation path ───
@@ -916,7 +941,8 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         (ENG-005 §3)."""
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(head=99)
-            session, cfg, signed, target, acct = self._prepare(tmp, relay)
+            session, cfg, target, acct = self._prepare(tmp, relay)
+            payload = list(session._prepared._state.signed_payload)
             stranger_signed = Account.create().sign_transaction({
                 "to": acct.address, "value": 0, "gas": 21000,
                 "gasPrice": 10**9, "nonce": 0, "chainId": SEPOLIA,
@@ -927,9 +953,9 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             )
             for call in (
                 lambda: session.simulate(stranger_raw, target),
-                lambda: session.simulate(signed, target),
+                lambda: session.simulate(payload, target),
                 lambda: session.submit(stranger_raw, target),
-                lambda: session.submit(signed, target, purpose="x"),
+                lambda: session.submit(payload, target, purpose="x"),
             ):
                 with self.assertRaises(TypeError):
                     call()
@@ -939,7 +965,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             sent_bundle, sent_block = relay.send_calls[0]
             self.assertEqual(sent_block, target)
             self.assertEqual(
-                [dict(t)["signed_transaction"] for t in sent_bundle], signed
+                [dict(t)["signed_transaction"] for t in sent_bundle], payload
             )
 
     def test_capability_fingerprint_binds_exact_signed_bytes(self):
@@ -948,13 +974,17 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         so it can never match the recorded authorization (ENG-005 §3)."""
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(head=99)
-            session, cfg, signed, target, acct = self._prepare(tmp, relay)
+            session, cfg, target, acct = self._prepare(tmp, relay)
             prepared = session._prepared
             self.assertEqual(
                 prepared.fingerprint,
-                _payload_fingerprint(prepared.signed_payload, target),
+                _payload_fingerprint(
+                    prepared._state.signed_payload, target
+                ),
             )
-            tampered = (bytes(signed[0]) + b"\x01",)
+            tampered = (
+                bytes(prepared._state.signed_payload[0]) + b"\x01",
+            )
             self.assertNotEqual(
                 _payload_fingerprint(tampered, target), prepared.fingerprint
             )
@@ -964,7 +994,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_submit_without_simulation_refused_before_relay(self):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub()
-            session, cfg, _, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError) as ctx:
                 session.submit()
             self.assertIn("no successful simulation", str(ctx.exception))
@@ -974,7 +1004,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_failed_simulation_prevents_submission_and_is_audited(self):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(sim_result={"error": {"message": "execution reverted"}})
-            session, cfg, signed, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError) as ctx:
                 session.simulate()
             self.assertIn("simulation failed", str(ctx.exception))
@@ -983,16 +1013,17 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertFalse(relay.send_calls)
             self.assertIn("simulation_failed", _audit_outcomes(cfg))
             # no secret material in the log
+            raw = session._prepared._state.signed_payload[0]
             with open(cfg.tx_log_path) as f:
                 log = f.read()
-            self.assertNotIn(signed[0].hex(), log)
+            self.assertNotIn(raw.hex(), log)
 
     def test_reverting_transaction_prevents_submission(self):
         with tempfile.TemporaryDirectory() as tmp:
             sim = _ok_simulation()
             sim["results"][0]["error"] = "execution reverted"
             relay = _RelayStub(sim_result=sim)
-            session, cfg, _, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError) as ctx:
                 session.simulate()
             self.assertIn("tx[0] would fail", str(ctx.exception))
@@ -1004,7 +1035,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             sim = _ok_simulation()
             sim["firstRevert"] = "0x" + "ee" * 32
             relay = _RelayStub(sim_result=sim)
-            session, cfg, _, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError):
                 session.simulate()
             self.assertFalse(relay.send_calls)
@@ -1013,7 +1044,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_empty_simulation_results_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(sim_result={"bundleHash": "0x1", "results": []})
-            session, cfg, _, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError) as ctx:
                 session.simulate()
             self.assertIn("no per-transaction results", str(ctx.exception))
@@ -1022,7 +1053,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_missing_simulation_response_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(sim_result=None)
-            session, cfg, _, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError):
                 session.simulate()
             self.assertFalse(relay.send_calls)
@@ -1031,7 +1062,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_result_count_mismatch_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(sim_result=_ok_simulation(n_txs=1))
-            session, cfg, _, _, _ = self._prepare(tmp, relay, n_txs=2)
+            session, cfg, _, _ = self._prepare(tmp, relay, n_txs=2)
             with self.assertRaises(TestnetSafetyError) as ctx:
                 session.simulate()
             self.assertIn("malformed response", str(ctx.exception))
@@ -1040,7 +1071,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_stale_simulation_prevents_submission(self):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(head=99)
-            session, cfg, _, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             session.simulate()           # authorized at head 99, target 100
             relay.advance(1)             # head becomes 100 → target reached
             with self.assertRaises(TestnetSafetyError) as ctx:
@@ -1059,7 +1090,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         simulation, then Holesky at submission — the binding refuses."""
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(chain_values=(SEPOLIA, SEPOLIA, HOLESKY))
-            session, cfg, _, _, _ = self._prepare(
+            session, cfg, _, _ = self._prepare(
                 tmp, relay, allowlist=TWO_CHAIN_ALLOWLIST
             )
             session.simulate()
@@ -1086,7 +1117,11 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             raw = bytes(getattr(signed, "raw_transaction", None) or signed.rawTransaction)
             prepared = PreparedFlashbotsBundle._mint(
                 sender=acct.address, chain_id=SEPOLIA,
-                validated_txs=[{"to": acct.address, "value": 0}],
+                validated_txs=[{
+                    "to": acct.address, "value": 0, "gas": 21000,
+                    "gasPrice": 10**9, "nonce": 0, "chainId": SEPOLIA,
+                    "data": b"",
+                }],
                 signed_payload=[raw], target_block=100,
                 fingerprint=_payload_fingerprint([raw], 100),
                 total_fee_exposure_wei=21000 * 10**9,
@@ -1103,7 +1138,8 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_happy_path_audits_and_consumes_authorization(self):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(head=99)
-            session, cfg, signed, target, _ = self._prepare(tmp, relay)
+            session, cfg, target, _ = self._prepare(tmp, relay)
+            payload = list(session._prepared._state.signed_payload)
             sim = session.simulate()
             self.assertEqual(len(relay.simulate_calls), 1)
             self.assertEqual(relay.simulate_calls[0][1], target)
@@ -1112,7 +1148,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             sent_bundle, sent_block = relay.send_calls[0]
             self.assertEqual(sent_block, target)
             self.assertEqual(
-                [dict(t)["signed_transaction"] for t in sent_bundle], signed
+                [dict(t)["signed_transaction"] for t in sent_bundle], payload
             )
             self.assertEqual(out["audit"]["outcome"], "accepted")
             self.assertEqual(out["audit"]["max_fee_exposure_wei"], 21000 * 2 * 10**9)
@@ -1131,7 +1167,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         successful simulation (ENG-005 §4)."""
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(head=99)
-            session, cfg, _, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             session.simulate()
 
             class _Timeout(Exception):
@@ -1161,7 +1197,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         as a REJECTION and fails closed (ENG-005 §4)."""
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(head=99)
-            session, cfg, _, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             session.simulate()
             relay.send_bundle = lambda bundle, target_block_number=None, **kw: {
                 "error": {"message": "bundle target block in the past"}
@@ -1179,7 +1215,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_relay_result_without_hash_is_uncertain(self):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(head=99)
-            session, cfg, _, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
             session.simulate()
             relay.send_bundle = lambda bundle, target_block_number=None, **kw: {
                 "unknown_shape": True
@@ -1195,19 +1231,20 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         §4) — including failure paths."""
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(head=99)
-            session, cfg, signed, _, _ = self._prepare(tmp, relay)
+            session, cfg, _, _ = self._prepare(tmp, relay)
+            raw = session._prepared._state.signed_payload[0]
             session.simulate()
 
             def _boom(bundle, target_block_number=None, **kw):
                 # hostile error embedding the signed payload
-                raise RuntimeError(f"send failed for 0x{bytes(signed[0]).hex()}")
+                raise RuntimeError(f"send failed for 0x{bytes(raw).hex()}")
 
             relay.send_bundle = _boom
             with self.assertRaises(RuntimeError):
                 session.submit()
             with open(cfg.tx_log_path) as f:
                 log = f.read()
-            self.assertNotIn(signed[0].hex(), log)
+            self.assertNotIn(raw.hex(), log)
             self.assertNotIn("test-passphrase", log)
             for record in (json.loads(l) for l in log.splitlines() if l.strip()):
                 self.assertEqual(sorted(record.keys()), sorted(TX_LOG_FIELDS))
@@ -1307,10 +1344,12 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
     def test_prepare_accepts_bundle_within_aggregate_cap(self):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub()
-            session, cfg, signed, target, acct = _prepared_bundle(
+            session, cfg, target, acct = _prepared_bundle(
                 tmp, relay, n_txs=2, fee_price_gwei=40
             )
-            self.assertEqual(len(signed), 2)
+            self.assertEqual(
+                len(session._prepared._state.signed_payload), 2
+            )
             self.assertEqual(
                 session._prepared.total_fee_exposure_wei,
                 2 * 21000 * 40 * 10**9,
@@ -1350,6 +1389,588 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
                     )
             self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
             relay.assert_not_called()
+
+
+class _FlakyChainEth(_EthStub):
+    """Chain stub that throws an INFRASTRUCTURE error from the
+    (fail_after+1)-th read on — emulating an RPC/transport failure during
+    preflight rather than a policy refusal."""
+
+    def __init__(self, chain_values, head, fail_after):
+        super().__init__(chain_values, head)
+        self._reads = 0
+        self._fail_after = fail_after
+
+    @property
+    def chain_id(self):
+        self._reads += 1
+        if self._reads > self._fail_after:
+            raise ConnectionError("RPC transport failure")
+        return super().chain_id
+
+
+class _InfraFailureRelay(_RelayStub):
+    """Relay whose chain reads succeed for the first `ok_reads` calls and
+    then fail with ConnectionError (session construction succeeds;
+    simulate/submit preflight hits the infrastructure failure)."""
+
+    def __init__(self, head=99, ok_reads=1):
+        super().__init__(chain_values=(SEPOLIA,), head=head)
+        self.eth = _FlakyChainEth([SEPOLIA], head, fail_after=ok_reads)
+
+
+class TestCapabilityIntegrityENG006(unittest.TestCase):
+    """DSS-WO-ENG-006 §3: frozen capability state, immutable intent
+    records, class-private minting token, and the field-by-field
+    correspondence between every DECODED signed transaction and its
+    validated intent — wrong signer, chain, recipient, nonce, value,
+    calldata, gas limit and fee envelope all fail closed."""
+
+    def _session(self, tmp, **kw):
+        relay = _RelayStub(head=99)
+        session, cfg, target, acct = _prepared_bundle(tmp, relay, **kw)
+        return session, cfg, target, acct, relay
+
+    def _minted(self, tmp, *, intent_tx, signed_tx, fee_exposure=None):
+        """Mint a capability whose validated intent is `intent_tx` but
+        whose signed payload is `signed_tx` — BOTH signed by the same
+        throwaway wallet recorded in the keystore, so the SIGNER check
+        passes and the signed-INTENT comparison is what must fire.
+
+        White-box note: _mint with the internal minting token is used here
+        ONLY to place a deliberately mismatched capability in front of the
+        session constructor; production cannot mint capabilities outside
+        prepare_flashbots_bundle (ENG-005 §3 note, unchanged)."""
+        info = _tmp_keystore(tmp)
+        acct = info["account"]
+        relay = _RelayStub()
+        signed_tx = dict(signed_tx)
+        signed_tx.setdefault("chainId", SEPOLIA)  # BEFORE signing
+        signed = acct.sign_transaction(signed_tx)
+        raw = bytes(
+            getattr(signed, "raw_transaction", None) or signed.rawTransaction
+        )
+        intent = dict(intent_tx)
+        intent["chainId"] = SEPOLIA
+        cfg = _bundle_cfg(tmp)
+        price = (
+            intent.get("maxFeePerGas") or intent.get("gasPrice") or 10**9
+        )
+        prepared = PreparedFlashbotsBundle._mint(
+            sender=acct.address, chain_id=SEPOLIA,
+            validated_txs=[intent], signed_payload=[raw], target_block=100,
+            fingerprint=_payload_fingerprint([raw], 100),
+            total_fee_exposure_wei=(
+                fee_exposure if fee_exposure is not None else 21000 * price
+            ),
+            purpose="signed-intent integrity test", config=cfg,
+        )
+        return prepared, relay, acct, cfg
+
+    BASE_1559 = {
+        "to": None,  # filled per-test (throwaway wallet address)
+        "value": 0, "gas": 21000, "data": b"", "nonce": 0,
+        "maxFeePerGas": 2 * 10**9, "maxPriorityFeePerGas": 10**9,
+    }
+
+    def _base_1559(self, acct):
+        tx = dict(self.BASE_1559)
+        tx["to"] = acct.address
+        return tx
+
+    # ── immutability ────────────────────────────────────────────────────
+
+    def test_capability_state_is_frozen_after_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, target, acct, relay = self._session(tmp)
+            prepared = session._prepared
+            with self.assertRaises(TestnetSafetyError):
+                prepared.sender = "0x" + "ff" * 20
+            with self.assertRaises(TestnetSafetyError):
+                prepared._state = object()
+            with self.assertRaises(TestnetSafetyError):
+                del prepared._state
+            # the frozen state record itself refuses mutation too
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                prepared._state.sender = "0x" + "ff" * 20
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                prepared._state.target_block = 999999
+            # and the values are unchanged
+            self.assertEqual(prepared.sender, acct.address.lower())
+            self.assertEqual(prepared.target_block, target)
+
+    def test_intent_records_are_immutable_not_dicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, target, acct, relay = self._session(tmp)
+            intents = session._prepared.intents
+            self.assertEqual(len(intents), 1)
+            intent = intents[0]
+            self.assertIsInstance(intent, ValidatedTransactionIntent)
+            self.assertNotIsInstance(intent, dict)
+            self.assertEqual(intent.to, acct.address.lower())
+            self.assertEqual(intent.value, 0)
+            self.assertEqual(intent.gas, 21000)
+            self.assertEqual(intent.fee_kind, "eip1559")
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                intent.value = 5
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                intent.to = "0x" + "ff" * 20
+
+    def test_minting_token_is_not_a_public_api(self):
+        """DSS-WO-ENG-006 §3: the preparation token is a class-private,
+        name-mangled object — no module-level public name, nothing
+        authority-shaped in the public dir(). HONEST LIMIT: same-process
+        code could still reach the mangled attribute; this boundary is
+        application-level (documented, not claimed unforgeable)."""
+        import executor.testnet_gate as gate
+
+        self.assertFalse(hasattr(gate, "_PREPARATION_AUTHORITY"))
+        public = [
+            n for n in dir(PreparedFlashbotsBundle) if not n.startswith("_")
+        ]
+        self.assertFalse(
+            any("AUTHORITY" in n.upper() for n in public),
+            f"authority token exposed publicly: {public}",
+        )
+        # capability creation stays inside the sanctioned preparation
+        # function: the module exposes no mint helper other than _mint,
+        # which requires the private token
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _bundle_cfg(tmp)
+            with self.assertRaises(TypeError):
+                PreparedFlashbotsBundle(
+                    sender="0x" + "aa" * 20, chain_id=SEPOLIA,
+                    validated_txs=[], signed_payload=[], target_block=100,
+                    fingerprint="0" * 64, total_fee_exposure_wei=1,
+                    purpose="x", config=cfg,
+                )
+
+    def test_capability_has_no_signed_payload_accessor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, target, acct, relay = self._session(tmp)
+            prepared = session._prepared
+            public = [n for n in dir(prepared) if not n.startswith("_")]
+            self.assertNotIn("signed_payload", public)
+            self.assertNotIn("validated_txs", public)
+            self.assertFalse(any("payload" in n.lower() for n in public))
+
+    # ── signed-intent correspondence ────────────────────────────────────
+
+    def test_signed_payload_fields_match_validated_intents(self):
+        """ENG-006 §7 (5): the decoded signed payload fields equal the
+        normalized validated intent — recovered sender, chain ID,
+        recipient, nonce, value, calldata, gas limit and the fee
+        envelope."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, target, acct, relay = self._session(tmp)
+            st = session._prepared._state
+            self.assertEqual(len(st.signed_payload), len(st.intents))
+            from eth_account import Account as _A
+
+            for raw, intent in zip(st.signed_payload, st.intents):
+                decoded = _decode_signed_tx(raw)
+                self.assertEqual(decoded["kind"], intent.fee_kind)
+                self.assertEqual(decoded["chain_id"], intent.chain_id)
+                self.assertEqual(
+                    "0x" + decoded["to"].hex(), intent.to
+                )
+                self.assertEqual(decoded["nonce"], intent.nonce)
+                self.assertEqual(decoded["value"], intent.value)
+                self.assertEqual(decoded["data"], intent.data)
+                self.assertEqual(decoded["gas"], intent.gas)
+                self.assertEqual(
+                    decoded["max_fee_per_gas"], intent.max_fee_per_gas
+                )
+                self.assertEqual(
+                    decoded["max_priority_fee_per_gas"],
+                    intent.max_priority_fee_per_gas,
+                )
+                self.assertEqual(
+                    _A.recover_transaction(raw).lower(),
+                    session._prepared.sender,
+                )
+            # a REAL prepared session verifies end-to-end: simulate works
+            session.simulate()
+            self.assertEqual(len(relay.simulate_calls), 1)
+
+    def _assert_mismatch_refused(self, tmp, *, intent_tx, signed_tx, needle,
+                                 fee_exposure=None):
+        prepared, relay, acct, cfg = self._minted(
+            tmp, intent_tx=intent_tx, signed_tx=signed_tx,
+            fee_exposure=fee_exposure,
+        )
+        with self.assertRaises(TestnetSafetyError) as ctx:
+            FlashbotsBundleSession(relay, prepared)
+        self.assertIn(needle, str(ctx.exception))
+        relay.assert_not_called()
+
+    def test_wrong_chain_in_signed_payload_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            signed = self._base_1559(acct)
+            signed["chainId"] = HOLESKY  # allowlisted elsewhere, wrong here
+            self._assert_mismatch_refused(
+                tmp,
+                intent_tx=self._base_1559(acct),
+                signed_tx=signed,
+                needle="chain mismatch",
+            )
+
+    def test_wrong_recipient_in_signed_payload_refused(self):
+        from eth_utils import to_checksum_address
+
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            signed = self._base_1559(acct)
+            signed["to"] = to_checksum_address("0x" + "bb" * 20)
+            self._assert_mismatch_refused(
+                tmp,
+                intent_tx=self._base_1559(acct),
+                signed_tx=signed,
+                needle="recipient mismatch",
+            )
+
+    def test_wrong_nonce_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            signed = self._base_1559(acct)
+            signed["nonce"] = 5
+            self._assert_mismatch_refused(
+                tmp,
+                intent_tx=self._base_1559(acct),
+                signed_tx=signed,
+                needle="nonce mismatch",
+            )
+
+    def test_changed_value_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            signed = self._base_1559(acct)
+            signed["value"] = 1
+            self._assert_mismatch_refused(
+                tmp,
+                intent_tx=self._base_1559(acct),
+                signed_tx=signed,
+                needle="value mismatch",
+            )
+
+    def test_changed_calldata_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            signed = self._base_1559(acct)
+            signed["data"] = b"\xde\xad"
+            self._assert_mismatch_refused(
+                tmp,
+                intent_tx=self._base_1559(acct),
+                signed_tx=signed,
+                needle="calldata mismatch",
+            )
+
+    def test_changed_gas_limit_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            signed = self._base_1559(acct)
+            signed["gas"] = 21001
+            self._assert_mismatch_refused(
+                tmp,
+                intent_tx=self._base_1559(acct),
+                signed_tx=signed,
+                needle="gas limit mismatch",
+            )
+
+    def test_changed_fee_price_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            signed = self._base_1559(acct)
+            signed["maxFeePerGas"] = 3 * 10**9
+            self._assert_mismatch_refused(
+                tmp,
+                intent_tx=self._base_1559(acct),
+                signed_tx=signed,
+                needle="fee fields mismatch",
+            )
+
+    def test_changed_fee_envelope_1559_to_legacy_refused(self):
+        """The fingerprint binds the exact bytes, but the DECODED envelope
+        comparison is what catches a legacy re-sign of the same intent:
+        a 1559 intent must never be satisfiable by a legacy payload."""
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            signed = {
+                "to": acct.address, "value": 0, "gas": 21000, "data": b"",
+                "nonce": 0, "gasPrice": 10**9, "chainId": SEPOLIA,
+            }
+            intent = self._base_1559(acct)  # 1559 envelope
+            self._assert_mismatch_refused(
+                tmp,
+                intent_tx=intent,
+                signed_tx=signed,
+                needle="fee envelope mismatch",
+                fee_exposure=21000 * 10**9,
+            )
+
+    def test_changed_fee_envelope_legacy_to_1559_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            signed = {
+                "to": acct.address, "value": 0, "gas": 21000, "data": b"",
+                "nonce": 0, "maxFeePerGas": 2 * 10**9,
+                "maxPriorityFeePerGas": 10**9, "chainId": SEPOLIA,
+            }
+            intent = {
+                "to": acct.address, "value": 0, "gas": 21000, "data": b"",
+                "nonce": 0, "gasPrice": 10**9,
+            }
+            self._assert_mismatch_refused(
+                tmp,
+                intent_tx=intent,
+                signed_tx=signed,
+                needle="fee envelope mismatch",
+                fee_exposure=21000 * 2 * 10**9,
+            )
+
+    def test_unknown_envelope_refused(self):
+        """A type-0x03 (or any other unknown typed) payload must fail
+        closed, never reach the relay."""
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            intent = {
+                "to": acct.address, "value": 0, "gas": 21000, "data": b"",
+                "nonce": 0, "gasPrice": 10**9, "chainId": SEPOLIA,
+            }
+            signed = acct.sign_transaction(dict(intent))
+            raw = bytes(
+                getattr(signed, "raw_transaction", None)
+                or signed.rawTransaction
+            )
+            forged = b"\x03" + raw  # hostile re-typing of a legacy payload
+            prepared = PreparedFlashbotsBundle._mint(
+                sender=acct.address, chain_id=SEPOLIA,
+                validated_txs=[intent], signed_payload=[forged],
+                target_block=100,
+                fingerprint=_payload_fingerprint([forged], 100),
+                total_fee_exposure_wei=21000 * 10**9,
+                purpose="unknown envelope", config=_bundle_cfg(tmp),
+            )
+            relay = _RelayStub()
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                FlashbotsBundleSession(relay, prepared)
+            # the forged payload cannot even be recovered as a signed
+            # transaction (and the decoder refuses the unknown envelope
+            # type directly — pinned below) — either way it fails closed
+            self.assertIn("refusing", str(ctx.exception))
+            relay.assert_not_called()
+
+    def test_decoder_refuses_unknown_envelope_directly(self):
+        """The signed-transaction decoder itself refuses every envelope
+        other than legacy and EIP-1559 (DSS-WO-ENG-006 §3)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            tx = {
+                "to": acct.address, "value": 0, "gas": 21000,
+                "gasPrice": 10**9, "nonce": 0, "chainId": SEPOLIA,
+                "data": b"",
+            }
+            signed = acct.sign_transaction(tx)
+            raw = bytes(
+                getattr(signed, "raw_transaction", None)
+                or signed.rawTransaction
+            )
+            for forged in (b"\x03" + raw, b"\x01" + raw, b"\xff\x00\x00"):
+                with self.assertRaises(TestnetSafetyError):
+                    _decode_signed_tx(forged)
+            # truncated payload also fails closed
+            with self.assertRaises(TestnetSafetyError):
+                _decode_signed_tx(raw[: len(raw) // 2])
+
+    def test_intent_count_mismatch_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            intent = {
+                "to": acct.address, "value": 0, "gas": 21000, "data": b"",
+                "nonce": 0, "gasPrice": 10**9, "chainId": SEPOLIA,
+            }
+            signed = acct.sign_transaction(dict(intent))
+            raw = bytes(
+                getattr(signed, "raw_transaction", None)
+                or signed.rawTransaction
+            )
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                PreparedFlashbotsBundle._mint(
+                    sender=acct.address, chain_id=SEPOLIA,
+                    validated_txs=[intent, dict(intent)],
+                    signed_payload=[raw], target_block=100,
+                    fingerprint=_payload_fingerprint([raw], 100),
+                    total_fee_exposure_wei=2 * 21000 * 10**9,
+                    purpose="count mismatch", config=_bundle_cfg(tmp),
+                )
+            self.assertIn("count does not match", str(ctx.exception))
+
+    # ── fee-exposure recheck before relay interactions (§5) ─────────────
+
+    def test_aggregate_fee_recheck_refuses_session_before_any_relay(self):
+        """ENG-006 §5/§7 (11): a bundle whose aggregate worst-case fee
+        exposure exceeds 0.002 native is refused at binding verification —
+        before ANY relay interaction — even though each transaction is
+        individually within the per-tx cap."""
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            intent = {
+                "to": acct.address, "value": 0, "gas": 21000, "data": b"",
+                "nonce": 0, "maxFeePerGas": 50 * 10**9,
+                "maxPriorityFeePerGas": 10**9, "chainId": SEPOLIA,
+            }
+            raws = []
+            intents = []
+            for nonce in (0, 1):
+                tx = dict(intent)
+                tx["nonce"] = nonce
+                intents.append(tx)
+                signed = acct.sign_transaction(tx)
+                raws.append(bytes(
+                    getattr(signed, "raw_transaction", None)
+                    or signed.rawTransaction
+                ))
+            relay = _RelayStub()
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepared = PreparedFlashbotsBundle._mint(
+                    sender=acct.address, chain_id=SEPOLIA,
+                    validated_txs=intents,
+                    signed_payload=raws, target_block=100,
+                    fingerprint=_payload_fingerprint(raws, 100),
+                    total_fee_exposure_wei=2 * 21000 * 50 * 10**9,
+                    purpose="over-aggregate", config=_bundle_cfg(tmp),
+                )
+                # the fee recheck runs at binding verification — session
+                # construction — BEFORE any relay interaction
+                FlashbotsBundleSession(relay, prepared)
+            self.assertIn("aggregate bundle fee exposure", str(ctx.exception))
+            relay.assert_not_called()
+
+    def test_fee_recheck_holds_recorded_total_against_intents(self):
+        """The recorded exposure must equal the exposure re-derived from
+        the frozen intents — a mismatched record refuses the session."""
+        with tempfile.TemporaryDirectory() as tmp:
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            intent = {
+                "to": acct.address, "value": 0, "gas": 21000, "data": b"",
+                "nonce": 0, "gasPrice": 10**9, "chainId": SEPOLIA,
+            }
+            signed = acct.sign_transaction(dict(intent))
+            raw = bytes(
+                getattr(signed, "raw_transaction", None)
+                or signed.rawTransaction
+            )
+            relay = _RelayStub()
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                prepared = PreparedFlashbotsBundle._mint(
+                    sender=acct.address, chain_id=SEPOLIA,
+                    validated_txs=[intent],
+                    signed_payload=[raw], target_block=100,
+                    fingerprint=_payload_fingerprint([raw], 100),
+                    total_fee_exposure_wei=999 * 10**18,  # wrong record
+                    purpose="recorded mismatch", config=_bundle_cfg(tmp),
+                )
+                FlashbotsBundleSession(relay, prepared)
+            self.assertIn("does not match the frozen signed intents",
+                          str(ctx.exception))
+            relay.assert_not_called()
+
+
+class TestPayloadContainmentENG006(unittest.TestCase):
+    """DSS-WO-ENG-006 §2/§4/§6: relay responses are scrubbed before they
+    leave the session, no public result object carries broadcastable
+    bytes, and preflight infrastructure failures are audited."""
+
+    def test_simulation_response_is_scrubbed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sim = _ok_simulation()
+            sim["results"][0]["signed_transaction"] = "0x" + "ab" * 60
+            sim["results"][0]["raw_blob"] = "0x" + "ef" * 55
+            relay = _RelayStub(head=99, sim_result=sim)
+            session, cfg, target, acct = _prepared_bundle(tmp, relay)
+            out = session.simulate()
+            dumped = json.dumps(out)
+            self.assertNotIn("ab" * 60, dumped)
+            self.assertNotIn("ef" * 55, dumped)
+            self.assertNotIn("signed_" + "transaction", dumped.replace(
+                '"signed_transaction": "<redacted>"', ""
+            ))
+            # legitimate metadata survives the scrub
+            self.assertEqual(out["results"][0]["gasUsed"], 21000)
+            self.assertIn("simulated", _audit_outcomes(cfg))
+
+    def test_submission_result_is_scrubbed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, target, acct = _prepared_bundle(tmp, relay)
+            session.simulate()
+
+            def _leaky(bundle, target_block_number=None, **kw):
+                return {
+                    "bundleHash": "0x" + "77" * 32,
+                    "signed_transaction": "0x" + "cd" * 64,
+                }
+
+            relay.send_bundle = _leaky
+            out = session.submit()
+            dumped = json.dumps(out["relay_result"])
+            self.assertNotIn("cd" * 64, dumped)
+            self.assertIn("bundleHash", dumped)
+            self.assertIn("accepted", _audit_outcomes(cfg))
+
+    def test_preflight_infra_failure_on_simulate_is_audited(self):
+        """DSS-WO-ENG-006 §6: an infrastructure/RPC failure during
+        preflight must not silently escape the audit path once the
+        attempt has been initiated."""
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _InfraFailureRelay(head=99, ok_reads=1)
+            session, cfg, target, acct = _prepared_bundle(tmp, relay)
+            with self.assertRaises(ConnectionError):
+                session.simulate()
+            outcomes = _audit_outcomes(cfg)
+            self.assertIn("simulation_refused", outcomes)
+            with open(cfg.tx_log_path) as f:
+                log = f.read()
+            self.assertIn("RPC transport failure", log)
+            raw = session._prepared._state.signed_payload[0]
+            self.assertNotIn(raw.hex(), log)
+            self.assertFalse(relay.simulate_calls)  # relay never reached
+
+    def test_preflight_infra_failure_on_submit_is_audited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _InfraFailureRelay(head=99, ok_reads=2)
+            session, cfg, target, acct = _prepared_bundle(tmp, relay)
+            session.simulate()  # read 2 — still healthy
+            with self.assertRaises(ConnectionError):
+                session.submit()  # read 3 — infrastructure failure
+            outcomes = _audit_outcomes(cfg)
+            self.assertIn("simulated", outcomes)
+            self.assertIn("submission_refused", outcomes)
+            self.assertFalse(relay.send_calls)
+            # the authorization was NOT consumed: the relay attempt never
+            # started (the refusal happened in preflight)
+            # → repairing the infra and re-submitting requires a NEW
+            #   simulation only if the block went stale, not because the
+            #   refusal consumed it; but a retry must still pass every
+            #   binding check.
+            with open(cfg.tx_log_path) as f:
+                log = f.read()
+            self.assertIn("RPC transport failure", log)
 
 
 class TestAuditLog(unittest.TestCase):

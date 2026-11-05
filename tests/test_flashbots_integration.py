@@ -3,7 +3,7 @@ tests/test_flashbots_integration.py
 ====================================
 OPT-IN Flashbots Sepolia integration test — DSS agent wallet only, through
 the unified testnet gate (DSS-WO-ENG-004; capability-gated per
-DSS-WO-ENG-005).
+DSS-WO-ENG-005; payload containment per DSS-WO-ENG-006).
 
 History and safety contract:
 
@@ -29,20 +29,24 @@ History and safety contract:
    no keystore-path override. There is no code path to any other wallet.
 
 4. Authorization lives in the gate (DSS-WO-ENG-004 §3, DSS-WO-ENG-005
-   §2–§3): every live operation goes through prepare_flashbots_bundle →
-   PreparedFlashbotsBundle (capability) → FlashbotsBundleSession.
-   Preparation DECRYPTS the wallet and SIGNS, so it requires the SAME
-   explicit execution gate (DSS_TESTNET_EXEC=1) as direct-RPC submission —
-   with the gate disabled, nothing decrypts and nothing signs. The session
-   can only be created from a capability minted by the sanctioned
-   preparation path; simulate()/submit() take no payload, so an arbitrary
-   bundle can never gain submission authority. Wallet identity binding,
-   the Sepolia-only production allowlist, mainnet hard rejection,
-   RPC chain-ID verification before signing and immediately before
-   submission, transaction policy (incl. per-transaction AND aggregate
-   bundle fee-exposure caps) and audit records are all enforced in
-   production code. The relay is a transport only; it never creates an
-   independent authorization path.
+   §2–§3, DSS-WO-ENG-006 §2–§4): every live operation goes through
+   prepare_flashbots_bundle → PreparedFlashbotsBundle (frozen capability)
+   → FlashbotsBundleSession. Preparation DECRYPTS the wallet and SIGNS,
+   so it requires the SAME explicit execution gate (DSS_TESTNET_EXEC=1)
+   as direct-RPC submission — with the gate disabled, nothing decrypts
+   and nothing signs. The session can only be created from a capability
+   minted by the sanctioned preparation path, and preparation returns
+   ONLY that session — the signed raw transaction bytes are NEVER
+   returned, exposed through a public API, or written to a log
+   (DSS-WO-ENG-006 §2). simulate()/submit() take no payload and return
+   scrubbed relay responses, so an arbitrary bundle can never gain
+   submission authority and no broadcastable bytes can leak through a
+   result object. Wallet identity binding, the Sepolia-only production
+   allowlist, mainnet hard rejection, RPC chain-ID verification before
+   signing and immediately before submission, transaction policy (incl.
+   per-transaction AND aggregate bundle fee-exposure caps) and audit
+   records are all enforced in production code. The relay is a transport
+   only; it never creates an independent authorization path.
 
 5. Simulation-before-submission is ENFORCED IN PRODUCTION CODE
    (DSS-WO-ENG-004 §4, DSS-WO-ENG-005 §4): FlashbotsBundleSession.submit
@@ -85,6 +89,7 @@ There is deliberately NO environment variable for the keystore path, the
 passphrase or any alternative wallet: the recorded DSS agent identity
 cannot be bypassed (DSS-WO-ENG-004 §2 reqs 5–6).
 """
+import dataclasses
 import json
 import os
 import sys
@@ -100,9 +105,10 @@ from executor.testnet_gate import (
     FLASHBOTS_SEPOLIA_RELAY,
     MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
     MAX_TESTNET_TX_FEE_WEI,
+    FlashbotsBundleSession,
+    PreparedFlashbotsBundle,
     TestnetExecutionConfig,
     TestnetSafetyError,
-    _payload_fingerprint,
     prepare_flashbots_bundle,
     verify_secret_store,
 )
@@ -140,6 +146,84 @@ def _read_recorded_address(cfg: TestnetExecutionConfig) -> str:
     """Public metadata only — the recorded agent address, read through the
     gate so a malformed record fails closed."""
     return cfg.load_agent_address()
+
+
+def _offline_cfg(tmp, *, enabled=True):
+    """A fully provisioned offline config with a THROWAWAY wallet."""
+    acct = Account.create()
+    keystore = Account.encrypt(acct.key, b"throwaway-passphrase")
+
+    def w(path, data, mode=0o600):
+        with open(path, "wb") as f:
+            f.write(data)
+        os.chmod(path, mode)
+
+    w(os.path.join(tmp, "keystore.json"), json.dumps(keystore).encode())
+    w(os.path.join(tmp, "pass"), b"throwaway-passphrase".hex().encode())
+    w(os.path.join(tmp, "address"), (acct.address + "\n").encode())
+    cfg = TestnetExecutionConfig(
+        enabled=enabled,
+        rpc_url="https://sepolia.example",
+        keystore_path=os.path.join(tmp, "keystore.json"),
+        passphrase_path=os.path.join(tmp, "pass"),
+        address_path=os.path.join(tmp, "address"),
+        tx_log_path=os.path.join(tmp, "txlog.jsonl"),
+    )
+    return cfg, acct
+
+
+def _mock_w3():
+    w3 = MagicMock()
+    w3.is_connected.return_value = True
+    w3.eth.chain_id = SEPOLIA_CHAIN_ID
+    w3.eth.block_number = 100
+    w3.eth.get_transaction_count.return_value = 7
+    w3.eth.get_block.return_value = {"baseFeePerGas": 10**9}
+    w3.to_wei.side_effect = lambda v, u: int(v * 10**9) if u == "gwei" else v
+    return w3
+
+
+class _LocalRelayStub:
+    """Minimal offline Flashbots transport stub for the public-API
+    containment tests: records calls, returns well-formed relay
+    responses, never executes anything."""
+
+    def __init__(self, chain_id=SEPOLIA_CHAIN_ID, head=99):
+        self._chain_id = chain_id
+        self._head = head
+        self.flashbots = self
+        self.simulate_calls = []
+        self.send_calls = []
+
+    @property
+    def eth(self):
+        return self
+
+    @property
+    def chain_id(self):
+        return self._chain_id
+
+    @property
+    def block_number(self):
+        return self._head
+
+    def simulate(self, bundle, block_tag, *args, **kwargs):
+        self.simulate_calls.append((bundle, block_tag))
+        return {
+            "bundleHash": "0x" + "cc" * 32,
+            "totalGasUsed": 21000,
+            "results": [
+                {"txHash": "0x" + "ee" * 32, "gasUsed": 21000, "value": "0x0"}
+            ],
+        }
+
+    def send_bundle(self, bundle, target_block_number=None, **kwargs):
+        self.send_calls.append((bundle, target_block_number))
+        return {"bundleHash": "0x" + "77" * 32}
+
+    def assert_not_called(self):
+        if self.simulate_calls or self.send_calls:
+            raise AssertionError("relay was contacted but must not have been")
 
 
 class TestWalletIdentityBindings(unittest.TestCase):
@@ -205,6 +289,10 @@ class TestWalletIdentityBindings(unittest.TestCase):
             "send_" + "private_transaction",
             "_PREPARATION" + "_AUTHORITY",
             "._" + "mint(",
+            # ENG-006 §2: this file must not touch the signed payload —
+            # not even via a white-box attribute read. Containment is
+            # proven through the public API only.
+            'signed_' + 'payload',
         )
         for item in forbidden:
             self.assertNotIn(item, src)
@@ -220,38 +308,11 @@ class TestPreparePathOffline(unittest.TestCase):
     """The unified prepare path with a throwaway wallet — no network."""
 
     def _provisioned(self, tmp):
-        acct = Account.create()
-        keystore = Account.encrypt(acct.key, b"throwaway-passphrase")
-
-        def w(path, data, mode=0o600):
-            with open(path, "wb") as f:
-                f.write(data)
-            os.chmod(path, mode)
-
-        w(os.path.join(tmp, "keystore.json"), json.dumps(keystore).encode())
-        w(os.path.join(tmp, "pass"), b"throwaway-passphrase".hex().encode())
-        w(os.path.join(tmp, "address"), (acct.address + "\n").encode())
-        cfg = TestnetExecutionConfig(
-            # Preparation signs, so the FULL gate (enabled=True) is the
-            # honest state to test (DSS-WO-ENG-005 §2).
-            enabled=True,
-            rpc_url="https://sepolia.example",
-            keystore_path=os.path.join(tmp, "keystore.json"),
-            passphrase_path=os.path.join(tmp, "pass"),
-            address_path=os.path.join(tmp, "address"),
-            tx_log_path=os.path.join(tmp, "txlog.jsonl"),
-        )
+        cfg, acct = _offline_cfg(tmp)
         return cfg, acct
 
     def _mock_w3(self):
-        w3 = MagicMock()
-        w3.is_connected.return_value = True
-        w3.eth.chain_id = SEPOLIA_CHAIN_ID
-        w3.eth.block_number = 100
-        w3.eth.get_transaction_count.return_value = 7
-        w3.eth.get_block.return_value = {"baseFeePerGas": 10**9}
-        w3.to_wei.side_effect = lambda v, u: int(v * 10**9) if u == "gwei" else v
-        return w3
+        return _mock_w3()
 
     def test_prepare_without_execution_gate_never_decrypts_or_signs(self):
         """DSS-WO-ENG-005 §2: with the gate disabled, Flashbots
@@ -283,7 +344,12 @@ class TestPreparePathOffline(unittest.TestCase):
             self.assertIn("DISABLED", str(ctx.exception))
             relay.assert_not_called()
 
-    def test_prepare_signs_bound_wallet_and_never_touches_relay(self):
+    def test_prepare_returns_controlled_session_only(self):
+        """DSS-WO-ENG-006 §2: prepare_flashbots_bundle returns ONLY the
+        controlled session — no tuple, no signed raw transactions, no
+        target block, no capability object — and the relay is never
+        contacted during prepare. The session is bound to the verified
+        wallet identity through the capability (DSS-WO-ENG-005 §3)."""
         with tempfile.TemporaryDirectory() as tmp:
             cfg, acct = self._provisioned(tmp)
             w3 = self._mock_w3()
@@ -291,27 +357,21 @@ class TestPreparePathOffline(unittest.TestCase):
             # The session constructor re-verifies the transport chain
             # binding, so the mock relay must report the expected chain.
             relay.eth.chain_id = SEPOLIA_CHAIN_ID
-            session, signed, target_block = prepare_flashbots_bundle(
+            result = prepare_flashbots_bundle(
                 [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
                 purpose="offline prepare check",
                 config=cfg,
                 web3_factory=lambda url: w3,
                 relay_factory=lambda url, auth, relay_url: relay,
             )
-            self.assertEqual(target_block, 101)
-            self.assertEqual(len(signed), 1)
-            self.assertIsInstance(signed[0], bytes)
-            self.assertTrue(signed[0])
+            self.assertIsInstance(result, FlashbotsBundleSession)
+            with self.assertRaises(TypeError):
+                a, b = result  # not an unpackable (session, signed, target)
+            self.assertRegex(result._prepared.fingerprint, r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                result._prepared.sender.lower(), acct.address.lower()
+            )
             relay.assert_not_called()  # no transport interaction in prepare
-            # The session is bound to the verified wallet identity through
-            # the capability (DSS-WO-ENG-005 §3).
-            self.assertEqual(
-                session._prepared.sender.lower(), acct.address.lower()
-            )
-            self.assertEqual(
-                session._prepared.fingerprint,
-                _payload_fingerprint([bytes(signed[0])], target_block),
-            )
 
     def test_prepare_refuses_policy_violation_before_relay(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -390,6 +450,164 @@ class TestPreparePathOffline(unittest.TestCase):
         self.assertGreater(2 * worst_case, MAX_TESTNET_TX_FEE_WEI)
 
 
+class TestPayloadContainment(unittest.TestCase):
+    """DSS-WO-ENG-006 §2/§4 — containment, proven through the PUBLIC API
+    only: preparation returns the controlled session, no public attribute
+    or returned result exposes broadcastable transaction bytes, session
+    methods accept no payload, and nothing payload-shaped reaches the
+    audit log. (The capability-integrity tests live in
+    tests/test_testnet_gate.py, which is explicitly white-box.)"""
+
+    def _prepare(self, tmp):
+        cfg, acct = _offline_cfg(tmp)
+        relay = _LocalRelayStub()
+        session = prepare_flashbots_bundle(
+            [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
+            purpose="containment check",
+            config=cfg,
+            web3_factory=lambda url: _mock_w3(),
+            relay_factory=lambda url, auth, relay_url: relay,
+        )
+        return session, cfg, acct, relay
+
+    @staticmethod
+    def _iter_public_values(obj):
+        for name in dir(obj):
+            if name.startswith("_"):
+                continue
+            try:
+                value = getattr(obj, name)
+            except Exception:
+                continue
+            yield name, value
+
+    @classmethod
+    def _walk_leaves(cls, value, depth=0):
+        if depth > 16:
+            return
+        if isinstance(value, (bytes, bytearray)):
+            yield bytes(value)
+        elif isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                yield from cls._walk_leaves(k, depth + 1)
+                yield from cls._walk_leaves(v, depth + 1)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            for v in value:
+                yield from cls._walk_leaves(v, depth + 1)
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            for f in dataclasses.fields(value):
+                yield from cls._walk_leaves(
+                    getattr(value, f.name), depth + 1
+                )
+
+    def test_preparation_returns_only_the_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, acct, relay = self._prepare(tmp)
+            self.assertIsInstance(session, FlashbotsBundleSession)
+            with self.assertRaises(TypeError):
+                a, b = session
+            with self.assertRaises(TypeError):
+                list(session)
+
+    def test_no_public_api_exposes_broadcastable_bytes(self):
+        """Every value reachable from the PUBLIC surface of the session and
+        the capability, plus the returned simulation/submission objects,
+        is scanned: no bytes object of broadcastable size (a signed
+        transaction is ≥ ~100 bytes) and no long hex blob may appear."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, acct, relay = self._prepare(tmp)
+            simulation = session.simulate()
+            submission = session.submit()
+            holders = (
+                ("session", session),
+                ("prepared", session._prepared),
+                ("simulate() return", simulation),
+                ("submit() return", submission),
+            )
+            for holder_name, holder in holders:
+                for name, value in self._iter_public_values(holder):
+                    for leaf in self._walk_leaves(value):
+                        if isinstance(leaf, bytes):
+                            self.assertLess(
+                                len(leaf), 100,
+                                f"{holder_name}.{name} exposes broadcastable "
+                                "transaction bytes",
+                            )
+                        else:
+                            self.assertLess(
+                                len(leaf), 100,
+                                f"{holder_name}.{name} exposes a long hex "
+                                "blob (potential signed payload)",
+                            )
+
+    def test_capability_has_no_payload_accessor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, acct, relay = self._prepare(tmp)
+            prepared = session._prepared
+            public_names = [
+                n for n in dir(prepared) if not n.startswith("_")
+            ]
+            self.assertNotIn("signed_" + "payload", public_names)
+            self.assertNotIn("validated_txs", public_names)
+            self.assertFalse(
+                any("payload" in n.lower() for n in public_names),
+                f"payload-shaped public attribute on capability: {public_names}",
+            )
+            session_names = [
+                n for n in dir(session) if not n.startswith("_")
+            ]
+            self.assertFalse(
+                any(
+                    "payload" in n.lower() or "signed" in n.lower()
+                    for n in session_names
+                ),
+                f"payload/signed-shaped public attribute on session: "
+                f"{session_names}",
+            )
+
+    def test_session_methods_accept_no_payload(self):
+        """Callers cannot substitute payloads or target blocks through the
+        public session methods: they accept no arguments at all."""
+        import inspect
+
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, acct, relay = self._prepare(tmp)
+            self.assertEqual(
+                list(inspect.signature(session.simulate).parameters), []
+            )
+            self.assertEqual(
+                list(inspect.signature(session.submit).parameters), []
+            )
+            for call in (
+                lambda: session.simulate(b"\\x00"),
+                lambda: session.submit(b"\\x00", 5),
+                lambda: session.simulate(target_block=5),
+                lambda: session.submit(signed_transaction=b"\\x00"),
+            ):
+                with self.assertRaises(TypeError):
+                    call()
+
+    def test_audit_log_stays_free_of_long_hex_and_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, acct, relay = self._prepare(tmp)
+            session.simulate()
+            session.submit()
+            with open(cfg.tx_log_path) as f:
+                log = f.read()
+            self.assertNotIn("throwaway-passphrase", log)
+            import re
+
+            long_hex = re.compile(r"0x[0-9a-fA-F]{100,}")
+            self.assertIsNone(long_hex.search(log))
+            for record in (json.loads(l) for l in log.splitlines() if l.strip()):
+                self.assertIn(
+                    record["outcome"],
+                    ("simulated", "accepted"),
+                )
+
+
 class TestFlashbotsSepoliaSimulation(unittest.TestCase):
     """Phase 1 — relay connectivity and bundle simulation (no submission).
 
@@ -428,7 +646,8 @@ class TestFlashbotsSepoliaSimulation(unittest.TestCase):
         # Unified gate path: execution gate, identity binding, chain
         # verification, policy, signing — then the read-only relay
         # simulation of the EXACT prepared payload (capability-bound).
-        session, signed, target_block = prepare_flashbots_bundle(
+        # ENG-006 §2: preparation returns ONLY the session.
+        session = prepare_flashbots_bundle(
             [{"to": recorded, "value": SELF_TRANSFER_VALUE_WEI}],
             purpose="Flashbots Sepolia relay simulation check (0-value self-transfer)",
             config=cfg,
@@ -468,7 +687,7 @@ class TestFlashbotsSepoliaSubmission(unittest.TestCase):
         if balance == 0:
             self.skipTest("DSS agent wallet is unfunded on Sepolia")
 
-        session, signed, target_block = prepare_flashbots_bundle(
+        session = prepare_flashbots_bundle(
             [{"to": recorded, "value": SELF_TRANSFER_VALUE_WEI}],
             purpose="Flashbots Sepolia 0-value self-transfer via relay",
             config=cfg,

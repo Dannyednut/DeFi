@@ -164,6 +164,52 @@ A caller can request preparation, simulation and controlled,
 authorization-checked submission — but cannot obtain the raw signed
 payload from the preparation API or any public session surface.
 
+**Caller-visible exception containment (DSS-WO-ENG-007 Finding A).**
+Relay and HTTP transports routinely quote the request body in exception
+messages, so a transport failure during simulate/submit would otherwise
+carry the exact signed payload hex to the CALLER even though the audit
+record is sanitized. The session therefore never re-raises an original
+transport or evaluation exception and never attaches one as a visible
+cause or context (`__cause__` and `__context__` are detached and the
+sanitized failure is raised outside the failing except block, so
+implicit chaining cannot re-attach it either). Callers receive a
+`TestnetSafetyError` whose message, args, repr and formatted traceback
+contain only the failure classification (refused / failed / rejected /
+uncertain), the original exception CLASS NAME and a sanitized
+diagnostic (long hex redacted, truncated). Relay-provided error text —
+the top-level simulation error, `firstRevert`, per-transaction errors
+and the explicit `eth_sendBundle` rejection body — is sanitized before
+it is incorporated into any caller-visible exception, and relay-supplied
+hash fields are held against the same long-hex rule before they reach
+the audit log. Sanitized audit coverage, failure-path logging and the
+one-use submission authorization are unchanged. Gate-raised
+`TestnetSafetyError` refusals keep their exact type and message with
+cause and context detached. Python exceptions are an in-process
+interface only: this is containment against accidental leakage through
+error paths, not a barrier against hostile same-process code (see the
+honest threat model above).
+
+**Access-list policy (DSS-WO-ENG-007 Finding B — Option A, fail
+closed).** The supported transaction policy covers plain legacy and
+EIP-1559 value-and-calldata intents only; access lists are OUT OF
+POLICY at this execution boundary. Any supplied non-empty `accessList`
+is rejected by `validate_transaction()` BEFORE anything is signed (and
+before wallet decryption for bundles; one rejected transaction rejects
+the whole bundle), a malformed (non-list) `accessList` is rejected, and
+the intent minting refuses an access list independently as defense in
+depth. The signed-transaction decoder independently refuses any
+non-empty access list in the signed EIP-1559 envelope (field 8) and
+refuses EIP-2930 envelopes outright, so a signed transaction that
+differs from its validated intent by an access list fails closed before
+any relay interaction. No access-list field is captured in the intent
+records: an absent, `None` or EMPTY accessList is accepted — eth_account
+signs an empty list either way, so the only accepted form is exactly
+one: none. Full binding (Option B: normalizing the access list into the
+intent and comparing it exactly) was considered and rejected as the
+strictly larger change with no policy gain — the gate's own preparation
+path can never mint an access-list intent, so there is no legitimate
+access-list payload to bind.
+
 **Capability immutability (DSS-WO-ENG-006 §3).** Prepared-bundle state
 is a frozen dataclass (`_PreparedBundleState`) held behind a single
 `__slots__` slot on the capability; attribute assignment and deletion on

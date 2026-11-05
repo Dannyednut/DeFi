@@ -4,7 +4,8 @@ tests/test_testnet_gate.py
 Offline, deterministic tests for the DSS testnet-only execution boundary
 (executor/testnet_gate.py, DSS-WO-ENG-003 D; unified per DSS-WO-ENG-004;
 capability-gated per DSS-WO-ENG-005; payload-containment and
-capability-integrity hardened per DSS-WO-ENG-006).
+capability-integrity hardened per DSS-WO-ENG-006; caller-visible
+exception containment and access-list fail-closure per DSS-WO-ENG-007).
 
 Every safety invariant of the gate is pinned here:
 
@@ -31,6 +32,17 @@ Every safety invariant of the gate is pinned here:
     CONTROLLED SESSION ONLY, no public API exposes broadcastable signed
     bytes, relay responses are scrubbed before they leave the session and
     the capability has no signed-payload property;
+  * caller-visible exception containment (ENG-007 Finding A): a transport
+    or evaluation exception that embeds the exact signed payload hex is
+    NEVER re-raised to the caller and never attached as a visible cause
+    or context — the caller receives a TestnetSafetyError carrying the
+    failure classification, the original exception class name and a
+    sanitized diagnostic, with __cause__ and __context__ detached;
+    relay-provided error text (top-level simulation error, firstRevert,
+    per-transaction errors, explicit eth_sendBundle rejection bodies) is
+    sanitized before it reaches any caller-visible exception; the audit
+    record keeps the correct outcome and sanitized diagnostic; the
+    one-use authorization consumption and retry rules are unchanged;
   * capability immutability and integrity (ENG-006 §3): prepared state is
     frozen (frozen dataclasses + refused attribute assignment), intents
     are frozen records, the minting token is a class-private name-mangled
@@ -43,6 +55,14 @@ Every safety invariant of the gate is pinned here:
     negative, malformed and over-cap fee inputs rejected), no unlimited
     token approvals, chainId binding, and an AGGREGATE bundle-level fee
     cap enforced before wallet decryption (ENG-005 §5);
+  * access lists are OUT OF POLICY (ENG-007 Finding B, Option A — fail
+    closed): a supplied non-empty accessList is rejected before signing,
+    a malformed accessList is rejected, an absent/None/empty accessList
+    is accepted (eth_account signs an empty list either way), the
+    signed-transaction decoder refuses a non-empty access list in the
+    signed EIP-1559 envelope, and a signed transaction that differs from
+    its validated intent by an access list fails closed before any relay
+    interaction;
   * wallet custody: the single wallet-loading path verifies secret-file
     presence/types/permissions, hex-decodes the passphrase, builds a
     proper eth_account LocalAccount and binds it to the recorded address;
@@ -70,6 +90,7 @@ import json
 import os
 import sys
 import tempfile
+import traceback
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -680,6 +701,76 @@ def _audit_outcomes(cfg):
         return [json.loads(line)["outcome"] for line in f if line.strip()]
 
 
+def _exception_surfaces(exc):
+    """Every string surface of an exception and of every exception
+    reachable through its cause/context chain: str(), repr(), args and
+    the fully formatted traceback (ENG-007 Finding A)."""
+    surfaces = [str(exc), repr(exc)]
+    surfaces.extend(str(a) for a in exc.args)
+    surfaces.append(
+        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    )
+    seen = set()
+    stack = [exc.__cause__, exc.__context__]
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        surfaces.append(str(e))
+        surfaces.append(repr(e))
+        stack.extend([e.__cause__, e.__context__])
+    return surfaces
+
+
+def _assert_exception_clean(testcase, exc, forbidden):
+    """DSS-WO-ENG-007 Finding A: no forbidden material (e.g. the exact
+    signed payload hex or a passphrase) may appear in the caller-visible
+    exception message, representation, arguments, formatted traceback or
+    cause/context chain. The cause and context must be fully detached."""
+    testcase.assertIsNone(exc.__cause__)
+    testcase.assertIsNone(exc.__context__)
+    for surface in _exception_surfaces(exc):
+        for secret in forbidden:
+            testcase.assertNotIn(secret, surface)
+
+
+def _minted_capability(tmp, *, intent_tx, signed_tx,
+                       purpose="signed-intent integrity test"):
+    """Mint a capability whose validated intent is `intent_tx` but whose
+    signed payload is `signed_tx` — BOTH signed by the same throwaway
+    wallet recorded in the keystore, so the SIGNER check passes and the
+    signed-INTENT comparison is what must fire.
+
+    White-box note: _mint with the internal minting token is used here
+    ONLY to place a deliberately mismatched capability in front of the
+    session constructor; production cannot mint capabilities outside
+    prepare_flashbots_bundle (ENG-005 §3 note, unchanged)."""
+    info = _tmp_keystore(tmp)
+    acct = info["account"]
+    relay = _RelayStub()
+    signed_tx = dict(signed_tx)
+    signed_tx.setdefault("chainId", SEPOLIA)  # BEFORE signing
+    signed = acct.sign_transaction(signed_tx)
+    raw = bytes(
+        getattr(signed, "raw_transaction", None) or signed.rawTransaction
+    )
+    intent = dict(intent_tx)
+    intent["chainId"] = SEPOLIA
+    cfg = _bundle_cfg(tmp)
+    price = (
+        intent.get("maxFeePerGas") or intent.get("gasPrice") or 10**9
+    )
+    prepared = PreparedFlashbotsBundle._mint(
+        sender=acct.address, chain_id=SEPOLIA,
+        validated_txs=[intent], signed_payload=[raw], target_block=100,
+        fingerprint=_payload_fingerprint([raw], 100),
+        total_fee_exposure_wei=21000 * price,
+        purpose=purpose, config=cfg,
+    )
+    return prepared, relay, acct, cfg
+
+
 def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
                      fee_price_gwei=2, chain_values=(SEPOLIA,), head=99,
                      purpose="capability session test"):
@@ -1177,8 +1268,13 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
                 raise _Timeout("relay unreachable")
 
             relay.send_bundle = _boom
-            with self.assertRaises(_Timeout):
+            # ENG-007 Finding A: the transport exception is replaced by a
+            # caller-safe TestnetSafetyError — never re-raised bare.
+            with self.assertRaises(TestnetSafetyError) as ctx:
                 session.submit()
+            self.assertIn("bundle submission uncertain", str(ctx.exception))
+            self.assertIn("_Timeout", str(ctx.exception))
+            _assert_exception_clean(self, ctx.exception, [])
             # outcome uncertain: the bundle may still have landed
             self.assertIn("uncertain", _audit_outcomes(cfg))
             # the authorization was consumed — a bare retry is refused
@@ -1226,31 +1322,54 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertIn("uncertain", _audit_outcomes(cfg))
 
     def test_full_lifecycle_leaks_no_secret_material(self):
-        """Across the whole lifecycle the audit log must never contain the
-        signed payload bytes, the private key, or the passphrase (ENG-005
-        §4) — including failure paths."""
+        """Across the whole lifecycle the audit log AND every
+        caller-visible exception must never contain the signed payload
+        bytes, the private key, or the passphrase (ENG-005 §4; caller
+        exception containment per ENG-007 Finding A) — including failure
+        paths. The exception must be clean across message, str(), repr(),
+        args, formatted traceback and the cause/context chain."""
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(head=99)
             session, cfg, _, _ = self._prepare(tmp, relay)
             raw = session._prepared._state.signed_payload[0]
+            payload_hex = bytes(raw).hex()
             session.simulate()
 
             def _boom(bundle, target_block_number=None, **kw):
                 # hostile error embedding the signed payload
-                raise RuntimeError(f"send failed for 0x{bytes(raw).hex()}")
+                raise RuntimeError(f"send failed for 0x{payload_hex}")
 
             relay.send_bundle = _boom
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError) as ctx:
                 session.submit()
+            exc = ctx.exception
+            # ENG-007 Finding A: the exception the CALLER receives is
+            # clean across every surface, not just the audit record.
+            _assert_exception_clean(
+                self, exc, [payload_hex, "test-passphrase"]
+            )
+            self.assertIsInstance(exc, TestnetSafetyError)
+            # classification preserved: uncertain transport failure with
+            # the original exception class named
+            self.assertIn("bundle submission uncertain", str(exc))
+            self.assertIn("RuntimeError", str(exc))
             with open(cfg.tx_log_path) as f:
                 log = f.read()
-            self.assertNotIn(raw.hex(), log)
+            self.assertNotIn(payload_hex, log)
             self.assertNotIn("test-passphrase", log)
             for record in (json.loads(l) for l in log.splitlines() if l.strip()):
                 self.assertEqual(sorted(record.keys()), sorted(TX_LOG_FIELDS))
                 self.assertIn(record["outcome"], (
                     "simulated", "uncertain",
                 ))
+            uncertain = [r for r in (json.loads(l) for l in log.splitlines() if l.strip())
+                         if r["outcome"] == "uncertain"][-1]
+            # sanitized diagnostic preserved in the audit record (the class
+            # name is part of the caller-visible exception, not the audit
+            # error field)
+            self.assertIn("send failed", uncertain["error"])
+            self.assertIn("0x<redacted>", uncertain["error"])
+            self.assertNotIn(payload_hex, uncertain["error"])
 
 
 class _ForgedPrepared:
@@ -1433,39 +1552,9 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
 
     def _minted(self, tmp, *, intent_tx, signed_tx, fee_exposure=None):
         """Mint a capability whose validated intent is `intent_tx` but
-        whose signed payload is `signed_tx` — BOTH signed by the same
-        throwaway wallet recorded in the keystore, so the SIGNER check
-        passes and the signed-INTENT comparison is what must fire.
-
-        White-box note: _mint with the internal minting token is used here
-        ONLY to place a deliberately mismatched capability in front of the
-        session constructor; production cannot mint capabilities outside
-        prepare_flashbots_bundle (ENG-005 §3 note, unchanged)."""
-        info = _tmp_keystore(tmp)
-        acct = info["account"]
-        relay = _RelayStub()
-        signed_tx = dict(signed_tx)
-        signed_tx.setdefault("chainId", SEPOLIA)  # BEFORE signing
-        signed = acct.sign_transaction(signed_tx)
-        raw = bytes(
-            getattr(signed, "raw_transaction", None) or signed.rawTransaction
-        )
-        intent = dict(intent_tx)
-        intent["chainId"] = SEPOLIA
-        cfg = _bundle_cfg(tmp)
-        price = (
-            intent.get("maxFeePerGas") or intent.get("gasPrice") or 10**9
-        )
-        prepared = PreparedFlashbotsBundle._mint(
-            sender=acct.address, chain_id=SEPOLIA,
-            validated_txs=[intent], signed_payload=[raw], target_block=100,
-            fingerprint=_payload_fingerprint([raw], 100),
-            total_fee_exposure_wei=(
-                fee_exposure if fee_exposure is not None else 21000 * price
-            ),
-            purpose="signed-intent integrity test", config=cfg,
-        )
-        return prepared, relay, acct, cfg
+        whose signed payload is `signed_tx` — see _minted_capability
+        (module level, shared with the ENG-007 access-list tests)."""
+        return _minted_capability(tmp, intent_tx=intent_tx, signed_tx=signed_tx)
 
     BASE_1559 = {
         "to": None,  # filled per-test (throwaway wallet address)
@@ -1940,8 +2029,15 @@ class TestPayloadContainmentENG006(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             relay = _InfraFailureRelay(head=99, ok_reads=1)
             session, cfg, target, acct = _prepared_bundle(tmp, relay)
-            with self.assertRaises(ConnectionError):
+            # ENG-007 Finding A: the raw ConnectionError is replaced by a
+            # caller-safe TestnetSafetyError with the classification, the
+            # exception class name and the sanitized diagnostic; the
+            # audit refusal record is unchanged.
+            with self.assertRaises(TestnetSafetyError) as ctx:
                 session.simulate()
+            self.assertIn("bundle simulation refused", str(ctx.exception))
+            self.assertIn("ConnectionError", str(ctx.exception))
+            _assert_exception_clean(self, ctx.exception, [])
             outcomes = _audit_outcomes(cfg)
             self.assertIn("simulation_refused", outcomes)
             with open(cfg.tx_log_path) as f:
@@ -1956,8 +2052,13 @@ class TestPayloadContainmentENG006(unittest.TestCase):
             relay = _InfraFailureRelay(head=99, ok_reads=2)
             session, cfg, target, acct = _prepared_bundle(tmp, relay)
             session.simulate()  # read 2 — still healthy
-            with self.assertRaises(ConnectionError):
+            # ENG-007 Finding A: sanitized replacement, never the raw
+            # ConnectionError.
+            with self.assertRaises(TestnetSafetyError) as ctx:
                 session.submit()  # read 3 — infrastructure failure
+            self.assertIn("bundle submission refused", str(ctx.exception))
+            self.assertIn("ConnectionError", str(ctx.exception))
+            _assert_exception_clean(self, ctx.exception, [])
             outcomes = _audit_outcomes(cfg)
             self.assertIn("simulated", outcomes)
             self.assertIn("submission_refused", outcomes)
@@ -2208,6 +2309,474 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
                 )
             self.assertIn("exceeds the testnet cap", str(ctx.exception))
             self.assertFalse(w3.eth.send_raw_transaction.called)
+
+
+class TestExceptionContainmentENG007(unittest.TestCase):
+    """DSS-WO-ENG-007 Finding A: caller-visible exception containment.
+
+    Transport and evaluation exceptions can embed the exact signed payload
+    hex (relays and HTTP libraries quote request bodies in error messages).
+    For EVERY failure path the caller-visible exception must be clean
+    across message, str(), repr(), args, formatted traceback and the
+    cause/context chain — while the audit record keeps the correct outcome
+    and a sanitized diagnostic, and the one-use authorization consumption
+    and retry rules stay unchanged."""
+
+    def _leak_setup(self, tmp):
+        relay = _RelayStub(head=99)
+        session, cfg, target, acct = _prepared_bundle(tmp, relay)
+        raw = session._prepared._state.signed_payload[0]
+        return session, cfg, relay, bytes(raw).hex()
+
+    # ── mandatory regression 1: send_bundle transport error ─────────────
+
+    def test_send_bundle_transport_error_never_reaches_the_caller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay, payload_hex = self._leak_setup(tmp)
+            session.simulate()
+
+            def _boom(bundle, target_block_number=None, **kw):
+                raise RuntimeError(f"send failed for 0x{payload_hex}")
+
+            relay.send_bundle = _boom
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.submit()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, [payload_hex])
+            # classification preserved: uncertain + original class named
+            self.assertIn("bundle submission uncertain", str(exc))
+            self.assertIn("RuntimeError", str(exc))
+            # audit record: correct outcome + sanitized diagnostic (the
+            # audit error field carries the sanitized MESSAGE; the class
+            # name is part of the caller-visible exception)
+            with open(cfg.tx_log_path) as f:
+                recs = [json.loads(l) for l in f if l.strip()]
+            self.assertEqual(
+                [r["outcome"] for r in recs], ["simulated", "uncertain"]
+            )
+            self.assertIn("send failed", recs[-1]["error"])
+            self.assertIn("0x<redacted>", recs[-1]["error"])
+            self.assertNotIn(payload_hex, recs[-1]["error"])
+            self.assertNotIn(payload_hex, json.dumps(recs))
+            # one-use authorization consumed by the attempt: a bare retry
+            # is refused without a new successful simulation
+            del relay.send_bundle  # restore the accepting stub
+            with self.assertRaises(TestnetSafetyError) as retry_err:
+                session.submit()
+            self.assertIn("no successful simulation", str(retry_err.exception))
+            self.assertEqual(len(relay.send_calls), 0)
+
+    # ── mandatory regression 1b: JSON-RPC ValueError classifies rejected ─
+
+    def test_json_rpc_rejection_classifies_rejected_and_stays_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay, payload_hex = self._leak_setup(tmp)
+            session.simulate()
+
+            def _boom(bundle, target_block_number=None, **kw):
+                raise ValueError(
+                    {"message": f"rejected tx 0x{payload_hex}", "code": -32010}
+                )
+
+            relay.send_bundle = _boom
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.submit()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, [payload_hex])
+            self.assertIn("bundle submission rejected", str(exc))
+            self.assertIn("ValueError", str(exc))
+            with open(cfg.tx_log_path) as f:
+                recs = [json.loads(l) for l in f if l.strip()]
+            self.assertEqual(
+                [r["outcome"] for r in recs], ["simulated", "rejected"]
+            )
+            self.assertNotIn(payload_hex, json.dumps(recs))
+
+    # ── mandatory regression 2: simulation transport error ──────────────
+
+    def test_simulation_transport_error_never_reaches_the_caller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay, payload_hex = self._leak_setup(tmp)
+
+            def _boom(bundle, block_tag, *args, **kwargs):
+                raise ConnectionAbortedError(
+                    f"POST body rejected: 0x{payload_hex}"
+                )
+
+            relay.simulate = _boom
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, [payload_hex])
+            self.assertIn("bundle simulation failed", str(exc))
+            self.assertIn("ConnectionAbortedError", str(exc))
+            with open(cfg.tx_log_path) as f:
+                recs = [json.loads(l) for l in f if l.strip()]
+            self.assertIn("simulation_failed", [r["outcome"] for r in recs])
+            failed = [
+                r for r in recs if r["outcome"] == "simulation_failed"
+            ][-1]
+            self.assertIn("POST body rejected", failed["error"])
+            self.assertIn("0x<redacted>", failed["error"])
+            self.assertNotIn(payload_hex, failed["error"])
+            self.assertNotIn(payload_hex, json.dumps(recs))
+            # a failed simulation authorizes nothing
+            with self.assertRaises(TestnetSafetyError):
+                session.submit()
+            self.assertEqual(len(relay.send_calls), 0)
+
+    # ── mandatory regression 3: explicit relay error body ───────────────
+
+    def test_explicit_relay_error_text_is_sanitized_for_the_caller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay, payload_hex = self._leak_setup(tmp)
+            session.simulate()
+
+            def _leaky(bundle, target_block_number=None, **kw):
+                return {
+                    "error": {
+                        "message": f"invalid bundle payload 0x{payload_hex}"
+                    },
+                    "bundleHash": "0x" + "ab" * 32,
+                }
+
+            relay.send_bundle = _leaky
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.submit()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, [payload_hex])
+            self.assertIn("relay rejected the bundle submission", str(exc))
+            self.assertNotIn(payload_hex, str(exc))
+            with open(cfg.tx_log_path) as f:
+                recs = [json.loads(l) for l in f if l.strip()]
+            rejected = [r for r in recs if r["outcome"] == "rejected"][-1]
+            self.assertNotIn(payload_hex, rejected["error"])
+            self.assertNotIn(payload_hex, json.dumps(recs))
+
+    def test_relay_hash_field_cannot_smuggle_payload_into_audit_log(self):
+        """DSS-WO-ENG-007 Finding A (hash-field hardening): a hostile
+        relay cannot use the bundleHash field to write the signed payload
+        into the audit log; a legitimate 32-byte hash still passes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay, payload_hex = self._leak_setup(tmp)
+            session.simulate()
+            relay.send_bundle = lambda bundle, target_block_number=None, **kw: {
+                "bundleHash": "0x" + payload_hex,  # hostile: payload as hash
+            }
+            out = session.submit()
+            self.assertEqual(out["audit"]["outcome"], "accepted")
+            self.assertEqual(
+                out["audit"]["tx_hash"], "0x<redacted-hex>"
+            )
+            with open(cfg.tx_log_path) as f:
+                recs = [json.loads(l) for l in f if l.strip()]
+            self.assertNotIn(payload_hex, json.dumps(recs))
+            accepted = [r for r in recs if r["outcome"] == "accepted"][-1]
+            self.assertEqual(accepted["tx_hash"], "0x<redacted-hex>")
+
+    # ── mandatory regression 4: simulation error responses ──────────────
+
+    def test_simulation_top_level_error_is_sanitized_for_the_caller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)  # healthy for preparation
+            session, cfg, _, _ = _prepared_bundle(tmp, relay)
+            payload_hex = bytes(
+                session._prepared._state.signed_payload[0]
+            ).hex()
+            # the relay's error response embeds the REAL signed payload
+            relay._sim_result = {
+                "error": f"bundle contains raw tx 0x{payload_hex}"
+            }
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, [payload_hex])
+            self.assertIn("bundle simulation failed", str(exc))
+            with open(cfg.tx_log_path) as f:
+                recs = [json.loads(l) for l in f if l.strip()]
+            failed = [r for r in recs if r["outcome"] == "simulation_failed"][-1]
+            self.assertNotIn(payload_hex, failed["error"])
+            self.assertNotIn(payload_hex, json.dumps(recs))
+
+    def test_simulation_first_revert_is_sanitized_for_the_caller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(tmp, relay)
+            payload_hex = bytes(
+                session._prepared._state.signed_payload[0]
+            ).hex()
+            sim = _ok_simulation()
+            sim["firstRevert"] = f"0x{payload_hex}"
+            relay._sim_result = sim
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, [payload_hex])
+            self.assertIn("firstRevert", str(exc))
+            self.assertNotIn(payload_hex, str(exc))
+
+    def test_simulation_per_tx_error_is_sanitized_for_the_caller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(tmp, relay)
+            payload_hex = bytes(
+                session._prepared._state.signed_payload[0]
+            ).hex()
+            sim = _ok_simulation()
+            sim["results"][0]["error"] = f"execution reverted: 0x{payload_hex}"
+            relay._sim_result = sim
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, [payload_hex])
+            self.assertIn("tx[0] would fail", str(exc))
+            self.assertNotIn(payload_hex, str(exc))
+
+    # ── mandatory regression 7: authorization rules unchanged ───────────
+
+    def test_preflight_refusal_still_leaves_authorization_in_place(self):
+        """The ENG-005/006 one-use rules are unchanged: a preflight
+        refusal (before the relay call) does NOT consume the successful
+        simulation's authorization; repairing the transport and
+        re-submitting works without a new simulation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(tmp, relay)
+            session.simulate()
+
+            class _BrokenChain:
+                chain_id = property(lambda self: (_ for _ in ()).throw(
+                    ConnectionError("RPC transport failure")))
+
+            original_eth = relay.eth
+            relay.eth = _BrokenChain()
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.submit()
+            self.assertIn("bundle submission refused", str(ctx.exception))
+            self.assertEqual(len(relay.send_calls), 0)
+            # repair the transport — the authorization must still be there
+            relay.eth = original_eth
+            out = session.submit()
+            self.assertEqual(len(relay.send_calls), 1)
+            self.assertEqual(out["audit"]["outcome"], "accepted")
+            # and it was ONE authorization: a further submit is refused
+            with self.assertRaises(TestnetSafetyError):
+                session.submit()
+            self.assertEqual(len(relay.send_calls), 1)
+
+    def test_all_failure_surfaces_in_one_lifecycle_are_clean(self):
+        """Mandatory regression 5, end-to-end: across refused / failed /
+        rejected / uncertain paths, no payload or credential material
+        appears in any caller-visible exception surface."""
+        forbidden_note = "test-passphrase"
+        with tempfile.TemporaryDirectory() as tmp:
+            # refused (preflight infra failure)
+            relay = _InfraFailureRelay(head=99, ok_reads=1)
+            session, cfg, _, _ = _prepared_bundle(tmp, relay)
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            _assert_exception_clean(self, ctx.exception, [forbidden_note])
+            raw_hex = bytes(
+                session._prepared._state.signed_payload[0]
+            ).hex()
+            _assert_exception_clean(self, ctx.exception, [raw_hex])
+        with tempfile.TemporaryDirectory() as tmp:
+            # failed (leaky simulation transport)
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(tmp, relay)
+            raw_hex = bytes(
+                session._prepared._state.signed_payload[0]
+            ).hex()
+
+            def _boom(bundle, block_tag, *a, **kw):
+                raise TimeoutError(f"sim timed out 0x{raw_hex}")
+
+            relay.simulate = _boom
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            _assert_exception_clean(self, ctx.exception, [raw_hex])
+        with tempfile.TemporaryDirectory() as tmp:
+            # rejected (explicit relay error quoting the payload)
+            relay = _RelayStub(head=99)
+            session, cfg, _, _ = _prepared_bundle(tmp, relay)
+            raw_hex = bytes(
+                session._prepared._state.signed_payload[0]
+            ).hex()
+            session.simulate()
+            relay.send_bundle = lambda bundle, target_block_number=None, **kw: {
+                "error": {"message": f"bad bundle 0x{raw_hex}"}
+            }
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.submit()
+            _assert_exception_clean(
+                self, ctx.exception, [raw_hex, forbidden_note]
+            )
+
+
+class TestAccessListPolicyENG007(unittest.TestCase):
+    """DSS-WO-ENG-007 Finding B (Option A — fail closed): access lists
+    are out of policy at this execution boundary. A supplied non-empty
+    accessList is rejected BEFORE signing; a malformed accessList is
+    rejected; an absent/None/empty accessList is accepted; the
+    signed-transaction decoder refuses a non-empty access list in the
+    signed EIP-1559 envelope; and a signed transaction that differs from
+    its validated intent by an access list fails closed before any relay
+    interaction. Existing EIP-1559 and legacy behaviour is unchanged."""
+
+    SENDER = "0x" + "aa" * 20
+    ACCESS_LIST = [
+        {"address": "0x" + "bb" * 20, "storageKeys": ["0x" + "11" * 32]}
+    ]
+
+    def _tx(self, **over):
+        tx = {
+            "to": self.SENDER, "value": 0, "gas": 21000,
+            "maxFeePerGas": 2 * 10**9, "maxPriorityFeePerGas": 10**9,
+            "data": b"", "chainId": 11155111,
+        }
+        tx.update(over)
+        return tx
+
+    # ── policy: before signing ───────────────────────────────────────────
+
+    def test_validate_transaction_rejects_non_empty_access_list(self):
+        with self.assertRaises(TestnetSafetyError) as ctx:
+            validate_transaction(
+                self._tx(accessList=self.ACCESS_LIST),
+                sender=self.SENDER, chain_id=11155111,
+            )
+        self.assertIn("access lists are not supported", str(ctx.exception))
+
+    def test_validate_transaction_rejects_malformed_access_list(self):
+        with self.assertRaises(TestnetSafetyError) as ctx:
+            validate_transaction(
+                self._tx(accessList="0xdeadbeef"),
+                sender=self.SENDER, chain_id=11155111,
+            )
+        self.assertIn("malformed accessList", str(ctx.exception))
+
+    def test_validate_transaction_accepts_empty_none_and_absent(self):
+        # an EMPTY accessList is the accepted form: eth_account signs an
+        # empty list whether the key is absent, None or []
+        for value in ([], None):
+            validate_transaction(
+                self._tx(accessList=value),
+                sender=self.SENDER, chain_id=11155111,
+            )
+        validate_transaction(
+            self._tx(), sender=self.SENDER, chain_id=11155111
+        )
+
+    def test_bundle_rejects_one_access_list_transaction(self):
+        with self.assertRaises(TestnetSafetyError) as ctx:
+            validate_bundle(
+                [self._tx(), self._tx(accessList=self.ACCESS_LIST)],
+                sender=self.SENDER, chain_id=11155111,
+            )
+        self.assertIn("bundle tx[1] rejected", str(ctx.exception))
+        self.assertIn("access lists are not supported", str(ctx.exception))
+
+    def test_prepare_refuses_access_list_bundle_before_wallet_decryption(self):
+        """The access-list refusal fires BEFORE the wallet is decrypted or
+        anything is signed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub()
+            info = _tmp_keystore(tmp)
+            acct = info["account"]
+            cfg = TestnetExecutionConfig(
+                enabled=True,
+                rpc_url="https://sepolia.example",
+                keystore_path=os.path.join(tmp, "keystore.json"),
+                passphrase_path=os.path.join(tmp, "pass"),
+                address_path=os.path.join(tmp, "address"),
+                tx_log_path=os.path.join(tmp, "txlog.jsonl"),
+            )
+            txs = [{
+                "to": acct.address, "value": 0, "gas": 21000,
+                "maxFeePerGas": 2 * 10**9, "maxPriorityFeePerGas": 10**9,
+                "data": b"", "accessList": self.ACCESS_LIST,
+            }]
+            with patch(
+                "executor.testnet_gate.load_agent_wallet",
+                side_effect=AssertionError("wallet must never be decrypted"),
+            ):
+                with self.assertRaises(TestnetSafetyError) as ctx:
+                    prepare_flashbots_bundle(
+                        txs, purpose="access list must never sign",
+                        config=cfg,
+                        web3_factory=lambda url: _PrepareW3(),
+                        relay_factory=lambda url, auth, relay_url: relay,
+                    )
+            self.assertIn("access lists are not supported", str(ctx.exception))
+            relay.assert_not_called()
+
+    # ── signed envelope: decoder refuses a non-empty access list ────────
+
+    def test_signed_decoder_refuses_non_empty_access_list(self):
+        acct = Account.create()
+        signed = acct.sign_transaction(dict(
+            self._tx(), to=acct.address, nonce=0,
+            accessList=self.ACCESS_LIST,
+        ))
+        raw = bytes(
+            getattr(signed, "raw_transaction", None) or signed.rawTransaction
+        )
+        self.assertEqual(raw[0], 0x02)  # EIP-1559 envelope
+        with self.assertRaises(TestnetSafetyError) as ctx:
+            _decode_signed_tx(raw)
+        self.assertIn("non-empty EIP-1559 access list", str(ctx.exception))
+
+    def test_signed_decoder_accepts_empty_access_list(self):
+        acct = Account.create()
+        signed = acct.sign_transaction(dict(
+            self._tx(), to=acct.address, nonce=0, accessList=[],
+        ))
+        raw = bytes(
+            getattr(signed, "raw_transaction", None) or signed.rawTransaction
+        )
+        decoded = _decode_signed_tx(raw)
+        self.assertEqual(decoded["kind"], "eip1559")
+        self.assertEqual(decoded["chain_id"], 11155111)
+
+    def test_signed_access_list_mismatch_fails_closed_before_relay(self):
+        """A signed transaction that differs from its validated intent by
+        an access list is refused at session construction — before ANY
+        relay interaction."""
+        with tempfile.TemporaryDirectory() as tmp:
+            recipient = Account.create()  # throwaway
+            signed_tx = {
+                "to": recipient.address, "value": 0, "gas": 21000,
+                "data": b"", "nonce": 0, "maxFeePerGas": 2 * 10**9,
+                "maxPriorityFeePerGas": 10**9,
+                "accessList": self.ACCESS_LIST,
+            }
+            intent_tx = {
+                k: v for k, v in signed_tx.items() if k != "accessList"
+            }
+            prepared, relay, acct, cfg = _minted_capability(
+                tmp, intent_tx=intent_tx, signed_tx=signed_tx,
+                purpose="access-list binding test",
+            )
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                FlashbotsBundleSession(relay, prepared)
+            self.assertIn(
+                "non-empty EIP-1559 access list", str(ctx.exception)
+            )
+            relay.assert_not_called()  # no relay interaction whatsoever
+
+    # ── existing behaviour unchanged ─────────────────────────────────────
+
+    def test_prepared_bundle_with_empty_access_list_verifies_end_to_end(self):
+        """The accepted form (no access list / empty list) still signs,
+        verifies and simulates end-to-end through the sanctioned path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            relay = _RelayStub(head=99)
+            session, cfg, target, acct = _prepared_bundle(tmp, relay)
+            st = session._prepared._state
+            decoded = _decode_signed_tx(st.signed_payload[0])
+            self.assertEqual(decoded["kind"], "eip1559")
+            session.simulate()
+            self.assertEqual(len(relay.simulate_calls), 1)
 
 
 if __name__ == "__main__":

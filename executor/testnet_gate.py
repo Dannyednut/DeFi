@@ -85,6 +85,24 @@ Design invariants (all fail closed):
     silently escape the audit path (DSS-WO-ENG-006 §6). Relay responses
     returned to callers are scrubbed of raw-transaction-shaped keys and
     long hex blobs before they leave the session (DSS-WO-ENG-006 §4).
+  * Caller-visible EXCEPTIONS never carry secret material (DSS-WO-ENG-007
+    Finding A): transport and evaluation failures can embed the exact
+    signed payload hex (relays and HTTP libraries quote request bodies),
+    so simulate()/submit() and the direct-RPC submission path never
+    re-raise such an exception and never attach one as a visible cause or
+    context. Callers receive a TestnetSafetyError carrying the failure
+    classification (refused / failed / rejected / uncertain), the original
+    exception CLASS NAME and a sanitized diagnostic; relay-provided error
+    text is sanitized before it is incorporated into any caller-visible
+    exception; gate-raised TestnetSafetyErrors keep their exact type and
+    message with cause and context detached.
+  * Access lists are OUT OF POLICY (DSS-WO-ENG-007 Finding B, Option A —
+    fail closed): any supplied non-empty accessList is rejected by the
+    transaction policy BEFORE signing, the signed-transaction decoder
+    independently refuses a non-empty access list in the signed EIP-1559
+    envelope, and no access-list field is bound into the intent records.
+    An absent, None or empty accessList is accepted (eth_account signs an
+    empty list either way). EIP-2930 envelopes remain refused outright.
 
 This module holds NO key material. The agent wallet is decrypted from
 the DSS secret store (encrypted keystore + passphrase file) only inside
@@ -582,6 +600,11 @@ def validate_transaction(
     """Enforce the transaction policy. Returns the tx unchanged if safe.
 
     Rules (each violation raises TestnetSafetyError):
+      * a supplied (non-empty) EIP-1559 access list is REJECTED — access
+        lists are out of policy at this execution boundary (DSS-WO-ENG-007
+        Finding B, Option A — fail closed); an absent, None or empty
+        accessList is accepted, and a malformed (non-list) accessList is
+        rejected;
       * no deployments (`to` must be a real recipient);
       * recipient must be the sender itself or a recorded known target
         for this chain (no arbitrary EOA transfers, no unverified targets);
@@ -593,6 +616,28 @@ def validate_transaction(
       * tx chainId, when present, must equal the verified chain ID.
     """
     targets = KNOWN_TARGETS if known_targets is None else known_targets
+
+    # DSS-WO-ENG-007 Finding B (Option A — fail closed): access lists are
+    # OUT OF POLICY at this execution boundary. The gate signs only plain
+    # legacy / EIP-1559 value-and-calldata intents, so any supplied
+    # non-empty accessList is rejected BEFORE signing; the signed-
+    # transaction decoder independently refuses any non-empty access list
+    # in the signed EIP-1559 envelope. An absent, None or EMPTY accessList
+    # is accepted — eth_account signs an empty list either way, so the
+    # only accepted form is exactly one: none.
+    access_list = tx.get("accessList")
+    if access_list is not None and not isinstance(access_list, (list, tuple)):
+        raise TestnetSafetyError(
+            "malformed accessList: expected a list — refusing "
+            "(DSS-WO-ENG-007 Finding B)"
+        )
+    if access_list:
+        raise TestnetSafetyError(
+            "access lists are not supported at this execution boundary: "
+            "the transaction policy rejects any supplied accessList "
+            "(fail closed, DSS-WO-ENG-007 Finding B)"
+        )
+
     to = tx.get("to")
     if not to or not str(to).strip():
         raise TestnetSafetyError(
@@ -782,6 +827,57 @@ def _scrub_transport_payload(obj: object, depth: int = 0):
     return obj
 
 
+def _clean_raise_candidate(
+    exc: BaseException, classification: str, *forbidden: str
+) -> TestnetSafetyError:
+    """Build the exception a caller may SEE after a failed operation
+    (DSS-WO-ENG-007 Finding A).
+
+    A transport or evaluation exception can embed the exact signed payload
+    hex (relays and HTTP libraries routinely quote the request body in
+    error messages), so the original exception object is NEVER re-raised
+    to the caller and never attached as a visible cause or context:
+
+      * a gate-constructed TestnetSafetyError (whose text is sanitized by
+        construction) is re-raised as the SAME object — same type, same
+        message, exact failure classification preserved — with any cause
+        or context detached;
+      * anything else is replaced by a fresh TestnetSafetyError carrying
+        only the failure classification, the original exception CLASS
+        NAME and the sanitized diagnostic (forbidden strings and long hex
+        redacted, truncated).
+
+    The returned exception must be raised OUTSIDE the failing except
+    block so Python's implicit exception chaining cannot attach the
+    unsanitized original as __context__ either. __cause__ and __context__
+    are cleared and __suppress_context__ is set, so no formatted
+    traceback and no attribute inspection can reach the original
+    exception.
+    """
+    err: TestnetSafetyError
+    if isinstance(exc, TestnetSafetyError) and not _LONG_HEX_RE.search(
+        str(exc)
+    ):
+        # Gate-constructed refusal: text is sanitized by construction;
+        # re-raising the same object preserves the exact type and message.
+        err = exc
+    else:
+        detail = _sanitize_error(exc, *forbidden)
+        err = TestnetSafetyError(
+            f"{classification}: {type(exc).__name__}: {detail}"
+            if detail
+            else f"{classification}: {type(exc).__name__}"
+        )
+    # Detach EVERY reference to the original failure. These must be set
+    # before the raise, and the raise itself must happen outside any
+    # except block (implicit chaining would otherwise re-attach the
+    # unsanitized original as __context__).
+    err.__cause__ = None
+    err.__context__ = None
+    err.__suppress_context__ = True
+    return err
+
+
 # ── Simulation gate (DSS-WO-ENG-004 §4) ──────────────────────────────────────
 
 def evaluate_bundle_simulation(
@@ -799,6 +895,12 @@ def evaluate_bundle_simulation(
       * empty per-transaction results fail;
       * any per-transaction `error` fails;
       * any transaction that consumed no gas (nothing executed) fails.
+
+    Relay-provided error text (top-level error, firstRevert,
+    per-transaction error) is SANITIZED before it is embedded in the
+    raised exception (DSS-WO-ENG-007 Finding A): a relay response can
+    quote the submitted signed transactions, so the refusal must not
+    propagate that text verbatim to the caller.
     """
     if not isinstance(simulation, dict) or not simulation:
         raise TestnetSafetyError(
@@ -806,13 +908,15 @@ def evaluate_bundle_simulation(
         )
     if simulation.get("error"):
         raise TestnetSafetyError(
-            f"bundle simulation failed: {simulation['error']}"
+            f"bundle simulation failed: "
+            f"{_sanitize_error(simulation['error'])}"
         )
     result = simulation.get("result")
     result = result if isinstance(result, dict) else simulation
     if result.get("firstRevert"):
         raise TestnetSafetyError(
-            f"bundle simulation reports firstRevert: {result['firstRevert']}"
+            f"bundle simulation reports firstRevert: "
+            f"{_sanitize_error(result['firstRevert'])}"
         )
     results = result.get("results")
     if not results or not isinstance(results, list):
@@ -833,7 +937,8 @@ def evaluate_bundle_simulation(
             )
         if entry.get("error"):
             raise TestnetSafetyError(
-                f"simulation: bundle tx[{i}] would fail: {entry['error']}"
+                f"simulation: bundle tx[{i}] would fail: "
+                f"{_sanitize_error(entry['error'])}"
             )
         gas_used = entry.get("gasUsed", 0)
         try:
@@ -893,7 +998,11 @@ class ValidatedTransactionIntent:
     minting time; the mutable input dict is consumed and never retained.
     Every field needed to re-verify the SIGNED transaction against the
     validated intent is captured here (recipient, value, gas, calldata,
-    nonce, chain ID and the exact fee envelope). Instances are frozen
+    nonce, chain ID and the exact fee envelope). Access lists are
+    deliberately NOT captured (DSS-WO-ENG-007 Finding B, Option A — fail
+    closed): they are out of policy, rejected before signing, and refused
+    in the signed envelope by the signed-transaction decoder, so an empty
+    decoded access list is the only accepted form. Instances are frozen
     dataclasses — attribute assignment raises — so the capability never
     exposes a mutable dictionary through its properties.
     """
@@ -916,6 +1025,16 @@ def _intent_from_validated_tx(tx: dict, chain_id: int) -> ValidatedTransactionIn
     fields fail closed. The input must be the FINAL validated form —
     nonce/gas/fee defaults are filled and the policy applied BEFORE this
     runs, never after."""
+    # DSS-WO-ENG-007 Finding B (defense in depth): validate_transaction
+    # already rejects a supplied access list before signing; the intent
+    # minting refuses one too, so an access list can never enter the
+    # capability even if validation were bypassed.
+    if tx.get("accessList"):
+        raise TestnetSafetyError(
+            "validated intent carries an access list — access lists are "
+            "out of policy at this execution boundary "
+            "(DSS-WO-ENG-007 Finding B)"
+        )
     to = tx.get("to")
     if not to or not str(to).strip():
         raise TestnetSafetyError("validated intent is missing a recipient")
@@ -1047,8 +1166,11 @@ def _decode_signed_tx(raw: bytes) -> dict:
     EIP-155 and EIP-1559 typed — and decoding anything else fails closed.
     This is the decoding half of the signed-intent verification: the
     session compares these fields against the validated intent of the
-    capability and any mismatch refuses simulation and submission. Never
-    includes the raw bytes in error messages."""
+    capability and any mismatch refuses simulation and submission. The
+    EIP-1559 access list (field 8) is checked too: a non-empty access
+    list is refused — access lists are out of policy at this boundary
+    (DSS-WO-ENG-007 Finding B, Option A). Never includes the raw bytes
+    in error messages."""
     raw = bytes(raw)
     if not raw:
         raise TestnetSafetyError("malformed signed transaction: empty payload")
@@ -1069,6 +1191,22 @@ def _decode_signed_tx(raw: bytes) -> dict:
         if not isinstance(to, (bytes, bytearray)) or (to and len(to) != 20):
             raise TestnetSafetyError(
                 "malformed signed transaction: recipient is not an address"
+            )
+        access_list = body[8]
+        if not isinstance(access_list, list):
+            raise TestnetSafetyError(
+                "malformed signed transaction: EIP-1559 access list is "
+                "not a list"
+            )
+        if access_list:
+            # DSS-WO-ENG-007 Finding B (Option A — fail closed): the gate
+            # never signs an access list, so a signed envelope that
+            # carries one is by definition not the validated intent —
+            # refuse it before any simulation or relay interaction.
+            raise TestnetSafetyError(
+                "signed transaction carries a non-empty EIP-1559 access "
+                "list; access lists are not supported at this execution "
+                "boundary (DSS-WO-ENG-007 Finding B) — refusing"
             )
         return {
             "kind": "eip1559",
@@ -1381,18 +1519,30 @@ class FlashbotsBundleSession:
 
     def _verify_payload_signers(self) -> None:
         """Wallet-identity binding: every signed transaction in the
-        capability must have been signed by the verified agent wallet."""
+        capability must have been signed by the verified agent wallet.
+        The refusal is raised OUTSIDE the recovery except block so no
+        library exception (which may embed the signed bytes it was
+        parsing) can surface as this refusal's cause or context
+        (DSS-WO-ENG-007 Finding A)."""
         for i, raw in enumerate(self._prepared._state.signed_payload):
+            refusal: Optional[TestnetSafetyError] = None
+            signer: Optional[str] = None
             try:
                 signer = _recover_signer(raw)
-            except Exception as exc:
-                raise TestnetSafetyError(
+            except Exception:
+                # The library exception may embed the signed bytes it was
+                # parsing — it is DROPPED, never chained or re-raised.
+                signer = None
+                refusal = TestnetSafetyError(
                     f"prepared bundle tx[{i}] is not a recoverable signed "
                     "transaction — refusing"
-                ) from exc
+                )
+            if refusal is not None:
+                raise refusal  # outside the except block: clean chaining
             if signer.lower() != self._prepared.sender:
                 raise TestnetSafetyError(
-                    f"prepared bundle tx[{i}] was signed by {signer.lower()}, "
+                    f"prepared bundle tx[{i}] was signed by "
+                    f"{signer.lower()}, "
                     "not the verified agent wallet — refusing"
                 )
 
@@ -1557,7 +1707,12 @@ class FlashbotsBundleSession:
 
     def _record(self, outcome: str, *, error=None, tx_hash=None, estimated_gas=None) -> dict:
         """Append one audit record for this bundle; error text must already
-        be sanitized by the caller."""
+        be sanitized by the caller. The bundle hash is relay-supplied, so
+        it is also held against the long-hex rule (DSS-WO-ENG-007 Finding
+        A): a hostile relay cannot use a hash field to smuggle the signed
+        payload into the audit log. Legitimate 32-byte hashes pass."""
+        if isinstance(tx_hash, str) and _LONG_HEX_RE.search(tx_hash):
+            tx_hash = "0x<redacted-hex>"
         return record_testnet_tx(
             self._config.tx_log_path,
             purpose=self._prepared.purpose,
@@ -1585,9 +1740,21 @@ class FlashbotsBundleSession:
         later requires. Simulation and submission are distinct operations.
         Every outcome — success, failure or refusal — is audited; error
         text is sanitized and never contains the signed payload.
+
+        CALLER-SAFE FAILURES (DSS-WO-ENG-007 Finding A): a transport or
+        evaluation exception can embed the exact signed payload hex, so
+        the original exception is never re-raised and never attached as a
+        visible cause or context. Callers receive a TestnetSafetyError
+        carrying the classification ("bundle simulation refused" for
+        preflight refusals, "bundle simulation failed" for relay/evaluation
+        failures), the original exception class name and a sanitized
+        diagnostic; gate-raised TestnetSafetyErrors keep their exact type
+        and message. Sanitized failures are raised OUTSIDE the failing
+        except block so implicit chaining cannot leak the original.
         """
         p = self._prepared
         st = p._state
+        pending: Optional[TestnetSafetyError] = None
         try:
             if not self._config.rpc_url:
                 raise TestnetSafetyError(
@@ -1604,12 +1771,21 @@ class FlashbotsBundleSession:
             # Every refusal is audited — including infrastructure/RPC
             # failures raised during preflight: once an attempt has been
             # initiated it must not silently escape the audit path
-            # (DSS-WO-ENG-006 §6).
+            # (DSS-WO-ENG-006 §6). The caller-visible exception is a
+            # SANITIZED replacement (DSS-WO-ENG-007 Finding A): the
+            # original transport exception can embed the signed payload,
+            # so it is never re-raised and never attached as a visible
+            # cause or context.
             self._record(
                 "simulation_refused",
                 error=_sanitize_error(exc, *self._payload_hexes()),
             )
-            raise
+            pending = _clean_raise_candidate(
+                exc, "bundle simulation refused", *self._payload_hexes()
+            )
+        if pending is not None:
+            # Raised OUTSIDE the except block: no implicit chaining.
+            raise pending
         try:
             simulation = self._w3.flashbots.simulate(
                 [{"signed_transaction": raw} for raw in st.signed_payload],
@@ -1621,12 +1797,17 @@ class FlashbotsBundleSession:
         except Exception as exc:
             # Failed simulations are audited too: top-level relay errors,
             # reverts, firstRevert, malformed responses, missing results
-            # and result-count mismatches (DSS-WO-ENG-005 §4).
+            # and result-count mismatches (DSS-WO-ENG-005 §4). Same
+            # caller-safe exception replacement (DSS-WO-ENG-007 Finding A).
             self._record(
                 "simulation_failed",
                 error=_sanitize_error(exc, *self._payload_hexes()),
             )
-            raise
+            pending = _clean_raise_candidate(
+                exc, "bundle simulation failed", *self._payload_hexes()
+            )
+        if pending is not None:
+            raise pending
         total_gas = None
         try:
             total_gas = int(simulation.get("totalGasUsed"))
@@ -1666,10 +1847,24 @@ class FlashbotsBundleSession:
         a NEW successful simulation. Every attempt — accepted, rejected,
         uncertain or refused — is audited; error text is sanitized and
         never contains the signed payload or any other secret material.
+
+        CALLER-SAFE FAILURES (DSS-WO-ENG-007 Finding A): transport
+        exceptions from eth_sendBundle can embed the exact signed payload
+        hex, so the original exception is never re-raised and never
+        attached as a visible cause or context. Callers receive a
+        TestnetSafetyError carrying the classification ("bundle submission
+        refused" / "bundle submission rejected" / "bundle submission
+        uncertain"), the original exception class name and a sanitized
+        diagnostic; relay-provided rejection text is sanitized before it
+        is incorporated into the raised exception; gate-raised
+        TestnetSafetyErrors keep their exact type and message. Sanitized
+        failures are raised OUTSIDE the failing except block so implicit
+        chaining cannot leak the original.
         """
         p = self._prepared
         st = p._state
         auth = None
+        pending: Optional[TestnetSafetyError] = None
         try:
             if not self._config.enabled:
                 raise TestnetSafetyError(
@@ -1702,12 +1897,20 @@ class FlashbotsBundleSession:
             # initiated it must not silently escape the audit path
             # (DSS-WO-ENG-006 §6). The one-use authorization is NOT
             # consumed here: the relay submission attempt never started.
+            # The caller-visible exception is a SANITIZED replacement
+            # (DSS-WO-ENG-007 Finding A).
             self._record(
                 "submission_refused",
                 error=_sanitize_error(exc, *self._payload_hexes()),
             )
-            raise
+            pending = _clean_raise_candidate(
+                exc, "bundle submission refused", *self._payload_hexes()
+            )
+        if pending is not None:
+            # Raised OUTSIDE the except block: no implicit chaining.
+            raise pending
 
+        submission_failure: Optional[TestnetSafetyError] = None
         try:
             result = self._w3.flashbots.send_bundle(
                 [{"signed_transaction": raw} for raw in st.signed_payload],
@@ -1719,20 +1922,32 @@ class FlashbotsBundleSession:
             # (timeout, transport failure) leaves the outcome UNCERTAIN —
             # the bundle may still have landed. Either way the consumed
             # authorization is NOT restored: retries need a new
-            # successful simulation.
+            # successful simulation. The original exception — which can
+            # embed the exact signed payload — is audited sanitized and
+            # then REPLACED by a caller-safe exception (DSS-WO-ENG-007
+            # Finding A); it is never re-raised or chained.
             outcome = "rejected" if isinstance(exc, ValueError) else "uncertain"
             self._record(
                 outcome,
                 error=_sanitize_error(exc, *self._payload_hexes()),
                 estimated_gas=(auth or {}).get("total_gas_used"),
             )
-            raise
+            submission_failure = _clean_raise_candidate(
+                exc, f"bundle submission {outcome}", *self._payload_hexes()
+            )
+        if submission_failure is not None:
+            # Raised OUTSIDE the except block: no implicit chaining.
+            raise submission_failure
 
         bundle_hash = simulation_hash(result)
         relay_error = _relay_error(result)
         if relay_error is not None:
             # The relay explicitly rejected the bundle (error in a 200
-            # response body instead of a raised error).
+            # response body instead of a raised error). The relay-provided
+            # error text is SANITIZED before it reaches the caller
+            # (DSS-WO-ENG-007 Finding A, item 3): a relay error can quote
+            # the submitted signed transactions. This raise is not inside
+            # any except block, so no implicit chaining occurs.
             self._record(
                 "rejected",
                 error=_sanitize_error(
@@ -1742,7 +1957,8 @@ class FlashbotsBundleSession:
                 estimated_gas=auth.get("total_gas_used"),
             )
             raise TestnetSafetyError(
-                f"relay rejected the bundle submission: {relay_error}"
+                "relay rejected the bundle submission: "
+                f"{_sanitize_error(relay_error, *self._payload_hexes())}"
             )
         if bundle_hash is None:
             self._record(
@@ -1930,8 +2146,10 @@ def sign_and_submit_testnet_tx(
         selector = "eth_transfer"
 
     # The exact signed payload must never appear in the audit log, even if
-    # a transport error embeds it (DSS-WO-ENG-005 §4).
+    # a transport error embeds it (DSS-WO-ENG-005 §4), and never in a
+    # caller-visible exception (DSS-WO-ENG-007 Finding A).
     raw_hexes = (raw.hex(), "0x" + raw.hex())
+    submission_failure: Optional[TestnetSafetyError] = None
     try:
         tx_hash = w3.eth.send_raw_transaction(raw)  # 7
     except Exception as exc:
@@ -1939,6 +2157,10 @@ def sign_and_submit_testnet_tx(
         # a JSON-RPC error response is a deterministic REJECTION by the
         # node; anything else (timeout, transport failure) leaves the
         # outcome UNCERTAIN — the transaction may still have been received.
+        # The original exception can embed the exact signed payload hex,
+        # so the caller receives a SANITIZED replacement raised OUTSIDE
+        # this except block — no bare re-raise, no cause/context chaining
+        # (DSS-WO-ENG-007 Finding A).
         outcome = "rejected" if isinstance(exc, ValueError) else "uncertain"
         record_testnet_tx(
             cfg.tx_log_path,
@@ -1953,7 +2175,11 @@ def sign_and_submit_testnet_tx(
             error=_sanitize_error(exc, *raw_hexes),
             max_fee_exposure_wei=fee_exposure,
         )
-        raise
+        submission_failure = _clean_raise_candidate(
+            exc, f"testnet submission {outcome}", *raw_hexes
+        )
+    if submission_failure is not None:
+        raise submission_failure
     tx_hash_hex = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
 
     actual_gas_used = None

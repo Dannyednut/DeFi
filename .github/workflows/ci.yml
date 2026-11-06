@@ -82,7 +82,12 @@ jobs:
       # before those fixes) were resolved by PR #1; docs/DEPENDENCIES.md
       # records that history. Failures are deliberately NOT skipped,
       # xfail-marked or otherwise hidden. The only skipped units are the
-      # two opt-in live Flashbots phases with visible reasons.
+      # three intentional, opt-in live-network diagnostics, each with a
+      # visible reason: the Flashbots Sepolia bundle simulation and the
+      # Flashbots Sepolia self-transfer submission (both gated on
+      # DSS_TESTNET_FLASHBOTS_LIVE=1, never set in CI), plus the
+      # optimizer live diagnostic (gated on DSS_LIVE_OPTIMIZER_DIAG=1,
+      # never set in CI).
       - name: Run offline test suite (fails on any test failure)
         run: >
           python -m pytest tests

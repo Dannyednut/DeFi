@@ -45,15 +45,19 @@ def summarize(path: Path) -> str:
         f"- passed: **{passed}** | failed: **{failures}** | errors: **{errors}** | skipped: **{skipped}**",
         "",
         "Reference points (see docs/DEPENDENCIES.md failure register):",
-        "- DSS-WO-ENG-003 current state: the offline suite is expected fully "
-        "green — 0 failed, 0 errors. Any skipped units are intentional, "
-        "gated live-network tests (opt-in Flashbots Sepolia integration, "
-        "opt-in optimizer live diagnostic) that skip visibly with their "
-        "reason and can never run in CI.",
+        "- Reconciled current state (PR #1 + PR #2, ENG-012): the offline "
+        "suite is expected fully green — 0 failed, 0 errors. All PR #2 "
+        "gate/fee/simulation/custody/containment additions (ENG-004 "
+        "through ENG-011) must pass. Any skipped units are intentional, "
+        "gated live-network tests (opt-in Flashbots Sepolia integration "
+        "routed through the unified execution gate, opt-in optimizer live "
+        "diagnostic) that skip visibly with their reason and can never "
+        "run in CI.",
         "- Historical: DSS-WO-ENG-002 CI scope: 20 failed, 91 passed, "
-        "1 error; DSS-WO-ENG-001 CI scope (pre-retirement): 22 failed, "
-        "86 passed, 1 error; DSS-MISSION-001 original baseline: 23 failed, "
-        "86 passed, 1 error.",
+        "1 error (resolved by PR #1); DSS-WO-ENG-001 CI scope "
+        "(pre-retirement): 22 failed, 86 passed, 1 error; "
+        "DSS-MISSION-001 original baseline: 23 failed, 86 passed, "
+        "1 error.",
         "- Failures and errors in THIS run are regressions, not baseline "
         "noise — the job is red on purpose until they are fixed. No failure "
         "is skipped, xfail-marked or otherwise hidden by CI.",

@@ -68,15 +68,26 @@ jobs:
       #       network/environment-dependent.
       #
       # tests/test_flashbots_integration.py is NO LONGER excluded:
-      # DSS-WO-ENG-003 rewrote it as an import-safe, opt-in integration test
-      # (the old version signed and broadcast at import time). It collects
-      # cleanly and skips visibly without DSS_TESTNET_FLASHBOTS_LIVE=1 plus
-      # the DSS agent keystore; CI provides neither, so CI can never sign or
-      # broadcast through it.
+      # DSS-WO-ENG-003 (PR #1) first rewrote the old import-time
+      # signing/broadcast script as an import-safe, opt-in integration
+      # test, and DSS-WO-ENG-004 (PR #2) routed it through the unified
+      # testnet execution gate. It collects cleanly and its live phases
+      # skip visibly without DSS_TESTNET_FLASHBOTS_LIVE=1 plus the DSS
+      # agent keystore; CI provides neither, so CI can never sign,
+      # broadcast or submit through it.
       #
-      # The offline suite passes completely as of DSS-WO-ENG-003
-      # (Workstream A). Intentionally gated live-network tests appear as
-      # skipped with their reason; no failure, xfail or hidden skip remains.
+      # The offline suite passes completely on the reconciled baseline:
+      # the 20 pre-existing baseline failures and 1 fixture error carried
+      # over from the DSS-WO-ENG-002 scope (while this branch was forked
+      # before those fixes) were resolved by PR #1; docs/DEPENDENCIES.md
+      # records that history. Failures are deliberately NOT skipped,
+      # xfail-marked or otherwise hidden. The only skipped units are the
+      # three intentional, opt-in live-network diagnostics, each with a
+      # visible reason: the Flashbots Sepolia bundle simulation and the
+      # Flashbots Sepolia self-transfer submission (both gated on
+      # DSS_TESTNET_FLASHBOTS_LIVE=1, never set in CI), plus the
+      # optimizer live diagnostic (gated on DSS_LIVE_OPTIMIZER_DIAG=1,
+      # never set in CI).
       - name: Run offline test suite (fails on any test failure)
         run: >
           python -m pytest tests

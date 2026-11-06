@@ -45,15 +45,20 @@ ends with `IMPORT SMOKE: PASS` (91 modules).
 
 ```bash
 python -m pytest tests \
-  --ignore=tests/test_flashbots_integration.py \
   --ignore=tests/test_multicall3_yieldout.py \
   -p no:cacheprovider -ra
 ```
 
-- Expected result: **20 failed, 91 passed, 1 error** — the pre-existing
-  baseline failures are classified in `docs/DEPENDENCIES.md` §6 (ENG-002
-  register) and are being addressed by later work orders. They are not
-  hidden by CI.
+- Expected result (DSS-WO-ENG-003, 2026-11-04): **129 passed, 0 failed,
+  0 errors, 3 skipped** — the suite is fully green. The 3 skips are
+  intentional opt-in live-network gates that skip visibly with their
+  reason and can never run in CI (Flashbots Sepolia simulation +
+  submission, optimizer live diagnostic). Historical baselines
+  (ENG-002: 20 failed / 91 passed / 1 error; ENG-001: 22 failed /
+  86 passed / 1 error) are kept in `docs/DEPENDENCIES.md` §6 for
+  traceability and are no longer the current state.
+- Any failure or error in a fresh run is a regression, not baseline
+  noise; no failure is hidden by CI.
 - The suite includes the Exec contract alignment tests
   (`tests/test_exec_contract_alignment.py`), which compile the authoritative
   Solidity sources. That requires the npm-pinned OpenZeppelin package and a
@@ -67,12 +72,17 @@ npm ci --prefix contracts   # pinned @openzeppelin/contracts 5.7.0
   refuses to compile on SHA-256 mismatch (see `contracts/PROVENANCE.md`).
   Without `node_modules` installed the compilation tests fail with a clear
   setup message — they are never silently skipped.
-- `tests/test_flashbots_integration.py` is a module-level manual script that
-  **signs and broadcasts a real transaction**; it must never be run by
-  automation (see the failure register).
+- `tests/test_flashbots_integration.py` is now an **import-safe, opt-in
+  integration test** (ENG-003): collecting it loads no keys and opens no
+  connections. The live phases use only the DSS agent testnet wallet
+  from the secure store and skip visibly unless
+  `DSS_TESTNET_FLASHBOTS_LIVE=1` + `DSS_TESTNET_RPC_URL` are provided;
+  submission additionally requires the `DSS_TESTNET_EXEC=1` gate. The
+  old version — a module-level script that signed and broadcast at
+  import time — is retired; do not reintroduce it.
 - `tests/test_multicall3_yieldout.py` depends on a local runtime artifact and
-  a live RPC endpoint; it cannot pass on a clean clone.
-- For the full baseline comparison, run without the second `--ignore`.
+  a live RPC endpoint; it cannot pass on a clean clone and stays excluded
+  from CI.
 
 ## 5. Regenerating the lock files (after editing the `.in` files)
 

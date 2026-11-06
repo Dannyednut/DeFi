@@ -76,7 +76,18 @@ No previously cached packages or local state were involved (standalone interpret
 
 ## 6. Classified failure register
 
-### ENG-002 register (current; 21 units across 18 test functions, CI scope: 20 failed + 1 error = 21 of 112 units)
+### ENG-003 register (CURRENT — resolved: 0 failed, 0 errors)
+
+**DSS-WO-ENG-003 (2026-11-04) repaired every unit in the ENG-002 register.** The offline CI suite now passes completely: **129 passed, 0 failed, 0 errors, 3 visibly skipped** (intentionally gated live-network tests, never runnable in CI). Failures in any new run are regressions, not baseline noise.
+
+| ENG-002 register entry | Resolution in ENG-003 |
+| --- | --- |
+| Stale relay tests (13 units) | `tests/test_relay.py` rewritten for the current fail-closed interface. **Production defect found and fixed:** the bundle-not-included path in `_relay_flashbots` fell through and returned `None`, crashing callers reading `RelayResult` attributes. Legacy public-fallback / `relay_signer=` / unknown-chain→mainnet behaviour intentionally NOT restored (security removals). |
+| Detector/forensics drift (3) | Interfaces reconciled (block-payload `_audit_shadow_trades`, `DecodedSwap.fee`, `LiquidationScanner` cache arg). **Production defect found and fixed:** `BaseDetector._estimate_gas_usd` declared `float` but returned a tuple on success — the liquidation scanner crashed on every real position (silently swallowed by `except: pass`), making the detector permanently dead. Tuple contract documented, scanner unpacks correctly. |
+| Broken optimizer test (1 error) | The file was a live-network manual script with a `mode` parameter pytest read as a missing fixture. Replaced by deterministic offline tests of the borrow math (verified against an independent float profit model) and entrypoint routing; the manual diagnostic is preserved behind `DSS_LIVE_OPTIMIZER_DIAG=1` and skips visibly. |
+| Synthetic graph failures (4) | **Two production defects found and fixed:** (1) `utils/multicall3.py` used `UNISWAP_V2_FACTORY_ABI`/`UNISWAP_V3_FACTORY_ABI` without importing them — every batched swap-path discovery raised `NameError` and was silently swallowed, disabling V2/V3 pool discovery entirely; (2) `estimate_tvl_from_edge` recomputed TVL from token USD prices, returning $0.00 for any pool containing an unpriced token and making the simulator's TVL guard drop it, even when the edge carried a good precomputed TVL. Regression coverage added (`tests/test_multicall3_discovery.py`); discovery tests rewritten for the current async batched architecture. |
+
+### ENG-002 register (HISTORICAL — superseded by ENG-003; kept for traceability; 21 units across 18 test functions, CI scope: 20 failed + 1 error = 21 of 112 units)
 
 | Category | Tests | Root cause |
 | --- | --- | --- |
@@ -95,19 +106,20 @@ Changes vs the ENG-001 register, all caused by the ENG-002 retirement/alignment:
 
 Baseline scope then: 23 failed / 86 passed / 1 error; CI scope: 22 failed / 86 passed / 1 error (109 units). Category B (the `AtomicArbExecutor` contract-existence failure) and the `test_phase13` ABI mismatch are gone for the reasons above.
 
-### Excluded from CI (updated by DSS-WO-ENG-004)
+### Excluded / gated tests (current state after ENG-003 + PR #2 gate work)
 | Test | Status |
 | --- | --- |
-| tests/test_flashbots_integration.py | **No longer excluded** (ENG-004). The module-level broadcast script described below was REPLACED on this branch by an import-safe, gate-routed integration test: it collects cleanly, its offline tests run in CI, and its two live phases skip visibly without `DSS_TESTNET_FLASHBOTS_LIVE=1` + RPC + the DSS agent keystore (CI provides none of these). The gate (executor/testnet_gate.py) is the single wallet/authorization path; the relay is a transport only. |
-| tests/test_multicall3_yieldout.py::test_run_multicall3_batch_yieldOut | Still excluded (unchanged): requires a local artifact from a live run (`logs/pending_opportunities.jsonl`) before it even dials `https://0xrpc.io/eth`; fails on a clean clone with "No cycles to test." |
+| tests/test_flashbots_integration.py | **Rewritten in ENG-003 (Workstream B, PR #1)** and NO LONGER excluded: the old module-level `PRIVATE_KEY`/signing/broadcast-at-import script is gone. The file now collects safely, never touches keys or network at import, and both live phases skip visibly without `DSS_TESTNET_FLASHBOTS_LIVE=1` + `DSS_TESTNET_RPC_URL` + the agent keystore. Submission additionally requires `DSS_TESTNET_EXEC=1`. Since ENG-004 (PR #2) the test is routed through the unified execution gate (`executor/testnet_gate.py`) — the single wallet/authorization path; the relay is a transport only. Chain-ID gate (mainnet always refused, unknown chains fail closed) is unit-tested offline. CI can never sign, broadcast or submit through it. |
+| tests/test_multicall3_yieldout.py::test_run_multicall3_batch_yieldOut | Still excluded from CI: requires a local artifact from a live run (`logs/pending_opportunities.jsonl`) before it even dials `https://0xrpc.io/eth`; fails on a clean clone with "No cycles to test." Classified network/environment-dependent; candidate for the same gated rewrite later. |
+| tests/test_optimizer.py (live diagnostic portion) | The offline tests always run; the preserved manual live diagnostic skips visibly unless `DSS_LIVE_OPTIMIZER_DIAG=1`. |
 
 Also inspected: `tests/test_mc3.py` defines no pytest-collectable tests (manual script under `__main__`) — contributes 0 tests, harmless.
 
-### Reconciliation (ENG-002 actuals)
+### Reconciliation (ENG-003 actuals)
 
-- CI scope: 112 pytest units = **91 passing + 20 failing + 1 error**; 0 skipped. Baseline scope (without the second `--ignore`) remains 1 unit higher via the excluded environment-dependent test.
-- `tests/test_flashbots_integration.py` remains the uncollectable file excluded everywhere.
-- Historical ENG-001 reconciliation: 105 test functions = 84 passing + 20 failing + 1 error; pytest 9 units = 86 + 23 + 1.
+- CI scope (with the single remaining `--ignore` for `test_multicall3_yieldout.py`): **129 passed, 0 failed, 0 errors, 3 skipped** (all three skips are intentional opt-in live-network gates with visible reasons: Flashbots Sepolia simulation, Flashbots Sepolia submission, optimizer live diagnostic). `tests/test_flashbots_integration.py` is now collected (import-safe) instead of excluded.
+- The ENG-002-era unit counts (112 units) are historical: the relay suite was restructured (21 → 16 units), the broken optimizer script became 10 offline tests + 1 gated diagnostic, discovery gained regression coverage (`tests/test_multicall3_discovery.py`, 4 units) and the chain-ID gate gained offline tests (4 units).
+- Historical ENG-002 reconciliation: 112 pytest units = 91 passing + 20 failing + 1 error; 0 skipped. Historical ENG-001 reconciliation: 105 test functions = 84 passing + 20 failing + 1 error; pytest 9 units = 86 + 23 + 1.
 
 ## 7. Explicit non-goals honored (ENG-001)
 
@@ -122,9 +134,9 @@ Per the Principal's direction, the separate `AtomicArbExecutor` contract is **re
 - **Preserved:** `execution/atomic.py` plan/route compilation, preflight simulation, exact envelope construction, chain-ID validation and fail-closed behaviour; `ArbExecRoute`/`build_arbexec_route` adapter; all `ARB_EXEC_ADDRESS_*` deployment configuration (no addresses invented).
 - **ABI:** `executor/exec_abi.json` is compiler-generated from the pinned source with solc `0.8.28+commit.7893614a` (SHA-256 verified against the official solc-bin checksum) and OpenZeppelin 5.7.0 exactly (`contracts/package-lock.json`). `config.ARB_EXEC_ABI` conforms to the generated interface, enforced by tests.
 - **Solidity versions:** source pragmas `^0.8.19` (Exec) / GPL-2.0-or-later Helper; compiler pinned as above; OZ 5.7.0 (required for the OZ-v5 `Ownable(initialOwner)` constructor style).
-- **New baseline (CI scope):** **20 failed / 91 passed / 1 error** (112 units) — see §6.
+- **New baseline (CI scope, ENG-002, HISTORICAL):** **20 failed / 91 passed / 1 error** (112 units) — fully repaired in ENG-003; see §6. Current expectation: fully green (see ENG-003 reconciliation).
 
-## 9. DSS-WO-ENG-004 — unified signing, Flashbots gate and fee caps (this branch)
+## 9. DSS-WO-ENG-004 — unified signing, Flashbots gate and fee caps (PR #2)
 
 `executor/testnet_gate.py` is the single authorization boundary for every
 testnet signing operation; the Flashbots relay is a transport only:
@@ -157,6 +169,9 @@ testnet signing operation; the Flashbots relay is a transport only:
 - **The old broadcast script is gone:** tests/test_flashbots_integration.py
   is now import-safe, gate-routed and collected by CI (its live phases
   skip visibly). The old workflow exclusion was removed.
-- **Baseline note:** the 20 failures / 1 error from the ENG-002 scope are
-  still present on this branch (fixed on work/dss-eng-001-deps-ci, PR #1;
-  this branch forked before those fixes). All ENG-004 additions pass.
+- **Baseline note (updated by the ENG-012 reconciliation):** the 20
+  failures / 1 error from the ENG-002 scope — still present on this
+  branch while it was forked before the PR #1 fixes — were resolved by
+  PR #1 and are gone after merging `main`; the integrated branch passes
+  the corrected baseline. All PR #2 additions (ENG-004 through ENG-011)
+  pass.

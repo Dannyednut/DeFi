@@ -34,22 +34,26 @@ class TestShadowAudit(unittest.TestCase):
             {"hash": MagicMock(hex=lambda: hash_ignore[2:]), "to": "0xSomeoneElse".lower()},
         ]
         
-        self.w3.eth.get_block.return_value = {
+        block_dict = {
+            "number": block_number,
             "transactions": mock_txs,
             "extraData": b"Flashbots"
         }
-        
+
         # 2. Execution
         self.resolver._log_shadow = MagicMock() # Intercept log call
-        self.resolver._audit_shadow_trades(block_number, [], is_public_fn)
-        
+        # Current interface: the full block payload is passed through so the
+        # audit can attribute builder provenance from extraData.
+        self.resolver._audit_shadow_trades(block_dict, is_public_fn)
+
         # 3. Validation
         # Should only log hash_private
         self.resolver._log_shadow.assert_called_once()
         args = self.resolver._log_shadow.call_args[0]
         self.assertEqual(args[0], hash_private)
         self.assertEqual(args[1], router_addr)
-        self.assertEqual(args[2].lower(), "flashbots") 
+        self.assertEqual(args[2].lower(), "flashbots")
+        self.assertEqual(args[3], block_number)
 
 if __name__ == "__main__":
     unittest.main()

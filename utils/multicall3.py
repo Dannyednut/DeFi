@@ -29,7 +29,19 @@ from log import get_logger
 # from graph import TokenGraph
 # from cache import PoolCache
 from tvl import estimate_tvl_v2, estimate_tvl_v3, is_above_min_liquidity
-from config import MIN_LIQUIDITY_USD, ARB_EXEC_ABI, get_chain
+# UNISWAP_V2_FACTORY_ABI / UNISWAP_V3_FACTORY_ABI are required by
+# _encode_get_pair/_encode_get_pool below. They were previously missing from
+# this import, so every batched swap-path discovery raised
+# NameError('UNISWAP_V2_FACTORY_ABI' is not defined), which registry.py's
+# except-branch reduced to candidates=[] — silently disabling V2/V3 pool
+# discovery from mempool swaps entirely.
+from config import (
+    MIN_LIQUIDITY_USD,
+    ARB_EXEC_ABI,
+    UNISWAP_V2_FACTORY_ABI,
+    UNISWAP_V3_FACTORY_ABI,
+    get_chain,
+)
 from optimizer.abi import QUOTER_V2_ABI, pack_path
 from utils.web3_compat import encode_call
 

@@ -45,22 +45,22 @@ def summarize(path: Path) -> str:
         f"- passed: **{passed}** | failed: **{failures}** | errors: **{errors}** | skipped: **{skipped}**",
         "",
         "Reference points (see docs/DEPENDENCIES.md failure register):",
-        "- DSS-WO-ENG-004 scope on this branch: the old module-level broadcast "
-        "script is replaced by a gate-routed import-safe integration test "
-        "(collected; its live phases skip visibly). All gate/fee/simulation/"
-        "custody additions must pass; the ONLY skipped units are the two "
-        "opt-in live Flashbots phases.",
-        "- Still expected on this branch: the 20 pre-existing baseline failures "
-        "and 1 fixture error carried over from the DSS-WO-ENG-002 scope (fixed "
-        "on work/dss-eng-001-deps-ci, PR #1 — this branch forked before those "
-        "fixes). The job stays red until the branches reconcile.",
-        "- Historical: DSS-WO-ENG-002 CI scope: 20 failed, 91 passed, 1 error; "
-        "DSS-WO-ENG-001 CI scope (pre-retirement): 22 failed, 86 passed, "
-        "1 error; DSS-MISSION-001 original baseline: 23 failed, 86 passed, "
+        "- Reconciled current state (PR #1 + PR #2, ENG-012): the offline "
+        "suite is expected fully green — 0 failed, 0 errors. All PR #2 "
+        "gate/fee/simulation/custody/containment additions (ENG-004 "
+        "through ENG-011) must pass. Any skipped units are intentional, "
+        "gated live-network tests (opt-in Flashbots Sepolia integration "
+        "routed through the unified execution gate, opt-in optimizer live "
+        "diagnostic) that skip visibly with their reason and can never "
+        "run in CI.",
+        "- Historical: DSS-WO-ENG-002 CI scope: 20 failed, 91 passed, "
+        "1 error (resolved by PR #1); DSS-WO-ENG-001 CI scope "
+        "(pre-retirement): 22 failed, 86 passed, 1 error; "
+        "DSS-MISSION-001 original baseline: 23 failed, 86 passed, "
         "1 error.",
-        "- Failures and errors in THIS run that are NOT part of that known set "
-        "are regressions — treat them as blockers. No failure is skipped, "
-        "xfail-marked or otherwise hidden by CI.",
+        "- Failures and errors in THIS run are regressions, not baseline "
+        "noise — the job is red on purpose until they are fixed. No failure "
+        "is skipped, xfail-marked or otherwise hidden by CI.",
         "",
     ]
     if failing:

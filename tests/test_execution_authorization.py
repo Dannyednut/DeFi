@@ -49,6 +49,7 @@ import os
 import sys
 import tempfile
 import unittest
+import contextlib
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,7 +69,9 @@ from executor.authorization import (
     reset_execution_authorization,
     resolve_execution_policy,
 )
+import executor.testnet_gate as _gate
 from executor.testnet_gate import (
+    ALLOWED_TESTNET_CHAINS,
     KNOWN_TARGETS,
     MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
     MAX_TESTNET_TX_VALUE_WEI,
@@ -82,6 +85,30 @@ from executor.mev_execution import MEVExecutionService
 SEPOLIA = 11155111
 MAINNET = 1
 HOLESKY = 17000
+
+
+@contextlib.contextmanager
+def _opted_out():
+    """Controlled environment patch (DSS-WO-ENG-015 R1): the REAL process
+    environment is the ONLY authorization authority; offline tests simulate
+    the disabled default by removing the opt-in from os.environ."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("DSS_TESTNET_EXEC", None)
+        yield
+
+
+_MODULE_OPT_IN = None
+
+
+def setUpModule():
+    """DSS-WO-ENG-015 R1: every authorization re-derives its decision from
+    the REAL process environment. The offline suite simulates the explicit
+    testnet opt-in by patching os.environ for this module; tests that pin
+    the disabled default remove it again via _opted_out()."""
+    global _MODULE_OPT_IN
+    _MODULE_OPT_IN = patch.dict(os.environ, {"DSS_TESTNET_EXEC": "1"}, clear=False)
+    _MODULE_OPT_IN.start()
+    unittest.addModuleCleanup(_MODULE_OPT_IN.stop)
 
 
 # ── offline fixtures ─────────────────────────────────────────────────────────
@@ -106,19 +133,20 @@ def _tmp_secret_store(tmpdir: str):
     return acct
 
 
-def _testnet_config(tmpdir: str, *, enabled: bool = True, account=None,
+def _testnet_config(tmpdir: str, *, account=None,
                     expected_chain_id: int = SEPOLIA,
-                    allowlist=None, rpc_url="https://sepolia.example"):
+                    rpc_url="https://sepolia.example"):
+    """R1: the config carries NO authorization state — no `enabled`, no
+    `allowlist`. Authorization is decided from the REAL process environment
+    (patched per-module by setUpModule) and the code-controlled maps."""
     acct = account or _tmp_secret_store(tmpdir)
     return TestnetExecutionConfig(
-        enabled=enabled,
         rpc_url=rpc_url,
         keystore_path=os.path.join(tmpdir, "keystore.json"),
         passphrase_path=os.path.join(tmpdir, "pass"),
         address_path=os.path.join(tmpdir, "address"),
         tx_log_path=os.path.join(tmpdir, "txlog.jsonl"),
         expected_chain_id=expected_chain_id,
-        allowlist=allowlist,
     ), acct
 
 
@@ -407,23 +435,28 @@ class TestPolicySelection(unittest.TestCase):
     """Network selection is not execution authorization."""
 
     def test_chain_id_alone_never_authorizes(self):
-        policy = resolve_execution_policy({"CHAIN_ID": str(SEPOLIA)})
+        """R1: policy resolution reads the REAL process environment — a
+        CHAIN_ID setting can never select or enable any policy."""
+        with patch.dict(os.environ, {"CHAIN_ID": str(SEPOLIA)}), _opted_out():
+            policy = resolve_execution_policy()
         self.assertIsInstance(policy, DisabledExecutionPolicy)
         boundary = ExecutionAuthorizationBoundary(policy=policy)
         with self.assertRaises(AuthorizationRefused):
             boundary.authorize_execution("test", chain_id=SEPOLIA)
 
     def test_execute_onchain_true_alone_never_authorizes(self):
-        policy = resolve_execution_policy({"EXECUTE_ONCHAIN": "true"})
+        with patch.dict(os.environ, {"EXECUTE_ONCHAIN": "true"}), _opted_out():
+            policy = resolve_execution_policy()
         self.assertIsInstance(policy, DisabledExecutionPolicy)
         boundary = ExecutionAuthorizationBoundary(policy=policy)
         with self.assertRaises(AuthorizationRefused):
             boundary.authorize_execution("test")
 
     def test_execute_onchain_true_cannot_authorize_mainnet(self):
-        policy = resolve_execution_policy(
-            {"EXECUTE_ONCHAIN": "true", "CHAIN_ID": str(MAINNET)}
-        )
+        with patch.dict(
+            os.environ, {"EXECUTE_ONCHAIN": "true", "CHAIN_ID": str(MAINNET)}
+        ), _opted_out():
+            policy = resolve_execution_policy()
         self.assertIsInstance(policy, DisabledExecutionPolicy)
         with self.assertRaises(AuthorizationRefused):
             ExecutionAuthorizationBoundary(policy=policy).authorize_execution(
@@ -431,10 +464,9 @@ class TestPolicySelection(unittest.TestCase):
             )
 
     def test_testnet_optin_selects_testnet_policy(self):
-        policy = resolve_execution_policy(
-            {"DSS_TESTNET_EXEC": "1", "DSS_TESTNET_RPC_URL": "https://x",
-             "CHAIN_ID": str(SEPOLIA)}
-        )
+        """R1: ONLY the real process environment carries the opt-in."""
+        with patch.dict(os.environ, {"DSS_TESTNET_EXEC": "1"}):
+            policy = resolve_execution_policy()
         # NOTE: availability is NOT asserted here — it depends on secret-store
         # provisioning, which is environment-specific. Policy SELECTION is
         # what this test pins.
@@ -445,15 +477,17 @@ class TestPolicySelection(unittest.TestCase):
         self.assertFalse(prod.execution_available())
         with self.assertRaises(AuthorizationRefused):
             prod.authorize("test", chain_id=SEPOLIA)
-        # Production is not selectable from any environment:
-        for env in (
+        # Production is not selectable from the real environment, whatever
+        # it contains (R1: there is no injected-environment route either):
+        for extra in (
             {"EXECUTE_ONCHAIN": "true"},
             {"EXECUTE_ONCHAIN": "1"},
             {"DSS_TESTNET_EXEC": "1"},
         ):
-            self.assertNotIsInstance(
-                resolve_execution_policy(env), ProductionExecutionPolicy
-            )
+            with patch.dict(os.environ, extra):
+                self.assertNotIsInstance(
+                    resolve_execution_policy(), ProductionExecutionPolicy
+                )
 
     def test_disabled_policy_refusal_is_testnet_safety_error(self):
         # Refusals are TestnetSafetyError subclasses so every existing
@@ -500,10 +534,10 @@ class TestBoundaryAuthorization(unittest.TestCase):
                     boundary.authorize_execution("arb_execution", chain_id=chain)
 
     def test_missing_credentials_fail_closed(self):
-        # enabled flag without any secret store: authorization refuses
+        # real-environment opt-in without any secret store: authorization
+        # still refuses (custody is re-verified at every authorization)
         with tempfile.TemporaryDirectory() as tmp:
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url="https://sepolia.example",
                 keystore_path=os.path.join(tmp, "nope.json"),
                 passphrase_path=os.path.join(tmp, "nope.pass"),
@@ -718,12 +752,18 @@ class TestSigningPathIntegration(unittest.TestCase):
         self.assertFalse(hasattr(executor, "get_sender"))
 
     def test_grep_level_invariant_only_gate_broadcasts(self):
-        """Structural invariant: outside tests, the only module that calls
-        send_raw_transaction / send_bundle is executor/testnet_gate.py."""
+        """Structural invariant (R1 §4 — broader submission-path audit):
+        outside tests, the only module that can broadcast by ANY mechanism
+        (send_raw_transaction, send_transaction, eth_sendRawTransaction,
+        eth_sendBundle, send_bundle) is executor/testnet_gate.py, and no
+        production module submits a send-shaped JSON-RPC method through
+        make_request."""
         import subprocess
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         result = subprocess.run(
-            ["git", "grep", "-l", "-E", "send_raw_transaction|send_bundle",
+            ["git", "grep", "-l", "-E",
+             "send_raw_transaction|send_transaction|eth_sendRawTransaction|"
+             "eth_sendBundle|send_bundle",
              "--", "*.py"],
             cwd=root, capture_output=True, text=True,
         )
@@ -734,6 +774,18 @@ class TestSigningPathIntegration(unittest.TestCase):
         self.assertEqual(
             files, {"executor/testnet_gate.py"},
             f"raw broadcast calls must exist ONLY in the gate, found: {files}",
+        )
+        # Direct JSON-RPC submission through make_request (or equivalent)
+        # must not exist in production code: only the gate orchestrations
+        # reach a network write, and only through the sanctioned transports.
+        result = subprocess.run(
+            ["git", "grep", "-n", "-E",
+             r"make_request\(\s*['\"]eth_send", "--", "*.py"],
+            cwd=root, capture_output=True, text=True,
+        )
+        self.assertEqual(
+            result.stdout.strip(), "",
+            "no production module may submit transactions via make_request",
         )
 
 
@@ -1022,13 +1074,12 @@ class AuthSubmitProbe:
         self.calls = []
 
     def __call__(self, tx, *, purpose, config=None, web3_factory=None,
-                 known_targets=None, receipt_timeout=120):
+                 receipt_timeout=120):
         from executor.testnet_gate import sign_and_submit_testnet_tx
         self.calls.append(dict(tx))
         return sign_and_submit_testnet_tx(
             tx, purpose=purpose, config=config,
             web3_factory=lambda url: self.gate_w3,
-            known_targets=known_targets,
             receipt_timeout=receipt_timeout,
         )
 
@@ -1267,6 +1318,414 @@ class _PrepareStub:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DSS-WO-ENG-015 R1 — override-isolation regression tests (Coordinator R1 §3)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TestR1EnvironmentAuthority(unittest.TestCase):
+    """The REAL process environment is the ONLY authority for the testnet
+    opt-in. A manually constructed configuration — however "enabled" it
+    looks — can never authorize execution without it, and no production
+    interface accepts an environment/config override."""
+
+    def _manual_config(self, tmp):
+        """A hand-built, FULLY provisioned configuration (throwaway keystore
+        present and custody-clean) — exactly what a caller trying to route
+        around the central policy would construct."""
+        acct = _tmp_secret_store(tmp)
+        cfg = TestnetExecutionConfig(
+            rpc_url="https://sepolia.example",
+            keystore_path=os.path.join(tmp, "keystore.json"),
+            passphrase_path=os.path.join(tmp, "pass"),
+            address_path=os.path.join(tmp, "address"),
+            tx_log_path=os.path.join(tmp, "txlog.jsonl"),
+        )
+        return cfg, acct
+
+    def test_config_no_longer_has_enabled_or_allowlist_fields(self):
+        # The structure itself removes the override: there is no `enabled`
+        # or `allowlist` field left to set.
+        self.assertNotIn("enabled", TestnetExecutionConfig.__dataclass_fields__)
+        self.assertNotIn("allowlist", TestnetExecutionConfig.__dataclass_fields__)
+        with self.assertRaises(TypeError):
+            # A caller replaying the OLD bypass (enabled=True) fails at
+            # construction.
+            TestnetExecutionConfig(enabled=True, rpc_url="https://x.example")
+        with self.assertRaises(TypeError):
+            TestnetExecutionConfig(allowlist={8453: "Base"})
+
+    def test_manually_constructed_config_cannot_authorize_without_env(self):
+        """R1 §3.1: a hand-built config (even fully provisioned) cannot
+        authorize execution when the REAL process environment has not
+        enabled DSS_TESTNET_EXEC."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, acct = self._manual_config(tmp)
+            boundary = ExecutionAuthorizationBoundary(
+                policy=TestnetExecutionPolicy(cfg)
+            )
+            with _opted_out():
+                # boundary-level refusal (the gate raises the base
+                # TestnetSafetyError; AuthorizationRefused is its subclass
+                # for disabled-policy and chain-mismatch verdicts)
+                with self.assertRaises(TestnetSafetyError) as ctx:
+                    boundary.authorize_execution("arb_execution", chain_id=SEPOLIA)
+                self.assertIn("DSS_TESTNET_EXEC", str(ctx.exception))
+                # gate-level refusal on a DIRECT orchestration call
+                with self.assertRaises(TestnetSafetyError) as ctx2:
+                    cfg.require_ready()
+                self.assertIn("DISABLED", str(ctx2.exception))
+                # and the signed-intent handle minted BEFORE the env change
+                # still cannot sign: every call re-reads the environment
+                with patch.dict(os.environ, {"DSS_TESTNET_EXEC": "1"}):
+                    auth = boundary.authorize_execution(
+                        "arb_execution", chain_id=SEPOLIA)
+                with _opted_out():
+                    gate_w3 = _GateW3()
+                    with patch(
+                        "executor.authorization.sign_and_submit_testnet_tx",
+                        side_effect=lambda t, **kw: _real_sign_and_submit(
+                            t, gate_w3=gate_w3, **kw),
+                    ):
+                        with self.assertRaises(TestnetSafetyError):
+                            auth.sign_and_submit(
+                                _self_transfer_tx(acct.address))
+                    self.assertEqual(gate_w3.raw_submissions, [])
+
+    def test_no_environment_parameter_on_production_interfaces(self):
+        """R1 §1.6: production-facing interfaces accept no caller-supplied
+        environment injection."""
+        import inspect as _inspect
+        self.assertEqual(
+            list(_inspect.signature(resolve_execution_policy).parameters), []
+        )
+        self.assertEqual(
+            list(_inspect.signature(
+                ExecutionAuthorizationBoundary.__init__).parameters),
+            ["self", "policy"],
+        )
+        # from_env keeps its optional mapping for offline-test CONFIG only;
+        # the opt-in is never taken from it.
+        with _opted_out():
+            cfg = TestnetExecutionConfig.from_env(
+                {"DSS_TESTNET_EXEC": "1",
+                 "DSS_TESTNET_RPC_URL": "https://sepolia.example"})
+            with self.assertRaises(TestnetSafetyError):
+                cfg.require_ready()
+
+    def test_injected_policy_confers_no_authorization_authority(self):
+        """Any policy object re-derives the decision from the authoritative
+        sources inside the gate — an injected policy cannot flip execution
+        on."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, acct = self._manual_config(tmp)
+            boundary = ExecutionAuthorizationBoundary(
+                policy=TestnetExecutionPolicy(cfg)
+            )
+            with _opted_out():
+                self.assertFalse(boundary.execution_available())
+                with self.assertRaises(TestnetSafetyError):
+                    boundary.authorize_execution("arb_execution")
+            with patch.dict(os.environ, {"DSS_TESTNET_EXEC": "1"}):
+                self.assertTrue(boundary.execution_available())
+
+    def test_direct_gate_orchestration_calls_cannot_bypass_policy(self):
+        """R1 §3.4: direct calls to the gate orchestrations with a hand-built
+        configuration hit the SAME central authorization policy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, acct = self._manual_config(tmp)
+            gate_w3 = _GateW3()
+            relay = _RelayW3()
+            with _opted_out():
+                with self.assertRaises(TestnetSafetyError) as ctx:
+                    from executor.testnet_gate import sign_and_submit_testnet_tx
+                    sign_and_submit_testnet_tx(
+                        _self_transfer_tx(acct.address),
+                        purpose="direct gate call must not bypass",
+                        config=cfg,
+                        web3_factory=lambda url: gate_w3,
+                    )
+                self.assertIn("DISABLED", str(ctx.exception))
+                with self.assertRaises(TestnetSafetyError) as ctx2:
+                    from executor.testnet_gate import prepare_flashbots_bundle
+                    prepare_flashbots_bundle(
+                        [_self_transfer_tx(acct.address)],
+                        purpose="direct gate bundle must not bypass",
+                        config=cfg,
+                        web3_factory=lambda url: _PrepareStub(),
+                        relay_factory=lambda url, a, r: relay,
+                    )
+                self.assertIn("DISABLED", str(ctx2.exception))
+            # EXECUTE_ONCHAIN=true cannot flip the gate either
+            with patch.dict(os.environ, {"EXECUTE_ONCHAIN": "true"}), _opted_out():
+                with self.assertRaises(TestnetSafetyError):
+                    from executor.testnet_gate import sign_and_submit_testnet_tx                         as _s
+                    _s(
+                        _self_transfer_tx(acct.address),
+                        purpose="execute_onchain must not help",
+                        config=cfg,
+                        web3_factory=lambda url: gate_w3,
+                    )
+            # nothing was signed or broadcast on any refusal
+            self.assertEqual(gate_w3.raw_submissions, [])
+            self.assertEqual(relay.simulate_calls, [])
+            self.assertEqual(relay.send_calls, [])
+
+    def test_standard_route_fully_disabled_without_real_opt_in(self):
+        """R1 §3.7: the standard application route (default boundary, the
+        ordinary executor and router wiring) is fully disabled when the REAL
+        environment carries no testnet opt-in."""
+        reset_execution_authorization()
+        try:
+            with _opted_out():
+                boundary = ExecutionAuthorizationBoundary()
+                self.assertFalse(boundary.execution_available())
+                with self.assertRaises(AuthorizationRefused):
+                    boundary.authorize_execution("arb_execution", chain_id=SEPOLIA)
+                executor = TestSigningPathIntegration()._executor(boundary)
+                result = executor.submit(_ok_opportunity("0x" + "11" * 20))
+                self.assertIsNotNone(result)
+                self.assertFalse(result.success)
+                self.assertEqual(result.method, "refused")
+        finally:
+            reset_execution_authorization()
+
+    def test_no_raw_signing_or_submission_on_any_refusal(self):
+        """R1 §3.8: on ANY refusal the wallet is never decrypted and nothing
+        is broadcast — proven with a real (throwaway) keystore configured
+        and a broadcast-recording stub RPC."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, acct = self._manual_config(tmp)
+            gate_w3 = _GateW3()
+            with _opted_out(), patch(
+                "executor.testnet_gate.load_agent_wallet",
+                side_effect=AssertionError("wallet must never be decrypted"),
+            ):
+                from executor.testnet_gate import sign_and_submit_testnet_tx
+                with self.assertRaises(TestnetSafetyError):
+                    sign_and_submit_testnet_tx(
+                        _self_transfer_tx(acct.address),
+                        purpose="refusal must not decrypt or sign",
+                        config=cfg,
+                        web3_factory=lambda url: gate_w3,
+                    )
+            self.assertEqual(gate_w3.raw_submissions, [])
+            # also: an authorization refused at the boundary never reaches
+            # the gate's wallet path
+            boundary = ExecutionAuthorizationBoundary(
+                policy=TestnetExecutionPolicy(cfg)
+            )
+            with _opted_out(), patch(
+                "executor.testnet_gate.load_agent_wallet",
+                side_effect=AssertionError("wallet must never be decrypted"),
+            ):
+                with self.assertRaises(TestnetSafetyError):
+                    boundary.authorize_execution("arb_execution", chain_id=SEPOLIA)
+
+
+class TestR1AllowlistIsolation(unittest.TestCase):
+    """The production allowlist is the code-controlled
+    ALLOWED_TESTNET_CHAINS map with Sepolia as its ONLY entry; no caller
+    can expand the live allowlist through any interface."""
+
+    def test_sepolia_is_the_only_production_allowlisted_testnet(self):
+        """R1 §3.3: Sepolia remains the only production-allowlisted testnet."""
+        self.assertEqual(ALLOWED_TESTNET_CHAINS, {SEPOLIA: "Ethereum Sepolia"})
+        self.assertEqual(_gate.ALLOWED_TESTNET_CHAINS, ALLOWED_TESTNET_CHAINS)
+        # effective_allowlist() is parameter-free and returns exactly that map
+        import inspect as _inspect
+        self.assertEqual(
+            list(_inspect.signature(_gate.effective_allowlist).parameters), []
+        )
+        self.assertIs(_gate.effective_allowlist(), ALLOWED_TESTNET_CHAINS)
+
+    def test_caller_supplied_allowlist_cannot_authorize_other_networks(self):
+        """R1 §3.2: a caller-supplied test allowlist cannot authorize Base,
+        Arbitrum or any other non-approved network — the parameter does not
+        exist and the code-controlled map refuses them."""
+        for chain, name in (
+            (8453, "Base"), (42161, "Arbitrum One"), (10, "OP Mainnet"),
+            (56, "BNB Chain"), (HOLESKY, "Holesky"), (137, "Polygon"),
+        ):
+            with self.subTest(chain=chain, name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    acct = _tmp_secret_store(tmp)
+                    cfg = TestnetExecutionConfig(
+                        rpc_url="https://attacker.example",
+                        keystore_path=os.path.join(tmp, "keystore.json"),
+                        passphrase_path=os.path.join(tmp, "pass"),
+                        address_path=os.path.join(tmp, "address"),
+                        expected_chain_id=chain,
+                    )
+                    # even with the explicit opt-in present in the REAL
+                    # environment, the chain is refused by the production map
+                    with patch.dict(os.environ, {"DSS_TESTNET_EXEC": "1"}):
+                        with self.assertRaises(TestnetSafetyError) as ctx:
+                            cfg.require_ready()
+                    self.assertIn("allowlist", str(ctx.exception))
+                    # and no interface accepts an alternative map:
+                    with self.assertRaises(TypeError):
+                        TestnetExecutionConfig(allowlist={chain: name})
+
+    def test_frozen_config_cannot_gain_an_allowlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, _ = self._manual_config_r1(tmp)
+            with self.assertRaises((AttributeError, TypeError)):
+                cfg.allowlist = {8453: "Base"}
+            import dataclasses as _dc
+            with self.assertRaises(TypeError):
+                _dc.replace(cfg, allowlist={8453: "Base"})
+
+    def _manual_config_r1(self, tmp):
+        acct = _tmp_secret_store(tmp)
+        return TestnetExecutionConfig(
+            rpc_url="https://sepolia.example",
+            keystore_path=os.path.join(tmp, "keystore.json"),
+            passphrase_path=os.path.join(tmp, "pass"),
+            address_path=os.path.join(tmp, "address"),
+            tx_log_path=os.path.join(tmp, "txlog.jsonl"),
+        ), acct
+
+
+class TestR1TargetInjection(unittest.TestCase):
+    """No production-facing execution interface accepts a `known_targets`
+    override: normal execution ALWAYS validates against the code-controlled
+    KNOWN_TARGETS map, which stays EMPTY."""
+
+    def test_known_targets_remain_empty(self):
+        self.assertIs(KNOWN_TARGETS, _gate.KNOWN_TARGETS)
+        self.assertEqual(_gate.KNOWN_TARGETS, {})
+
+    def test_no_known_targets_parameter_on_execution_interfaces(self):
+        import inspect as _inspect
+        from executor.testnet_gate import (
+            prepare_flashbots_bundle as gate_prepare,
+            sign_and_submit_testnet_tx as gate_submit,
+            validate_bundle,
+            validate_transaction,
+        )
+        for fn in (
+            AuthorizedExecution.sign_and_submit,
+            AuthorizedExecution.prepare_flashbots_bundle,
+            MEVExecutionService.submit,
+            gate_submit,
+            gate_prepare,
+            validate_transaction,
+            validate_bundle,
+        ):
+            self.assertNotIn(
+                "known_targets", _inspect.signature(fn).parameters,
+                f"{fn.__qualname__} must not accept a known_targets override",
+            )
+
+    def test_runtime_caller_cannot_authorize_arbitrary_contract(self):
+        """R1 §3.5: a caller passing its own target map to the ONLY
+        sanctioned direct-RPC handle is refused — twice over: the parameter
+        no longer exists (TypeError), and the policy refuses the unapproved
+        recipient against the EMPTY production map."""
+        with tempfile.TemporaryDirectory() as tmp:
+            boundary, cfg, acct = _authorized_boundary(tmp)
+            auth = boundary.authorize_execution("arb_execution", chain_id=SEPOLIA)
+            attacker_contract = to_checksum_address("0x" + "dd" * 20)
+            attacker_map = {SEPOLIA: {attacker_contract.lower(): "attacker"}}
+            gate_w3 = _GateW3()
+            with self.assertRaises(TypeError):
+                auth.sign_and_submit(
+                    _self_transfer_tx(acct.address, to=attacker_contract),
+                    known_targets=attacker_map,
+                )
+            # without any override the production policy refuses the target
+            with patch(
+                "executor.authorization.sign_and_submit_testnet_tx",
+                side_effect=lambda t, **kw:
+                    _real_sign_and_submit(t, gate_w3=gate_w3, **kw),
+            ):
+                with self.assertRaises(TestnetSafetyError) as ctx:
+                    auth.sign_and_submit(
+                        _self_transfer_tx(acct.address, to=attacker_contract),
+                    )
+            self.assertIn("neither the agent wallet nor", str(ctx.exception))
+            self.assertEqual(gate_w3.raw_submissions, [])
+
+    def test_runtime_caller_cannot_authorize_arbitrary_bundle_target(self):
+        """The Flashbots preparation handle refuses the override too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            boundary, cfg, acct = _authorized_boundary(tmp)
+            auth = boundary.authorize_execution("bundle-test", chain_id=SEPOLIA)
+            attacker_contract = to_checksum_address("0x" + "df" * 20)
+            with self.assertRaises(TypeError):
+                auth.prepare_flashbots_bundle(
+                    [_self_transfer_tx(acct.address, to=attacker_contract)],
+                    known_targets={SEPOLIA: {attacker_contract.lower(): "x"}},
+                )
+            # and without the override the gate refuses the recipient
+            with patch(
+                "executor.authorization.prepare_flashbots_bundle",
+                side_effect=lambda txs, **kw:
+                    _real_prepare(txs, relay=_RelayW3(), **kw),
+            ):
+                with self.assertRaises(TestnetSafetyError) as ctx:
+                    auth.prepare_flashbots_bundle(
+                        [_self_transfer_tx(acct.address, to=attacker_contract)],
+                    )
+            self.assertIn("neither the agent wallet nor", str(ctx.exception))
+
+    def test_mev_service_cannot_authorize_unapproved_target_via_override(self):
+        """R1 §3.6: MEVExecutionService.submit cannot authorize an unapproved
+        target through an override — the parameter does not exist, and the
+        gate still validates against the empty production map."""
+        with tempfile.TemporaryDirectory() as tmp:
+            boundary, cfg, acct = _authorized_boundary(tmp)
+            service = MEVExecutionService(
+                _ExecutorW3(chain_id=SEPOLIA), simulator=None,
+                authorization=boundary,
+            )
+            from mev.models import BundleCandidate
+            attacker_contract = to_checksum_address("0x" + "de" * 20)
+            # target_block=101: the stub head is 100, so the MEV preflight
+            # (chain policy, target-block window, profit ceiling) passes and
+            # the refusal below is the GATE's target-policy refusal.
+            candidate = BundleCandidate(
+                chain_id=SEPOLIA, trigger_hash="0x" + "02" * 32,
+                searcher_raw_tx="", target_block=101,
+                expected_profit_wei=10**16, gas_limit=300_000,
+                max_fee_per_gas=2 * 10**9, max_priority_fee_per_gas=10**9,
+            )
+            with self.assertRaises(TypeError):
+                service.submit(
+                    candidate,
+                    unsigned_searcher_tx=_self_transfer_tx(
+                        acct.address, to=attacker_contract),
+                    known_targets={SEPOLIA: {attacker_contract.lower(): "evil"}},
+                )
+            # without any override the unapproved target is still refused
+            with patch(
+                "executor.authorization.prepare_flashbots_bundle",
+                side_effect=lambda txs, **kw:
+                    _real_prepare(txs, relay=_RelayW3(), **kw),
+            ):
+                result = service.submit(
+                    candidate,
+                    unsigned_searcher_tx=_self_transfer_tx(
+                        acct.address, to=attacker_contract),
+                )
+            self.assertFalse(result.success)
+            self.assertEqual(result.method, "flashbots")
+            self.assertIn("neither the agent wallet nor", result.error)
+
+
+def _real_prepare(unsigned_txs, *, relay, **kwargs):
+    """Run the REAL gate bundle preparation with offline stub transports."""
+    from executor.testnet_gate import prepare_flashbots_bundle
+    if kwargs.get("web3_factory") is None:
+        kwargs["web3_factory"] = lambda url: _PrepareStub()
+    if kwargs.get("relay_factory") is None:
+        kwargs["relay_factory"] = lambda url, auth_account, relay_url: relay
+    return prepare_flashbots_bundle(
+        [dict(t) for t in unsigned_txs], **kwargs)
+
+
 class TestProductionInvariants(unittest.TestCase):
     def test_committed_known_targets_remain_empty(self):
         """No contract target was authorized by ENG-015."""
@@ -1289,6 +1748,31 @@ class TestProductionInvariants(unittest.TestCase):
                 )
         finally:
             reset_execution_authorization()
+
+    def test_r1_environment_is_the_only_opt_in_authority(self):
+        """R1: gate_opted_in() reads the REAL process environment and is the
+        single authoritative read; resolve_execution_policy() uses exactly
+        it."""
+        import inspect as _inspect
+        from executor.testnet_gate import gate_opted_in
+        with _opted_out():
+            self.assertFalse(gate_opted_in())
+            self.assertIsInstance(
+                resolve_execution_policy(), DisabledExecutionPolicy)
+        with patch.dict(os.environ, {"DSS_TESTNET_EXEC": "1"}):
+            self.assertTrue(gate_opted_in())
+            self.assertIsInstance(
+                resolve_execution_policy(), TestnetExecutionPolicy)
+        with patch.dict(os.environ, {"DSS_TESTNET_EXEC": "true"}):
+            # anything but the exact "1" is NOT an opt-in
+            self.assertFalse(gate_opted_in())
+
+    def test_r1_disabled_policy_refusal_is_not_silently_accepted(self):
+        """A refused authorization must never be reported as available."""
+        with _opted_out():
+            boundary = ExecutionAuthorizationBoundary()
+            self.assertFalse(boundary.execution_available())
+            self.assertIn("DSS_TESTNET_EXEC", boundary.refusal_reason())
 
 
 if __name__ == "__main__":

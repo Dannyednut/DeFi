@@ -106,6 +106,7 @@ Every safety invariant of the gate is pinned here:
     signing AND before submission — exercised end-to-end with a mocked
     Web3 and a throwaway keystore; nothing touches a network.
 """
+import contextlib
 import json
 import os
 import sys
@@ -115,6 +116,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import executor.testnet_gate as _gate
 
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
@@ -159,6 +162,32 @@ HOLESKY = 17000
 TWO_CHAIN_ALLOWLIST = {SEPOLIA: "Ethereum Sepolia", HOLESKY: "Holesky"}
 
 
+@contextlib.contextmanager
+def _opted_out():
+    """Controlled environment patch (DSS-WO-ENG-015 R1): the REAL process
+    environment is the ONLY authorization authority, so offline tests
+    simulate the disabled gate by removing the opt-in from os.environ —
+    never by passing an authorization flag through an API."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("DSS_TESTNET_EXEC", None)
+        yield
+
+
+_MODULE_OPT_IN = None
+
+
+def setUpModule():
+    """DSS-WO-ENG-015 R1: the gate reads the REAL process environment at
+    every authorization. The offline suite simulates the explicit testnet
+    opt-in by patching os.environ for this module (controlled environment
+    patching — not an operational interface); disabled-gate tests remove
+    it again via _opted_out()."""
+    global _MODULE_OPT_IN
+    _MODULE_OPT_IN = patch.dict(os.environ, {"DSS_TESTNET_EXEC": "1"}, clear=False)
+    _MODULE_OPT_IN.start()
+    unittest.addModuleCleanup(_MODULE_OPT_IN.stop)
+
+
 def _restricted_write(path: str, data: bytes) -> None:
     with open(path, "wb") as f:
         f.write(data)
@@ -179,11 +208,14 @@ def _tmp_keystore(tmpdir: str, address: str = None):
 
 class TestGateDefaults(unittest.TestCase):
     def test_gate_disabled_by_default(self):
-        cfg = TestnetExecutionConfig.from_env(env={})
-        self.assertFalse(cfg.enabled)
-        with self.assertRaises(TestnetSafetyError) as ctx:
-            cfg.require_ready()
-        self.assertIn("DISABLED", str(ctx.exception))
+        """R1: the gate decision comes from the REAL environment — the
+        configuration object has no `enabled` state at all."""
+        self.assertNotIn("enabled", TestnetExecutionConfig.__dataclass_fields__)
+        with _opted_out():
+            cfg = TestnetExecutionConfig.from_env(env={})
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                cfg.require_ready()
+            self.assertIn("DISABLED", str(ctx.exception))
 
     def test_enabled_without_credentials_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,7 +224,6 @@ class TestGateDefaults(unittest.TestCase):
                 "DSS_TESTNET_RPC_URL": "https://sepolia.example",
             })
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url=cfg.rpc_url,
                 keystore_path=os.path.join(tmp, "missing.json"),
                 passphrase_path=os.path.join(tmp, "missing.pass"),
@@ -206,7 +237,6 @@ class TestGateDefaults(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _tmp_keystore(tmp)
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url="https://x.example",
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -224,9 +254,16 @@ class TestGateDefaults(unittest.TestCase):
             "DSS_TESTNET_RPC_URL": "https://sepolia.example",
             "DSS_TESTNET_ALLOWLIST": "1,2,3",
         })
-        self.assertIsNone(cfg.allowlist)
-        self.assertIs(cfg.effective_allowlist(), ALLOWED_TESTNET_CHAINS)
+        # R1: the config no longer even HAS an allowlist field, and the
+        # opt-in is never taken from the `env` mapping passed to from_env.
+        self.assertNotIn("allowlist", TestnetExecutionConfig.__dataclass_fields__)
+        self.assertIs(_gate.effective_allowlist(), ALLOWED_TESTNET_CHAINS)
         self.assertEqual(cfg.relay_url, "https://relay-sepolia.flashbots.net")
+        with _opted_out():
+            with self.assertRaises(TestnetSafetyError):
+                # DSS_TESTNET_EXEC inside a caller-supplied mapping is NOT
+                # an authority: require_ready reads the REAL environment.
+                cfg.require_ready()
 
     def test_production_guard_untouched(self):
         """EXECUTE_ONCHAIN must remain the separate, unchanged production
@@ -250,10 +287,13 @@ class TestChainIdGate(unittest.TestCase):
             check_chain_id(1)
         self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
 
-    def test_mainnet_rejected_even_on_injected_allowlist(self):
-        """Mainnet can never be smuggled in through a test allowlist."""
-        with self.assertRaises(TestnetSafetyError) as ctx:
-            check_chain_id(1, allowlist=TWO_CHAIN_ALLOWLIST)
+    def test_mainnet_rejected_even_if_the_map_is_patched(self):
+        """Mainnet can never be smuggled in — not even by patching the
+        module map (a controlled mock, DSS-WO-ENG-015 R1: no API accepts
+        an alternative allowlist)."""
+        with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {1: "smuggled mainnet"}):
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                check_chain_id(1)
         self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
 
     def test_unknown_chains_rejected(self):
@@ -270,19 +310,19 @@ class TestChainIdGate(unittest.TestCase):
             check_chain_id(11155111, expected=999999)
         self.assertIn("mismatch", str(ctx.exception))
 
-    def test_injected_allowlist_unexpected_chain_rejected(self):
-        """ENG-004 §6: with a controlled two-chain allowlist, an allowlisted
-        RPC chain that is not the expected one hits the real mismatch
-        branch."""
-        with self.assertRaises(TestnetSafetyError) as ctx:
-            check_chain_id(HOLESKY, expected=SEPOLIA, allowlist=TWO_CHAIN_ALLOWLIST)
+    def test_allowlisted_unexpected_chain_rejected(self):
+        """ENG-004 §6: with the module map controlled-mocked to two chains,
+        an allowlisted RPC chain that is not the expected one hits the real
+        mismatch branch (R1: map patching is a test technique, never an
+        operational interface)."""
+        with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}):
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                check_chain_id(HOLESKY, expected=SEPOLIA)
         self.assertIn("RPC chain mismatch", str(ctx.exception))
 
-    def test_injected_allowlist_expected_chain_accepted(self):
-        self.assertEqual(
-            check_chain_id(HOLESKY, expected=HOLESKY, allowlist=TWO_CHAIN_ALLOWLIST),
-            HOLESKY,
-        )
+    def test_allowlisted_expected_chain_accepted(self):
+        with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}):
+            self.assertEqual(check_chain_id(HOLESKY, expected=HOLESKY), HOLESKY)
 
     def test_allowlist_contains_sepolia_only(self):
         """Initially Sepolia only; any addition requires a documented
@@ -330,12 +370,15 @@ class TestTransactionPolicy(unittest.TestCase):
         self.assertIn("unverified contract targets", str(ctx.exception))
 
     def test_known_target_allowed(self):
+        """R1: no target override exists — tests patch the module map as a
+        controlled mock; production always uses the committed map."""
         contract = "0x" + "cc" * 20
         targets = {11155111: {contract: "reviewed test deployment"}}
-        out = validate_transaction(
-            self.base_tx(to=contract),
-            sender=self.SENDER, chain_id=11155111, known_targets=targets,
-        )
+        with patch.object(_gate, "KNOWN_TARGETS", targets):
+            out = validate_transaction(
+                self.base_tx(to=contract),
+                sender=self.SENDER, chain_id=11155111,
+            )
         self.assertEqual(out["to"], contract)
 
     def test_deployment_rejected(self):
@@ -365,22 +408,26 @@ class TestTransactionPolicy(unittest.TestCase):
     def test_unlimited_approval_rejected(self):
         unlimited = (2**256 - 1).to_bytes(32, "big")
         data = bytes.fromhex("095ea7b3") + b"\x00" * 32 + unlimited  # padded address word + amount
-        with self.assertRaises(TestnetSafetyError) as ctx:
-            validate_transaction(
-                self.base_tx(to="0x" + "cc" * 20, data=data),
-                sender=self.SENDER, chain_id=11155111,
-                known_targets={11155111: {"0x" + "cc" * 20: "token"}},
-            )
+        with patch.object(
+            _gate, "KNOWN_TARGETS", {11155111: {"0x" + "cc" * 20: "token"}},
+        ):
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                validate_transaction(
+                    self.base_tx(to="0x" + "cc" * 20, data=data),
+                    sender=self.SENDER, chain_id=11155111,
+                )
         self.assertIn("approval rejected", str(ctx.exception))
 
     def test_bounded_approval_allowed(self):
         bounded = (10**15).to_bytes(32, "big")
         data = bytes.fromhex("095ea7b3") + b"\x00" * 32 + bounded
-        out = validate_transaction(
-            self.base_tx(to="0x" + "cc" * 20, data=data),
-            sender=self.SENDER, chain_id=11155111,
-            known_targets={11155111: {"0x" + "cc" * 20: "token"}},
-        )
+        with patch.object(
+            _gate, "KNOWN_TARGETS", {11155111: {"0x" + "cc" * 20: "token"}},
+        ):
+            out = validate_transaction(
+                self.base_tx(to="0x" + "cc" * 20, data=data),
+                sender=self.SENDER, chain_id=11155111,
+            )
         self.assertEqual(out["to"], "0x" + "cc" * 20)
 
     def test_chain_id_binding_enforced(self):
@@ -514,7 +561,6 @@ class TestWalletCustody(unittest.TestCase):
         info = _tmp_keystore(tmp)
         return (
             TestnetExecutionConfig(
-                enabled=True,
                 rpc_url="https://sepolia.example",
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -549,7 +595,7 @@ class TestWalletCustody(unittest.TestCase):
             )
             _restricted_write(os.path.join(tmp, "pass"), b"78746573742d70617373706872617365")
             cfg = TestnetExecutionConfig(
-                enabled=True, rpc_url="https://sepolia.example",
+"https://sepolia.example",
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
                 address_path=os.path.join(real_dir, "address"),
@@ -671,15 +717,13 @@ class _RelayStub:
             )
 
 
-def _bundle_cfg(tmp, *, enabled=True, allowlist=None):
+def _bundle_cfg(tmp):
     return TestnetExecutionConfig(
-        enabled=enabled,
         rpc_url="https://sepolia.example",
         keystore_path=os.path.join(tmp, "keystore.json"),
         passphrase_path=os.path.join(tmp, "pass"),
         address_path=os.path.join(tmp, "address"),
         tx_log_path=os.path.join(tmp, "txlog.jsonl"),
-        allowlist=allowlist,
     )
 
 
@@ -799,7 +843,7 @@ def _minted_capability(tmp, *, intent_tx, signed_tx,
     return prepared, relay, acct, cfg
 
 
-def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
+def _prepared_bundle(tmp, relay, *, n_txs=1,
                      fee_price_gwei=2, chain_values=(SEPOLIA,), head=99,
                      purpose="capability session test",
                      rpc_url="https://sepolia.example",
@@ -816,13 +860,11 @@ def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
     info = _tmp_keystore(tmp)
     acct = info["account"]
     cfg = TestnetExecutionConfig(
-        enabled=enabled,
         rpc_url=rpc_url,
         keystore_path=os.path.join(tmp, "keystore.json"),
         passphrase_path=os.path.join(tmp, "pass"),
         address_path=os.path.join(tmp, "address"),
         tx_log_path=os.path.join(tmp, "txlog.jsonl"),
-        allowlist=allowlist,
         relay_url=relay_url,
     )
     w3 = _PrepareW3(chain_values=chain_values, head=head)
@@ -863,8 +905,8 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
                 "executor.testnet_gate.load_agent_wallet",
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
-                with self.assertRaises(TestnetSafetyError) as ctx:
-                    self._prepare(tmp, relay, enabled=False)
+                with _opted_out(), self.assertRaises(TestnetSafetyError) as ctx:
+                    self._prepare(tmp, relay)
             self.assertIn("DISABLED", str(ctx.exception))
             relay.assert_not_called()
 
@@ -899,9 +941,11 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
                 address_path=os.path.join(tmp, "address"),
                 tx_log_path=os.path.join(tmp, "txlog.jsonl"),
             )
-            disabled = TestnetExecutionConfig(enabled=False, **base)
-            # Both transports refuse at the gate, before any signing.
-            with self.assertRaises(TestnetSafetyError) as direct_err:
+            disabled = TestnetExecutionConfig(**base)
+            # Both transports refuse at the gate, before any signing. R1:
+            # the refusal comes from the authoritative REAL environment
+            # read (_opted_out removes the opt-in from os.environ).
+            with _opted_out(), self.assertRaises(TestnetSafetyError) as direct_err:
                 sign_and_submit_testnet_tx(
                     {"to": acct.address, "value": 0, "gas": 21000, "data": b""},
                     purpose="gate parity", config=disabled,
@@ -913,7 +957,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
                 "executor.testnet_gate.load_agent_wallet",
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
-                with self.assertRaises(TestnetSafetyError) as fb_err:
+                with _opted_out(), self.assertRaises(TestnetSafetyError) as fb_err:
                     prepare_flashbots_bundle(
                         [{"to": acct.address, "value": 0}],
                         purpose="gate parity", config=disabled,
@@ -925,7 +969,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
 
             # With the gate enabled, both transports sign with the same
             # wallet — the one bound to the recorded address.
-            enabled = TestnetExecutionConfig(enabled=True, **base)
+            enabled = TestnetExecutionConfig(**base)
             sent = []
 
             class _DirectW3:
@@ -1215,12 +1259,11 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         simulation, then Holesky at submission — the binding refuses."""
         with tempfile.TemporaryDirectory() as tmp:
             relay = _RelayStub(chain_values=(SEPOLIA, SEPOLIA, HOLESKY))
-            session, cfg, _, _ = self._prepare(
-                tmp, relay, allowlist=TWO_CHAIN_ALLOWLIST
-            )
-            session.simulate()
-            with self.assertRaises(TestnetSafetyError) as ctx:
-                session.submit()
+            with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}):
+                session, cfg, _, _ = self._prepare(tmp, relay)
+                session.simulate()
+                with self.assertRaises(TestnetSafetyError) as ctx:
+                    session.submit()
             self.assertIn("RPC chain mismatch", str(ctx.exception))
             self.assertFalse(relay.send_calls)
             self.assertIn("submission_refused", _audit_outcomes(cfg))
@@ -1234,7 +1277,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             relay = _RelayStub(head=99)
             info = _tmp_keystore(tmp)
             acct = info["account"]
-            cfg = _bundle_cfg(tmp, enabled=False)
+            cfg = _bundle_cfg(tmp)
             signed = acct.sign_transaction({
                 "to": acct.address, "value": 0, "gas": 21000,
                 "gasPrice": 10**9, "nonce": 0, "chainId": SEPOLIA,
@@ -1254,8 +1297,8 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             )
             session = FlashbotsBundleSession(relay, prepared)
             session.simulate()  # read-only relay op needs no gate
-            with self.assertRaises(TestnetSafetyError) as ctx:
-                session.submit()
+            with _opted_out(), self.assertRaises(TestnetSafetyError) as ctx:
+                session.submit()  # R1: re-checks the REAL environment
             self.assertIn("DSS_TESTNET_EXEC=1", str(ctx.exception))
             self.assertFalse(relay.send_calls)
             self.assertIn("submission_refused", _audit_outcomes(cfg))
@@ -1471,7 +1514,6 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url="https://sepolia.example",
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -1526,7 +1568,6 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url="https://sepolia.example",
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -2156,7 +2197,6 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
     def _provisioned(self, tmp):
         info = _tmp_keystore(tmp)
         return TestnetExecutionConfig(
-            enabled=True,
             rpc_url="https://sepolia.example",
             keystore_path=os.path.join(tmp, "keystore.json"),
             passphrase_path=os.path.join(tmp, "pass"),
@@ -2196,14 +2236,13 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg, _ = self._provisioned(tmp)
             disabled = TestnetExecutionConfig(
-                enabled=False,
                 rpc_url=cfg.rpc_url,
                 keystore_path=cfg.keystore_path,
                 passphrase_path=cfg.passphrase_path,
                 address_path=cfg.address_path,
             )
             w3 = MagicMock()
-            with self.assertRaises(TestnetSafetyError):
+            with _opted_out(), self.assertRaises(TestnetSafetyError):
                 sign_and_submit_testnet_tx(
                     {"to": None, "value": 0, "gas": 21000, "data": b""},
                     purpose="should never run",
@@ -2233,23 +2272,22 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
         """ENG-004 §6 (replaces the old ineffective test): the REAL mismatch
         branch. The expected chain IS allowlisted (require_ready passes) and
         the RPC reports a DIFFERENT allowlisted chain — the mismatch must
-        fire before wallet signing. Production allowlist is never touched;
-        a controlled allowlist is injected explicitly."""
+        fire before wallet signing. The production map is never changed;
+        the module map is controlled-mocked for this test only (R1)."""
         with tempfile.TemporaryDirectory() as tmp:
             cfg, _ = self._provisioned(tmp)
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url=cfg.rpc_url,
                 keystore_path=cfg.keystore_path,
                 passphrase_path=cfg.passphrase_path,
                 address_path=cfg.address_path,
                 tx_log_path=cfg.tx_log_path,
                 expected_chain_id=SEPOLIA,           # allowlisted → ready
-                allowlist=TWO_CHAIN_ALLOWLIST,       # controlled test injection
             )
             w3 = self._mock_w3()
-            w3.eth.chain_id = HOLESKY                # allowlisted, unexpected
-            with self.assertRaises(TestnetSafetyError) as ctx:
+            w3.eth.chain_id = HOLESKY           # allowlisted (mocked), unexpected
+            with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}), \
+                    self.assertRaises(TestnetSafetyError) as ctx:
                 sign_and_submit_testnet_tx(
                     {"to": None, "value": 0, "gas": 21000, "data": b""},
                     purpose="should never sign",
@@ -2309,17 +2347,16 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg, sender = self._provisioned(tmp)
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url=cfg.rpc_url,
                 keystore_path=cfg.keystore_path,
                 passphrase_path=cfg.passphrase_path,
                 address_path=cfg.address_path,
                 tx_log_path=cfg.tx_log_path,
                 expected_chain_id=SEPOLIA,
-                allowlist=TWO_CHAIN_ALLOWLIST,  # both chains allowlisted
             )
             w3 = self._flipping_w3([SEPOLIA, SEPOLIA, HOLESKY])
-            with self.assertRaises(TestnetSafetyError) as ctx:
+            with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}), \
+                    self.assertRaises(TestnetSafetyError) as ctx:
                 sign_and_submit_testnet_tx(
                     {"to": sender, "value": 0, "gas": 21000, "data": b""},
                     purpose="chain flip must never send",
@@ -2746,7 +2783,6 @@ class TestAccessListPolicyENG007(unittest.TestCase):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url="https://sepolia.example",
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -3047,7 +3083,6 @@ class TestCredentialContainmentENG008(unittest.TestCase):
             info = _tmp_keystore(tmp)
             sender = info["account"].address
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url=CRED_RPC_URL,
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -3266,7 +3301,6 @@ class TestSanitizerCredentialRulesENG008(unittest.TestCase):
 
     def test_registered_secrets_from_config(self):
         cfg = TestnetExecutionConfig(
-            enabled=True,
             rpc_url=CRED_RPC_URL,
             relay_url="https://relay-sepolia.flashbots.net",
         )
@@ -3403,7 +3437,6 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
         info = _tmp_keystore(tmp)
         return (
             TestnetExecutionConfig(
-                enabled=True,
                 rpc_url=CRED_RPC_URL,
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -3622,7 +3655,6 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
         info = _tmp_keystore(tmp)
         return (
             TestnetExecutionConfig(
-                enabled=True,
                 rpc_url=CRED_RPC_URL,
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -3762,7 +3794,6 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
             info = _tmp_keystore(tmp)
             sender = info["account"].address
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url=CRED_RPC_URL,
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -4165,7 +4196,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
 
     def test_registration_includes_short_credentials_and_decoded_forms(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG010_RPC_URL))
+ENG010_RPC_URL))
         for secret in ENG010_REGISTERED:
             self.assertIn(secret, reg)
         # Finding A: an ordinary short username is NOT registered
@@ -4175,7 +4206,6 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
         # Finding A: percent-encoded user information is registered raw
         # AND safely URL-decoded
         pct_cfg = TestnetExecutionConfig(
-            enabled=True,
             rpc_url=(
                 "https://relay-agent:rk%212@relay.sepolia.invalid/v2/submit"
             ),
@@ -4342,7 +4372,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
     def test_percent_encoded_token_raw_form_echoed(self):
         # both forms are registered for the same configured token
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG010_PCT_RPC_URL))
+ENG010_PCT_RPC_URL))
         self.assertIn(ENG010_PCT_TOKEN_RAW, reg)
         self.assertIn(ENG010_PCT_TOKEN_DECODED, reg)
         with tempfile.TemporaryDirectory() as tmp:
@@ -4366,7 +4396,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
 
     def test_short_ordinary_query_value_remains_available(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG010_RPC_URL))
+ENG010_RPC_URL))
         # the ordinary value is not credential material: not registered
         self.assertNotIn(ENG010_ORDINARY_VALUE, reg)
         with tempfile.TemporaryDirectory() as tmp:
@@ -4390,7 +4420,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
 
     def test_ordinary_username_agent_not_individually_redacted(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG010_RPC_URL))
+ENG010_RPC_URL))
         self.assertNotIn("agent", reg)
         # benign diagnostics mentioning the word "agent" survive
         text = "the agent wallet verified; user agent recorded"
@@ -4555,7 +4585,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_encoded_access_token_registered_and_contained_in_per_tx_error(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_ENC_TOKEN_URL))
+ENG011_ENC_TOKEN_URL))
         for secret in ENG011_ENC_TOKEN_REGISTERED:
             self.assertIn(secret, reg)
         # ordinary components stay unregistered
@@ -4603,7 +4633,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_encoded_api_key_contained_in_nested_success_metadata(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_ENC_KEY_URL))
+ENG011_ENC_KEY_URL))
         self.assertIn(ENG011_SHORT_KEY, reg)
         with tempfile.TemporaryDirectory() as tmp:
             session, cfg, relay = self._session(tmp, ENG011_ENC_KEY_URL)
@@ -4643,7 +4673,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
             self.assertTrue(
                 _query_param_name_is_credential(name), f"{name!r} must match")
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_MIXED_URL))
+ENG011_MIXED_URL))
         for secret in ENG011_MIXED_REGISTERED:
             self.assertIn(secret, reg)
         with tempfile.TemporaryDirectory() as tmp:
@@ -4674,7 +4704,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_bare_short_credential_echoed_after_query_decoding(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_PCT_PLUS_URL))
+ENG011_PCT_PLUS_URL))
         # raw AND percent-decoded forms of the same configured token
         self.assertIn(ENG011_PCT_PLUS_RAW, reg)
         self.assertIn(ENG011_PCT_PLUS_DECODED, reg)
@@ -4711,7 +4741,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_form_plus_value_raw_and_form_decoded_forms_protected(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_FORM_URL))
+ENG011_FORM_URL))
         # the literal '+' form and its form-decoded space form are BOTH
         # registered for the same configured credential
         self.assertIn(ENG011_FORM_TOKEN, reg)
@@ -4764,7 +4794,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_encoded_ordinary_name_does_not_trigger_registration(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_ORDINARY_URL))
+ENG011_ORDINARY_URL))
         # the encoded ordinary name resolves to "network" — NOT a
         # credential name — so its short value stays unregistered, as do
         # the other ordinary short values
@@ -4794,7 +4824,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_ordinary_metadata_and_existing_exclusions_preserved(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_ENC_TOKEN_URL))
+ENG011_ENC_TOKEN_URL))
         # existing short-value exclusions stand
         for ordinary in ("agent", ENG011_ORDINARY_VALUE, "v2", "submit"):
             self.assertNotIn(ordinary, reg)
@@ -4836,7 +4866,6 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_encoded_name_on_relay_url_is_registered_and_contained(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True,
             rpc_url="https://sepolia.example",
             relay_url=ENG011_RELAY_URL,
         ))

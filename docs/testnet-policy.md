@@ -20,8 +20,8 @@ this document is met.
 | `EXECUTE_ONCHAIN` remains the production guard and stays `false` | `config.py`; the gate does not read or modify it (asserted by test) |
 | Ethereum mainnet (chain ID 1) is always refused | hard-coded in `check_chain_id` (not configurable) |
 | Unknown chains fail closed | `ALLOWED_TESTNET_CHAINS` is the only authority |
-| Production allowlist is Sepolia-only and never environment-configurable | module constant; tests may inject a controlled allowlist explicitly (see §2); `from_env` cannot set it |
-| Gate disabled unless `DSS_TESTNET_EXEC=1` | `TestnetExecutionConfig.from_env`; EVERY operation that decrypts the wallet and signs — direct RPC and Flashbots preparation alike — requires it (`require_ready`); bundle submission re-checks it inside `FlashbotsBundleSession.submit` (DSS-WO-ENG-005 §2) |
+| Production allowlist is Sepolia-only and never configurable | module constant `ALLOWED_TESTNET_CHAINS`, read directly by every check; NO interface accepts an alternative map (R1); tests controlled-mock the module map (see §2) |
+| Gate disabled unless the REAL process environment carries `DSS_TESTNET_EXEC=1` | `gate_opted_in()` — the single authoritative read of `os.environ` (R1); EVERY operation that decrypts the wallet and signs — direct RPC and Flashbots preparation alike — requires it (`require_ready`); bundle submission re-checks it inside `FlashbotsBundleSession.submit` (DSS-WO-ENG-005 §2). No configuration object, API parameter or injected mapping can enable the gate |
 | Missing RPC / keystore / passphrase / address fails closed | `require_ready` (signing paths) / `require_provisioned` (read-only chain/RPC checks) |
 | ONE wallet-loading path for every signing operation | `load_agent_wallet` (see §3); the Flashbots transport has no wallet logic of its own |
 | Only the sanctioned preparation path creates a submission session | `PreparedFlashbotsBundle` capability minted exclusively by `prepare_flashbots_bundle`; `FlashbotsBundleSession` refuses forged, duck-typed or subclassed objects and re-verifies every binding (wallet identity via signer recovery, chain ID, validated intent, exact signed payload, target block) at construction and before every relay interaction (DSS-WO-ENG-005 §3; DSS-WO-ENG-006 §3) |
@@ -30,7 +30,7 @@ this document is met.
 | Chain ID verified before signing AND immediately before submission | both transports: `sign_and_submit_testnet_tx` and `prepare_flashbots_bundle` + `FlashbotsBundleSession.verify_chain` |
 | No arbitrary EOA transfers | `validate_transaction`: recipient = agent wallet or reviewed target |
 | No unlimited token approvals | approval selectors decoded; amount capped at `MAX_TOKEN_APPROVAL_AMOUNT` |
-| No unverified contract targets | `KNOWN_TARGETS` empty by default; entries require review below |
+| No unverified contract targets | `KNOWN_TARGETS` empty by default; entries require a separately reviewed, explicit code change; NO execution interface accepts a target override (R1) |
 | No contract deployments | empty `to` rejected outright |
 | Value, gas AND monetary fee caps per transaction | `MAX_TESTNET_TX_VALUE_WEI` (0.001 native), `MAX_TESTNET_GAS_UNITS` (500k), plus §4 fee-exposure policy |
 | Aggregate bundle fee exposure within the same cap | `validate_bundle_fee_exposure`: the SUM of worst-case expenditure across a bundle must stay within `MAX_TESTNET_TX_FEE_WEI` (0.002 native), checked BEFORE wallet decryption; values never clipped (DSS-WO-ENG-005 §5) |
@@ -49,13 +49,16 @@ is touched: a documented review of (a) current network health, (b) RPC
 availability and reported chain ID, (c) required contract/protocol
 deployments for the strategies involved, and (d) Coordinator sign-off.
 
-**Test-injected allowlists:** offline tests may pass a controlled allowlist
-explicitly (e.g. Sepolia + Holesky) to exercise the mismatch branch — an
-allowlisted RPC chain that differs from the expected one is rejected before
-wallet signing, and a chain identity change between signing and submission
-prevents sending. This mechanism exists ONLY as an explicit function or
-config argument; the environment can never change the production map, and
-mainnet (1) is rejected even on an injected allowlist.
+**Allowlist isolation (R1).** There is no allowlist parameter anywhere:
+`check_chain_id`, `TestnetExecutionConfig` and the orchestrations take no
+alternative map, so a caller can never expand the live allowlist.
+Deterministic offline testing is preserved by controlled mocks — tests
+patch the module map (`patch.dict(ALLOWED_TESTNET_CHAINS, {...})`) to
+exercise the allowlisted-but-unexpected branch: an allowlisted RPC chain
+that differs from the expected one is rejected before wallet signing, and a
+chain identity change between signing and submission prevents sending.
+Mainnet (1) is rejected even when the mocked map contains it. Map patching
+is a test technique, not an operational interface.
 
 ## 3. Wallet custody (single path)
 
@@ -494,8 +497,7 @@ attempts only when a policy with an audit log is selected.
   ArbExec contract, which is neither the agent wallet nor a reviewed target,
   so the ordinary executor is refused at the transaction policy until the
   Coordinator authorizes a specific target in a separate change. Offline
-  tests may inject a controlled target map explicitly (same mechanism as
-  test-injected allowlists).
+  tests controlled-mock the module map (same technique as the allowlist).
 - Atomic-backrun bundles that front a third-party (victim) transaction are
   refused: the session model binds every bundle transaction to the verified
   agent wallet. Extending the capability model to mixed-signer bundles is a
@@ -504,3 +506,70 @@ attempts only when a policy with an audit log is selected.
   prepared payloads were never submitted (the batch is one combined
   transaction), so preparing them would mint one-use authorizations for
   unused payloads. Batch gas estimates use the detector/optimizer values.
+
+### 8.1 Override isolation (DSS-WO-ENG-015 R1)
+
+The Coordinator's independent review of ENG-015 identified two runtime
+authorization weaknesses caused by test-only configuration overrides being
+exposed through production execution interfaces. R1 eliminates both
+structurally — the override routes no longer exist rather than being
+checked.
+
+**Testnet policy configuration is isolated.** The authorization decision is
+re-derived from the authoritative sources at EVERY check; configuration
+objects carry no authorization state:
+
+- `TestnetExecutionConfig` no longer has an `enabled` field. The explicit
+  opt-in has exactly ONE authority: the REAL process environment, read by
+  `gate_opted_in()` (the only read of `DSS_TESTNET_EXEC` in the repository)
+  inside `require_ready()` and `FlashbotsBundleSession.submit()`. A
+  manually constructed configuration — however it is built — can never
+  authorize execution; replaying the old `TestnetExecutionConfig(enabled=
+  True)` bypass fails at construction with `TypeError`.
+- The allowlist field is gone. `require_provisioned`, `check_chain_id` and
+  both orchestrations read the code-controlled `ALLOWED_TESTNET_CHAINS` map
+  directly; no function, constructor or environment variable accepts an
+  alternative map, so the live allowlist cannot be expanded by a caller.
+- `resolve_execution_policy()` takes no argument: there is no
+  caller-supplied environment injection. `ExecutionAuthorizationBoundary`
+  accepts no `env` either. The optional `policy` wiring argument exists for
+  offline tests only and confers no authorization authority: every policy's
+  `authorize` re-runs the gate's environment-anchored checks.
+- Direct calls to the gate orchestrations cannot bypass the central policy:
+  `config` arguments carry operational endpoints only (RPC URL, secret-store
+  file locations, audit-log path, relay URL) and every authorization-relevant
+  input is re-read from the authoritative sources inside the gate.
+- Offline determinism is preserved through environment patching
+  (`patch.dict(os.environ, ...)`) and controlled mocks of module maps —
+  test techniques, never operational interfaces.
+
+**Known-target injection is removed.** The `known_targets` parameters on
+`AuthorizedExecution.sign_and_submit`, `AuthorizedExecution.prepare_
+flashbots_bundle`, `MEVExecutionService.submit`, the gate orchestrations and
+`validate_transaction`/`validate_bundle` no longer exist: normal execution
+ALWAYS validates recipients against the code-controlled `KNOWN_TARGETS` map
+(still EMPTY). A contract target can only be approved through a separately
+reviewed, explicit code change to that map. Offline tests patch the module
+map as a controlled mock.
+
+**Regression coverage (R1 §3).** `tests/test_execution_authorization.py`
+adds `TestR1EnvironmentAuthority`, `TestR1AllowlistIsolation` and
+`TestR1TargetInjection`: a hand-built fully-provisioned configuration
+refuses without the real-environment opt-in (boundary, gate orchestration
+and `require_ready`); Base/Arbitrum/OP/BNB/Holesky/Polygon are refused even
+when a caller points a configuration at them; Sepolia is pinned as the only
+production-allowlisted testnet; direct gate-orchestration calls cannot
+bypass the central policy (including with `EXECUTE_ONCHAIN=true`);
+runtime callers cannot pass target maps into `AuthorizedExecution` or
+`MEVExecutionService.submit` (`TypeError`) and unapproved recipients are
+refused against the empty production map; the standard application route is
+fully disabled without the real opt-in; and no refusal ever decrypts the
+wallet or broadcasts anything.
+
+**Submission-path audit (R1 §4).** The structural invariant test now greps
+the repository for EVERY broadcast mechanism — `send_raw_transaction`,
+`send_transaction`, `eth_sendRawTransaction`, `eth_sendBundle`,
+`send_bundle` — and asserts only `executor/testnet_gate.py` matches, plus
+asserts no production module issues a send-shaped JSON-RPC method through
+`make_request`. Wallet custody, chain verification, transaction
+restrictions and fee-exposure checks are unchanged.

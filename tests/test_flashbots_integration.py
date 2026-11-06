@@ -90,6 +90,7 @@ passphrase or any alternative wallet: the recorded DSS agent identity
 cannot be bypassed (DSS-WO-ENG-004 §2 reqs 5–6).
 """
 import dataclasses
+import contextlib
 import json
 import os
 import sys
@@ -99,7 +100,32 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import executor.testnet_gate as _gate
+
 from eth_account import Account  # noqa: F401 — throwaway keys for offline tests
+
+@contextlib.contextmanager
+def _opted_out():
+    """Controlled environment patch (DSS-WO-ENG-015 R1): the REAL process
+    environment is the ONLY authorization authority; offline tests simulate
+    the disabled gate by removing the opt-in from os.environ."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("DSS_TESTNET_EXEC", None)
+        yield
+
+
+_MODULE_OPT_IN = None
+
+
+def setUpModule():
+    """DSS-WO-ENG-015 R1: the gate reads the REAL process environment at
+    every authorization; the offline suite simulates the explicit opt-in
+    by patching os.environ for this module."""
+    global _MODULE_OPT_IN
+    _MODULE_OPT_IN = patch.dict(os.environ, {"DSS_TESTNET_EXEC": "1"}, clear=False)
+    _MODULE_OPT_IN.start()
+    unittest.addModuleCleanup(_MODULE_OPT_IN.stop)
+
 
 from executor.testnet_gate import (
     FLASHBOTS_SEPOLIA_RELAY,
@@ -132,7 +158,7 @@ def _skip_reason() -> str | None:
         )
     # Secret store presence + permissions through the gate's custody check.
     # The config carries no RPC URL yet; verify only the secret-store part.
-    probe = TestnetExecutionConfig(enabled=True, rpc_url=None)
+    probe = TestnetExecutionConfig(rpc_url=None)
     try:
         verify_secret_store(probe)
     except TestnetSafetyError as exc:
@@ -148,7 +174,7 @@ def _read_recorded_address(cfg: TestnetExecutionConfig) -> str:
     return cfg.load_agent_address()
 
 
-def _offline_cfg(tmp, *, enabled=True):
+def _offline_cfg(tmp):
     """A fully provisioned offline config with a THROWAWAY wallet."""
     acct = Account.create()
     keystore = Account.encrypt(acct.key, b"throwaway-passphrase")
@@ -162,7 +188,6 @@ def _offline_cfg(tmp, *, enabled=True):
     w(os.path.join(tmp, "pass"), b"throwaway-passphrase".hex().encode())
     w(os.path.join(tmp, "address"), (acct.address + "\n").encode())
     cfg = TestnetExecutionConfig(
-        enabled=enabled,
         rpc_url="https://sepolia.example",
         keystore_path=os.path.join(tmp, "keystore.json"),
         passphrase_path=os.path.join(tmp, "pass"),
@@ -321,7 +346,6 @@ class TestPreparePathOffline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg, acct = self._provisioned(tmp)
             disabled = TestnetExecutionConfig(
-                enabled=False,
                 rpc_url=cfg.rpc_url,
                 keystore_path=cfg.keystore_path,
                 passphrase_path=cfg.passphrase_path,
@@ -333,7 +357,7 @@ class TestPreparePathOffline(unittest.TestCase):
                 "executor.testnet_gate.load_agent_wallet",
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
-                with self.assertRaises(TestnetSafetyError) as ctx:
+                with _opted_out(), self.assertRaises(TestnetSafetyError) as ctx:
                     prepare_flashbots_bundle(
                         [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
                         purpose="must never prepare",
@@ -393,20 +417,21 @@ class TestPreparePathOffline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cfg, acct = self._provisioned(tmp)
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url=cfg.rpc_url,
                 keystore_path=cfg.keystore_path,
                 passphrase_path=cfg.passphrase_path,
                 address_path=cfg.address_path,
                 tx_log_path=cfg.tx_log_path,
                 expected_chain_id=SEPOLIA_CHAIN_ID,
-                # controlled test allowlist; production stays Sepolia-only
-                allowlist={SEPOLIA_CHAIN_ID: "Ethereum Sepolia", 17000: "Holesky"},
             )
             w3 = self._mock_w3()
             w3.eth.chain_id = 17000
             relay = MagicMock()
-            with self.assertRaises(TestnetSafetyError) as ctx:
+            # R1: no allowlist override exists — the module map is
+            # controlled-mocked so Holesky counts as allowlisted-but-
+            # unexpected; this is a test technique, not an interface.
+            with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {17000: "Holesky"}), \
+                    self.assertRaises(TestnetSafetyError) as ctx:
                 prepare_flashbots_bundle(
                     [{"to": acct.address, "value": 0}],
                     purpose="must never prepare",

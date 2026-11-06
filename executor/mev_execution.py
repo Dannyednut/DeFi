@@ -75,14 +75,16 @@ class MEVExecutionService:
         candidate: BundleCandidate,
         *,
         unsigned_searcher_tx: dict,
-        known_targets: dict[int, dict[str, str]] | None = None,
     ) -> RelayResult:
         """Submit a backrun candidate through the authorization boundary.
 
         The searcher transaction must be an UNSIGNED intent dict; it is
         signed exclusively inside the gate's session after the full
         authorization and policy checks. No route exists to hand in
-        pre-signed bytes.
+        pre-signed bytes. There is no ``known_targets`` override: the
+        reviewed-target map is always the gate's code-controlled
+        ``KNOWN_TARGETS`` (DSS-WO-ENG-015 R1), so a caller cannot
+        authorize an arbitrary contract by passing its own map.
         """
         # 1. Authorize through the unified boundary FIRST (fail closed):
         #    explicit testnet opt-in, allowlisted chain, wallet custody.
@@ -113,11 +115,10 @@ class MEVExecutionService:
 
         # 4. Single private transaction via the gate session:
         #    prepare (sign inside the gate) → simulate (mandatory) → submit.
+        #    No target override exists: the gate always validates against
+        #    the code-controlled KNOWN_TARGETS map (DSS-WO-ENG-015 R1).
         try:
-            session = auth.prepare_flashbots_bundle(
-                [unsigned_searcher_tx],
-                known_targets=known_targets,
-            )
+            session = auth.prepare_flashbots_bundle([unsigned_searcher_tx])
             session.simulate()
             submission = session.submit()
         except TestnetSafetyError as exc:

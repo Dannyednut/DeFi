@@ -24,8 +24,33 @@ Design invariants (all fail closed):
     ALLOWED_TESTNET_CHAINS may be used. Initially Sepolia only; adding a
     network requires a documented, individually reviewed change to that
     map (docs/testnet-policy.md records the review requirement). The
-    production allowlist can NEVER be changed from the environment; a
-    controlled allowlist can be injected explicitly by offline tests.
+    production allowlist can NEVER be changed from the environment, from
+    a caller-supplied configuration object or from any API parameter
+    (DSS-WO-ENG-015 R1); offline tests exercise non-Sepolia branches by
+    patching the module map as a controlled mock, which is not an
+    operational interface.
+
+DSS-WO-ENG-015 R1 — authorization inputs are ISOLATED from callers:
+
+  * The explicit testnet opt-in has EXACTLY ONE authority: the REAL
+    process environment (``os.environ``), read by ``gate_opted_in()`` at
+    every authorization. A manually constructed
+    ``TestnetExecutionConfig`` carries no ``enabled`` state and can never
+    authorize anything by itself; only a process whose actual environment
+    contains ``DSS_TESTNET_EXEC=1`` can pass ``require_ready()``.
+  * The production allowlist is the code-controlled
+    ``ALLOWED_TESTNET_CHAINS`` map — Sepolia is its only entry. No
+    configuration object, function argument or environment variable can
+    expand it.
+  * The known contract targets are the code-controlled ``KNOWN_TARGETS``
+    map — deliberately EMPTY. No execution interface accepts a target
+    override; approving a contract requires an explicit, separately
+    reviewed code change.
+  * Offline determinism is preserved through environment patching and
+    controlled mocks (``unittest.mock.patch.dict(os.environ, ...)`` and
+    patching module maps in tests). Test injection is never an
+    operational authorization mechanism: no production-facing interface
+    accepts an opt-in flag, an allowlist or a target map.
   * The RPC-reported chain ID is verified immediately before signing AND
     again immediately before submission (both transports).
   * Missing wallet credentials, RPC configuration or required config is
@@ -149,9 +174,14 @@ MAINNET_CHAIN_ID = 1
 
 # Explicit testnet allowlist. Sepolia only for now. Adding a chain requires
 # a documented network-specific review (status, RPC, contract deployments)
-# recorded in docs/testnet-policy.md BEFORE it is listed here. Offline tests
-# may inject a controlled allowlist via explicit function/config arguments;
-# the production map below can never be altered from the environment.
+# recorded in docs/testnet-policy.md BEFORE it is listed here.
+#
+# DSS-WO-ENG-015 R1: this map is the ONLY allowlist. It can never be
+# altered from the environment, from a caller-supplied configuration
+# object or through any function argument — every authorization check
+# reads it directly. Offline tests that need a second allowlisted chain
+# patch this module attribute as a controlled mock; that is a test
+# technique, not an operational interface.
 ALLOWED_TESTNET_CHAINS: dict[int, str] = {
     11155111: "Ethereum Sepolia",
 }
@@ -226,30 +256,49 @@ class TestnetSafetyError(RuntimeError):
     __test__ = False
 
 
-def effective_allowlist(
-    allowlist: Optional[dict[int, str]] = None,
-) -> dict[int, str]:
-    """Return the allowlist in force: the production map unless a controlled
-    test allowlist was explicitly injected. The environment can never change
-    this."""
-    return ALLOWED_TESTNET_CHAINS if allowlist is None else allowlist
+def gate_opted_in() -> bool:
+    """THE single authoritative read of the explicit testnet opt-in.
+
+    The REAL process environment (``os.environ``) is the only authority
+    for ``DSS_TESTNET_EXEC=1`` (DSS-WO-ENG-015 R1): it is read here, at
+    authorization time, and nowhere else. No configuration object, no
+    caller-supplied mapping and no function argument can enable the gate —
+    a manually constructed ``TestnetExecutionConfig`` therefore can never
+    authorize execution on its own. Offline tests patch ``os.environ``.
+    """
+    return os.environ.get("DSS_TESTNET_EXEC", "") == "1"
+
+
+def effective_allowlist() -> dict[int, str]:
+    """Return the allowlist in force: the code-controlled production map.
+
+    DSS-WO-ENG-015 R1: there is no parameter and no override — every
+    caller gets ``ALLOWED_TESTNET_CHAINS``. The environment can never
+    change this, and no API accepts an alternative map."""
+    return ALLOWED_TESTNET_CHAINS
 
 
 # ── Gate configuration ───────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class TestnetExecutionConfig:
-    """Everything needed to permit ONE testnet execution session.
+    """Operational settings for ONE testnet execution session.
 
-    Built from the environment; `enabled` requires the explicit testnet
-    execution gate flag. All credential paths point into the DSS secret
-    store; the raw key is only ever decrypted in memory by
-    load_agent_wallet. The allowlist and relay URL are NOT environment
-    configurable — changing them is a reviewed code change (offline tests
-    may inject an allowlist explicitly).
+    DSS-WO-ENG-015 R1: this object carries NO authorization state. There
+    is no ``enabled`` flag (the explicit opt-in is read from the REAL
+    process environment by ``gate_opted_in()`` at every authorization)
+    and no ``allowlist`` (the production allowlist is the code-controlled
+    ``ALLOWED_TESTNET_CHAINS`` map, read directly by every check). A
+    manually constructed config can therefore never authorize execution,
+    expand the allowlist or weaken policy — it selects only operational
+    endpoints (RPC URL, secret-store file locations, audit-log path,
+    relay URL) and is still fully subject to every gate check.
+
+    All credential paths point into the DSS secret store; the raw key is
+    only ever decrypted in memory by load_agent_wallet. The relay URL is
+    NOT environment configurable — changing it is a reviewed code change.
     """
 
-    enabled: bool
     rpc_url: Optional[str] = None
     keystore_path: str = DEFAULT_KEYSTORE_PATH
     passphrase_path: str = DEFAULT_PASSPHRASE_PATH
@@ -262,23 +311,26 @@ class TestnetExecutionConfig:
     max_total_fee_wei: int = MAX_TESTNET_TX_FEE_WEI
     tx_log_path: str = DEFAULT_TX_LOG_PATH
     relay_url: str = FLASHBOTS_SEPOLIA_RELAY
-    # Test injection only; from_env never sets it.
-    allowlist: Optional[dict[int, str]] = None
 
     # Not a pytest test class despite the Test prefix.
     __test__ = False
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None) -> "TestnetExecutionConfig":
+        """Build the operational settings from the environment.
+
+        The optional ``env`` mapping exists ONLY so offline tests can
+        construct deterministic configurations; it can never affect the
+        authorization decision: the explicit opt-in is read from the REAL
+        process environment by ``gate_opted_in()`` (never from ``env``),
+        and the allowlist is code-controlled. Production callers use
+        ``from_env()`` with no argument (the real ``os.environ``).
+        """
         e = env if env is not None else os.environ
         return cls(
-            enabled=e.get("DSS_TESTNET_EXEC", "") == "1",
             rpc_url=e.get("DSS_TESTNET_RPC_URL") or None,
             expected_chain_id=int(e.get("DSS_TESTNET_CHAIN_ID", "11155111")),
         )
-
-    def effective_allowlist(self) -> dict[int, str]:
-        return effective_allowlist(self.allowlist)
 
     def require_provisioned(self) -> None:
         """Fail closed unless every required input is present and the
@@ -289,17 +341,24 @@ class TestnetExecutionConfig:
             raise TestnetSafetyError(
                 "DSS_TESTNET_RPC_URL is required when the gate is enabled"
             )
-        if self.expected_chain_id not in self.effective_allowlist():
+        if self.expected_chain_id not in effective_allowlist():
             raise TestnetSafetyError(
                 f"chain {self.expected_chain_id} is not on the testnet allowlist"
             )
         verify_secret_store(self)
 
     def require_ready(self) -> None:
-        """Fail closed unless the gate is explicitly enabled AND every
-        required input is present, the expected chain is allowlisted and
-        the secret store passes custody checks."""
-        if not self.enabled:
+        """Fail closed unless the REAL process environment carries the
+        explicit ``DSS_TESTNET_EXEC=1`` opt-in AND every required input is
+        present, the expected chain is on the code-controlled allowlist
+        and the secret store passes custody checks.
+
+        DSS-WO-ENG-015 R1: the opt-in decision is made from
+        ``gate_opted_in()`` — the authoritative environment read — never
+        from any field of this configuration object, so a manually
+        constructed config can never enable execution.
+        """
+        if not gate_opted_in():
             raise TestnetSafetyError(
                 "testnet execution gate is DISABLED "
                 "(set DSS_TESTNET_EXEC=1 to enable; it is off by default)"
@@ -320,22 +379,21 @@ class TestnetExecutionConfig:
 def check_chain_id(
     chain_id: int,
     expected: Optional[int] = None,
-    allowlist: Optional[dict[int, str]] = None,
 ) -> int:
     """Validate a chain ID against the testnet boundary.
 
     Mainnet is always rejected, unknown chains fail closed, and if an
     `expected` chain is given the reported one must match it exactly.
-    `allowlist` may be injected by offline tests to exercise the
-    allowlisted-but-unexpected branch; production always uses the
-    Sepolia-only map.
+    DSS-WO-ENG-015 R1: the allowlist is ALWAYS the code-controlled
+    production map — there is no parameter through which a caller could
+    widen it (offline tests patch the module map as a controlled mock).
     """
     chain_id = int(chain_id)
     if chain_id == MAINNET_CHAIN_ID:
         raise TestnetSafetyError(
             "DSS testnet execution path refuses Ethereum mainnet (chain ID 1)"
         )
-    chains = effective_allowlist(allowlist)
+    chains = effective_allowlist()
     if chain_id not in chains:
         raise TestnetSafetyError(
             f"chain ID {chain_id} is not on the DSS testnet allowlist "
@@ -616,7 +674,6 @@ def validate_transaction(
     max_fee_per_gas_wei: int = MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
     max_priority_fee_wei: int = MAX_TESTNET_MAX_PRIORITY_FEE_WEI,
     max_total_fee_wei: int = MAX_TESTNET_TX_FEE_WEI,
-    known_targets: Optional[dict[int, dict[str, str]]] = None,
 ) -> dict:
     """Enforce the transaction policy. Returns the tx unchanged if safe.
 
@@ -636,8 +693,15 @@ def validate_transaction(
         missing/negative/malformed/over-cap fee inputs rejected;
       * approval calldata must be bounded (no unlimited allowances);
       * tx chainId, when present, must equal the verified chain ID.
+
+    DSS-WO-ENG-015 R1: the reviewed-target map is ALWAYS the
+    code-controlled ``KNOWN_TARGETS`` — deliberately empty. There is no
+    parameter through which a caller could substitute its own map, so a
+    contract target can only be approved by an explicit, separately
+    reviewed code change. Offline tests patch the module map as a
+    controlled mock.
     """
-    targets = KNOWN_TARGETS if known_targets is None else known_targets
+    targets = KNOWN_TARGETS
 
     # DSS-WO-ENG-007 Finding B (Option A — fail closed): access lists are
     # OUT OF POLICY at this execution boundary. The gate signs only plain
@@ -732,7 +796,6 @@ def validate_bundle(
     max_fee_per_gas_wei: int = MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
     max_priority_fee_wei: int = MAX_TESTNET_MAX_PRIORITY_FEE_WEI,
     max_total_fee_wei: int = MAX_TESTNET_TX_FEE_WEI,
-    known_targets: Optional[dict[int, dict[str, str]]] = None,
 ) -> list[dict]:
     """Apply the same transaction policy to every transaction of a
     Flashbots bundle. One rejected transaction rejects the whole bundle.
@@ -740,7 +803,9 @@ def validate_bundle(
     The AGGREGATE fee exposure across all bundle transactions is
     additionally capped at max_total_fee_wei (DSS-WO-ENG-005 §5) — an
     over-limit bundle is rejected as a whole, before any wallet is
-    decrypted or anything signed.
+    decrypted or anything signed. Like validate_transaction, this
+    ALWAYS uses the code-controlled ``KNOWN_TARGETS`` map
+    (DSS-WO-ENG-015 R1).
     """
     validated: list[dict] = []
     for i, tx in enumerate(unsigned_txs):
@@ -755,7 +820,6 @@ def validate_bundle(
                     max_fee_per_gas_wei=max_fee_per_gas_wei,
                     max_priority_fee_wei=max_priority_fee_wei,
                     max_total_fee_wei=max_total_fee_wei,
-                    known_targets=known_targets,
                 )
             )
         except TestnetSafetyError as exc:
@@ -2077,11 +2141,9 @@ class FlashbotsBundleSession:
 
     def verify_chain(self) -> int:
         """Verify the transport RPC's reported chain ID against the
-        allowlist and the configured expectation."""
+        code-controlled allowlist and the configured expectation."""
         reported = int(self._w3.eth.chain_id)
-        return check_chain_id(
-            reported, self._config.expected_chain_id, self._config.effective_allowlist()
-        )
+        return check_chain_id(reported, self._config.expected_chain_id)
 
     # ── audit ───────────────────────────────────────────────────────────────
 
@@ -2265,7 +2327,7 @@ class FlashbotsBundleSession:
         auth = None
         pending: Optional[TestnetSafetyError] = None
         try:
-            if not self._config.enabled:
+            if not gate_opted_in():  # DSS-WO-ENG-015 R1: real-environment authority
                 raise TestnetSafetyError(
                     "bundle submission requires the testnet execution gate "
                     "(set DSS_TESTNET_EXEC=1); it is off by default"
@@ -2496,12 +2558,13 @@ def _audit_orchestration_refusal(
     exception object unchanged, so the caller raises the exact same refusal
     (same type, same message) — auditing never rewrites a policy verdict.
 
-    Audits only when the gate is ENABLED: an attempt under a disabled gate
-    has no execution context (nothing can decrypt a wallet, sign or
-    submit), so disabled-gate refusals keep their historical no-audit
-    behavior and disabled-by-default runs write nothing.
+    Audits only when the gate is ENABLED (per the authoritative real
+    process environment read, DSS-WO-ENG-015 R1): an attempt under a
+    disabled gate has no execution context (nothing can decrypt a wallet,
+    sign or submit), so disabled-gate refusals keep their historical
+    no-audit behavior and disabled-by-default runs write nothing.
     """
-    if not getattr(cfg, "enabled", False):
+    if not gate_opted_in():
         return exc
     try:
         record_testnet_tx(
@@ -2529,7 +2592,6 @@ def sign_and_submit_testnet_tx(
     purpose: str,
     config: Optional[TestnetExecutionConfig] = None,
     web3_factory: Optional[Callable[[str], object]] = None,
-    known_targets: Optional[dict[int, dict[str, str]]] = None,
     receipt_timeout: int = 120,
 ) -> dict:
     """The ONLY sanctioned path from intention to a live direct-RPC testnet
@@ -2562,6 +2624,13 @@ def sign_and_submit_testnet_tx(
     converted into a transport failure.
 
     Returns the audit record. Never returns or logs key material.
+
+    DSS-WO-ENG-015 R1: the ``config`` argument carries NO authorization
+    state — the explicit opt-in is read from the REAL process environment
+    and the allowlist/target map are code-controlled, so a direct call
+    with a manually constructed configuration cannot bypass the central
+    authorization policy. There is no ``known_targets`` override: the
+    reviewed-target map is always the code-controlled ``KNOWN_TARGETS``.
     """
     cfg = config or TestnetExecutionConfig.from_env()
     try:
@@ -2616,7 +2685,7 @@ def sign_and_submit_testnet_tx(
     if rpc_failure is not None:
         raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
     try:
-        check_chain_id(reported, cfg.expected_chain_id, cfg.effective_allowlist())
+        check_chain_id(reported, cfg.expected_chain_id)  # code-controlled allowlist (R1)
     except TestnetSafetyError as exc:
         raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported)
 
@@ -2643,8 +2712,7 @@ def sign_and_submit_testnet_tx(
             max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
             max_priority_fee_wei=cfg.max_priority_fee_wei,
             max_total_fee_wei=cfg.max_total_fee_wei,
-            known_targets=known_targets,
-        )  # 3b
+        )  # 3b — targets are ALWAYS the code-controlled KNOWN_TARGETS (R1)
         fee_exposure = validate_fee_exposure(
             tx,
             max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
@@ -2686,8 +2754,8 @@ def sign_and_submit_testnet_tx(
         raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
     try:
         check_chain_id(  # still the expected chain immediately before signing
-            reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
-        )
+            reported_now, cfg.expected_chain_id
+        )  # code-controlled allowlist (R1)
     except TestnetSafetyError as exc:
         raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported_now)
     signing_failure: Optional[TestnetSafetyError] = None
@@ -2713,8 +2781,8 @@ def sign_and_submit_testnet_tx(
         raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
     try:
         check_chain_id(  # pre-submission
-            reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
-        )
+            reported_now, cfg.expected_chain_id
+        )  # code-controlled allowlist (R1)
     except TestnetSafetyError as exc:
         raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported_now)
 
@@ -2816,7 +2884,6 @@ def prepare_flashbots_bundle(
     config: Optional[TestnetExecutionConfig] = None,
     web3_factory: Optional[Callable[[str], object]] = None,
     relay_factory: Optional[Callable[[str, object, str], object]] = None,
-    known_targets: Optional[dict[int, dict[str, str]]] = None,
 ) -> "FlashbotsBundleSession":
     """The ONLY sanctioned preparation path for Flashbots bundle operations.
 
@@ -2861,6 +2928,13 @@ def prepare_flashbots_bundle(
     The Flashbots relay never becomes an independent authorization path:
     the session only transports the exact payload that already passed
     every gate above.
+
+    DSS-WO-ENG-015 R1: the ``config`` argument carries NO authorization
+    state — the explicit opt-in is read from the REAL process environment
+    and the allowlist/target map are code-controlled, so a direct call
+    with a manually constructed configuration cannot bypass the central
+    authorization policy. There is no ``known_targets`` override: the
+    reviewed-target map is always the code-controlled ``KNOWN_TARGETS``.
 
     PREFLIGHT CONTAINMENT (DSS-WO-ENG-009 Finding B): EVERY external
     RPC/relay operation of the preparation path — provider construction,
@@ -2930,7 +3004,7 @@ def prepare_flashbots_bundle(
     if rpc_failure is not None:
         raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
     try:
-        check_chain_id(reported, cfg.expected_chain_id, cfg.effective_allowlist())
+        check_chain_id(reported, cfg.expected_chain_id)  # code-controlled allowlist (R1)
     except TestnetSafetyError as exc:
         raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported)
 
@@ -2958,8 +3032,7 @@ def prepare_flashbots_bundle(
             max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
             max_priority_fee_wei=cfg.max_priority_fee_wei,
             max_total_fee_wei=cfg.max_total_fee_wei,
-            known_targets=known_targets,
-        )  # 3b — includes the AGGREGATE bundle fee cap, before wallet decryption
+        )  # 3b — AGGREGATE bundle fee cap; code-controlled targets (R1)
         total_fee_exposure = validate_bundle_fee_exposure(
             validated,
             max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
@@ -2997,8 +3070,8 @@ def prepare_flashbots_bundle(
         raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
     try:
         check_chain_id(  # still the expected chain immediately before signing
-            reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
-        )
+            reported_now, cfg.expected_chain_id
+        )  # code-controlled allowlist (R1)
     except TestnetSafetyError as exc:
         raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported_now)
     signing_failure: Optional[TestnetSafetyError] = None

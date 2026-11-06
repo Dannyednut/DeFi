@@ -51,6 +51,18 @@ Design invariants (all fail closed):
     logger only (this also keeps disabled-by-default runs from writing audit
     files).
 
+DSS-WO-ENG-015 R1 — authorization inputs are isolated from callers: the
+explicit opt-in has exactly ONE authority (the REAL process environment,
+read by the gate's ``gate_opted_in()`` at every authorization), the
+allowlist is the code-controlled ``ALLOWED_TESTNET_CHAINS`` map, and the
+reviewed-target map is the code-controlled ``KNOWN_TARGETS``. Neither
+this module's API nor the gate orchestrations accept an opt-in flag, an
+allowlist, a target map or a caller-supplied environment: a manually
+constructed policy/config object selects operational endpoints only and
+re-derives every authorization decision from the authoritative sources
+inside the gate. Offline tests use environment patching and controlled
+mocks, which are not operational interfaces.
+
 HONEST BOUNDARY (inherited from executor/testnet_gate.py): this is an
 application-level boundary for the agent's own code paths. Arbitrary hostile
 code executing inside the same interpreter can defeat Python-level
@@ -72,6 +84,7 @@ from .testnet_gate import (
     TestnetSafetyError,
     _sanitize_error,
     _registered_secrets,
+    gate_opted_in,
     prepare_flashbots_bundle,
     record_testnet_tx,
     sign_and_submit_testnet_tx,
@@ -153,11 +166,14 @@ class TestnetExecutionPolicy(ExecutionPolicy):
     """The explicitly authorized Sepolia testnet policy.
 
     Every authorization runs the gate's ``require_ready`` — the explicit
-    ``DSS_TESTNET_EXEC=1`` opt-in, allowlist membership of the expected
-    chain and the full secret-store custody checks — and additionally
-    requires the requested runtime chain to equal the policy's configured
-    chain. The gate then re-verifies the RPC-reported chain ID before
-    signing and before submission."""
+    ``DSS_TESTNET_EXEC=1`` opt-in read from the REAL process environment
+    (DSS-WO-ENG-015 R1: a policy object, however it was constructed,
+    confers NO authorization authority of its own — the gate re-derives
+    the decision from the authoritative sources at every call),
+    allowlist membership of the expected chain in the code-controlled
+    production map and the full secret-store custody checks. The gate
+    then re-verifies the RPC-reported chain ID before signing and before
+    submission."""
 
     # Not a pytest test class despite the Test prefix.
     __test__ = False
@@ -232,30 +248,33 @@ class ProductionExecutionPolicy(ExecutionPolicy):
         return "production execution policy is disabled"
 
 
-def resolve_execution_policy(env: Optional[dict] = None) -> ExecutionPolicy:
+def resolve_execution_policy() -> ExecutionPolicy:
     """THE single authoritative policy-selection point.
 
-    Reads only the execution-gate variables via the gate's own
-    ``TestnetExecutionConfig.from_env``:
+    DSS-WO-ENG-015 R1: this function takes NO argument — there is no
+    caller-supplied environment injection. It reads the REAL process
+    environment through the gate's own authoritative primitives:
 
-      * ``DSS_TESTNET_EXEC=1`` (+ ``DSS_TESTNET_RPC_URL``, optionally
-        ``DSS_TESTNET_CHAIN_ID``) selects the Sepolia testnet policy;
+      * ``gate_opted_in()`` — the only read of ``DSS_TESTNET_EXEC=1`` —
+        selects the Sepolia testnet policy (with ``DSS_TESTNET_RPC_URL``
+        and optionally ``DSS_TESTNET_CHAIN_ID`` supplying the operational
+        endpoints via ``TestnetExecutionConfig.from_env()``);
       * anything else selects the disabled policy.
 
     ``EXECUTE_ONCHAIN`` is read ONLY to emit an explicit warning that it
     cannot authorize execution. ``CHAIN_ID`` is never read here at all:
-    network selection is not execution authorization.
+    network selection is not execution authorization. A manually
+    constructed policy or configuration object cannot bypass this: every
+    policy's ``authorize`` re-runs the gate's environment-anchored checks.
     """
-    e = env if env is not None else os.environ
-    if str(e.get("EXECUTE_ONCHAIN", "false")).lower() == "true":
+    if str(os.environ.get("EXECUTE_ONCHAIN", "false")).lower() == "true":
         log.warning(
             "EXECUTE_ONCHAIN=true requested, but no production execution "
             "policy exists: the unified authorization boundary refuses "
             "production/mainnet execution regardless of this switch"
         )
-    cfg = TestnetExecutionConfig.from_env(env)
-    if cfg.enabled:
-        return TestnetExecutionPolicy(cfg)
+    if gate_opted_in():
+        return TestnetExecutionPolicy(TestnetExecutionConfig.from_env())
     return DisabledExecutionPolicy()
 
 
@@ -286,24 +305,24 @@ class AuthorizedExecution:
         self,
         tx: dict,
         *,
-        known_targets: Optional[dict[int, dict[str, str]]] = None,
         receipt_timeout: int = 120,
         web3_factory: Optional[Callable[[str], Any]] = None,
     ) -> dict:
         """THE only direct-RPC signing-and-submission route.
 
-        Delegates to the gate orchestration: gate enablement, RPC chain
-        verification (before signing AND before submission), transaction
-        policy, wallet custody binding, submission, receipt and audit.
-        Returns the gate's audit record; raises ``TestnetSafetyError`` on
-        any refusal or failure. Signed raw bytes never leave the gate.
+        Delegates to the gate orchestration: real-environment opt-in, RPC
+        chain verification (before signing AND before submission),
+        transaction policy (against the code-controlled ``KNOWN_TARGETS``
+        map — there is no target override, DSS-WO-ENG-015 R1), wallet
+        custody binding, submission, receipt and audit. Returns the gate's
+        audit record; raises ``TestnetSafetyError`` on any refusal or
+        failure. Signed raw bytes never leave the gate.
         """
         return sign_and_submit_testnet_tx(
             tx,
             purpose=self.purpose,
             config=self.config,
             web3_factory=web3_factory,
-            known_targets=known_targets,
             receipt_timeout=receipt_timeout,
         )
 
@@ -311,16 +330,17 @@ class AuthorizedExecution:
         self,
         unsigned_txs: Sequence[dict],
         *,
-        known_targets: Optional[dict[int, dict[str, str]]] = None,
         web3_factory: Optional[Callable[[str], Any]] = None,
         relay_factory: Optional[Callable[[str, Any, str], Any]] = None,
     ) -> Any:
         """THE only Flashbots bundle preparation route.
 
-        Delegates to the gate: same explicit gate, chain verification,
-        transaction policy (including the aggregate bundle fee cap), wallet
-        custody binding and signing. Returns ONLY the controlled
-        ``FlashbotsBundleSession`` — signed raw bytes never leave the gate.
+        Delegates to the gate: same real-environment opt-in, chain
+        verification, transaction policy (including the aggregate bundle
+        fee cap and the code-controlled ``KNOWN_TARGETS`` map — there is
+        no target override, DSS-WO-ENG-015 R1), wallet custody binding and
+        signing. Returns ONLY the controlled ``FlashbotsBundleSession`` —
+        signed raw bytes never leave the gate.
         """
         return prepare_flashbots_bundle(
             [dict(t) for t in unsigned_txs],
@@ -328,7 +348,6 @@ class AuthorizedExecution:
             config=self.config,
             web3_factory=web3_factory,
             relay_factory=relay_factory,
-            known_targets=known_targets,
         )
 
 
@@ -351,10 +370,20 @@ class ExecutionAuthorizationBoundary:
     def __init__(
         self,
         policy: Optional[ExecutionPolicy] = None,
-        env: Optional[dict] = None,
     ):
+        """Wire the boundary.
+
+        DSS-WO-ENG-015 R1: there is NO caller-supplied environment —
+        policy resolution without an explicit policy ALWAYS reads the
+        REAL process environment via ``resolve_execution_policy()``. The
+        optional ``policy`` argument exists for offline-test wiring only;
+        it confers no authorization authority: every policy's
+        ``authorize`` re-derives the decision from the authoritative
+        sources (real-environment opt-in, code-controlled allowlist, real
+        wallet custody) inside the gate at every call.
+        """
         self._policy = (
-            policy if policy is not None else resolve_execution_policy(env)
+            policy if policy is not None else resolve_execution_policy()
         )
 
     @property
@@ -429,7 +458,7 @@ class ExecutionAuthorizationBoundary:
             exc,
         )
         cfg = getattr(self._policy, "config", None)
-        if cfg is None or not getattr(cfg, "enabled", False):
+        if cfg is None or not gate_opted_in():
             return
         try:
             record_testnet_tx(

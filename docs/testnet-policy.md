@@ -259,6 +259,29 @@ strings, long hex blobs) are unchanged, and legitimate relay metadata —
 hashes, gas figures, statuses — is preserved: responses are redacted,
 never discarded.
 
+**Registered-secrets scope (DSS-WO-ENG-010 Findings A–C; DSS-WO-ENG-011).**
+The registered credential material is widened honestly, not blanketly.
+The complete URL user-information pair AND the password itself are
+registered regardless of length (an ordinary short username such as
+`agent` is NOT registered individually). Any query parameter whose NAME
+clearly indicates credential material — `token`, `api_key`/`api-key`/
+`apikey`, `access_key`, `secret`, `password`/`passwd`/`pwd`,
+`passphrase`, `authorization`, `auth` (exact match only),
+`credential(s)`, and compound names ending in an unambiguous credential
+noun — has its value registered regardless of length. Parameter names
+are percent-decoded safely BEFORE classification (DSS-WO-ENG-011), so an
+encoded name (`access%5Ftoken`, `api%2Dkey`, a mixed-case encoded name)
+is recognized exactly like its decoded form, while an ordinary name
+containing encoded characters (`net%77ork` → `network`, `%76%32` →
+`v2`) still matches nothing and its value stays available. Registered
+values are held in their raw, percent-decoded and form-decoded (`+` as
+space) forms, so either echo shape is contained. Long path-embedded
+provider keys keep the >=16-character rule; ordinary short query values
+(network names, environment labels, project identifiers) and short
+route components (`v2`) remain unregistered — legitimate relay metadata
+is preserved, not discarded, and benign diagnostics are not over-
+redacted.
+
 **Access-list policy (DSS-WO-ENG-007 Finding B — Option A, fail closed;
 type consistency per DSS-WO-ENG-008 Finding B).** The supported
 transaction policy covers plain legacy and EIP-1559 value-and-calldata

@@ -880,6 +880,14 @@ def _sanitize_error(message: object, *forbidden: str) -> str:
 # "auth" is matched EXACTLY only, so an ordinary word ending in "-auth"
 # cannot trigger registration. Ordinary non-sensitive parameters
 # (network=, env=, project=, chainid=, v2=, ...) match none of these.
+#
+# DSS-WO-ENG-011: normal URL query parsing resolves percent escapes in
+# parameter names (`access%5Ftoken` → `access_token`, `api%2Dkey` →
+# `api-key`), so each name is classified in its raw form TOGETHER with
+# its safely percent-decoded and form-decoded forms. Decoding widens
+# recognition — it never creates registration on its own: an ordinary
+# name that merely CONTAINS encoded characters (`net%77ork` → `network`,
+# `%76%32` → `v2`) still matches nothing.
 _CRED_QUERY_PARAM_NAMES = frozenset({
     "token", "apikey", "accesskey", "secret", "password", "passwd",
     "pwd", "passphrase", "authorization", "auth", "credential",
@@ -891,30 +899,69 @@ _CRED_QUERY_PARAM_SUFFIXES = (
 )
 
 
+def _safely_unquote(raw: str) -> str:
+    """Percent-decode a raw query-string token (a parameter NAME or a
+    VALUE); any malformed escape or decoding failure leaves the raw
+    text unchanged (DSS-WO-ENG-011)."""
+    try:
+        return urllib.parse.unquote(raw, errors="replace")
+    except Exception:
+        return raw
+
+
+def _safely_unquote_plus(raw: str) -> str:
+    """Form-decode a raw query-string token (percent-escapes AND '+' as
+    a space, the way HTML form decoding treats query strings); any
+    failure leaves the raw text unchanged (DSS-WO-ENG-011)."""
+    try:
+        return urllib.parse.unquote_plus(raw, errors="replace")
+    except Exception:
+        return raw
+
+
 def _query_param_name_is_credential(name: object) -> bool:
     """True when a query-parameter NAME clearly indicates credential
-    material (DSS-WO-ENG-010 Finding B): case-insensitive and
-    separator-insensitive exact names (`token`, `api_key`/`api-key`/
-    `apikey`/`apiKey`, `access_key`, `secret`, `password`/`passwd`/`pwd`,
-    `passphrase`, `authorization`, `auth`, `credential`/`credentials`)
-    plus compound names ending in an unambiguous credential noun
-    (`access_token`, `client_secret`, `auth_token`, ...). Ordinary names
-    — network, environment, project or route identifiers — never match."""
+    material (DSS-WO-ENG-010 Finding B; encoded-name recognition per
+    DSS-WO-ENG-011): case-insensitive and separator-insensitive exact
+    names (`token`, `api_key`/`api-key`/`apikey`/`apiKey`, `access_key`,
+    `secret`, `password`/`passwd`/`pwd`, `passphrase`, `authorization`,
+    `auth`, `credential`/`credentials`) plus compound names ending in an
+    unambiguous credential noun (`access_token`, `client_secret`,
+    `auth_token`, ...). Ordinary names — network, environment, project
+    or route identifiers — never match.
+
+    The exact-name and compound-suffix rules are unchanged; they are now
+    applied to the raw name AND to its safely percent-decoded and
+    form-decoded forms, because normal query parsing resolves
+    `access%5Ftoken` to `access_token` and `api%2Dkey` to `api-key`.
+    A name is accepted only when one of those forms matches a credential
+    rule: an ordinary name containing encoded characters (`net%77ork`,
+    `pro%6Aect`, `%76%32`) still never matches."""
     if not isinstance(name, str):
         return False
-    normalized = re.sub(r"[\s_\-]+", "", name).lower()
-    if not normalized:
-        return False
-    return normalized in _CRED_QUERY_PARAM_NAMES or normalized.endswith(
-        _CRED_QUERY_PARAM_SUFFIXES
-    )
+    seen = set()
+    for candidate in (
+        name, _safely_unquote(name), _safely_unquote_plus(name),
+    ):
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized = re.sub(r"[\s_\-]+", "", candidate).lower()
+        if not normalized:
+            continue
+        if normalized in _CRED_QUERY_PARAM_NAMES or normalized.endswith(
+            _CRED_QUERY_PARAM_SUFFIXES
+        ):
+            return True
+    return False
 
 
 def _registered_secrets(config: object) -> tuple:
     """Exact credential strings tied to THIS configuration that must
     never reach a caller-visible exception or the audit log (DSS-WO-ENG-
     008 Finding A; short-credential and encoded-value containment per
-    DSS-WO-ENG-010 Findings A–C): the configured RPC and relay URLs
+    DSS-WO-ENG-010 Findings A–C; encoded-name and form-decoded-value
+    containment per DSS-WO-ENG-011): the configured RPC and relay URLs
     verbatim plus their credential-bearing components.
 
     Components EXPLICITLY identified as credentials by the URL structure
@@ -932,11 +979,17 @@ def _registered_secrets(config: object) -> tuple:
       * Finding B (credential-bearing query parameters): the value of
         any query parameter whose NAME clearly indicates credential
         material (case-insensitive, separator-variant and compound
-        matching — see _query_param_name_is_credential), raw and
-        percent-decoded. Ordinary non-sensitive query values (network
-        names, environment labels, project identifiers) are NOT newly
-        registered; the existing >=16-character rule for them is
-        preserved so no protection is weakened;
+        matching — see _query_param_name_is_credential), raw,
+        percent-decoded and form-decoded. Parameter NAMES are decoded
+        safely BEFORE classification (DSS-WO-ENG-011): normal query
+        parsing resolves `access%5Ftoken` to `access_token` and
+        `api%2Dkey` to `api-key`, so a short credential attached to an
+        encoded name cannot escape registration — while an ordinary
+        name containing encoded characters (`net%77ork` → `network`)
+        still matches nothing. Ordinary non-sensitive query values
+        (network names, environment labels, project identifiers) are
+        NOT newly registered; the existing >=16-character rule for them
+        is preserved so no protection is weakened;
       * Finding C (URL path components): the existing >=16-character
         protection for long path-embedded provider keys is PRESERVED
         (registering every short route component such as "v2" would
@@ -945,11 +998,18 @@ def _registered_secrets(config: object) -> tuple:
 
     def _register(value: str) -> None:
         """Register a credential value in its raw form AND its safely
-        URL-decoded form (identical when no percent-encoding is
-        present); both are deduplicated."""
+        percent-decoded and form-decoded forms (identical when no
+        percent-encoding or '+' is present); all forms are deduplicated
+        (form-decoded variant per DSS-WO-ENG-011, because query/form
+        decoding treats '+' as a space and either representation can be
+        echoed back)."""
         if not value:
             return
-        for form in (value, urllib.parse.unquote(value)):
+        for form in (
+            value,
+            _safely_unquote(value),
+            _safely_unquote_plus(value),
+        ):
             if form and form not in secrets:
                 secrets.append(form)
 
@@ -976,7 +1036,11 @@ def _registered_secrets(config: object) -> tuple:
         for segment in parts.path.split("/"):
             if segment and len(segment) >= 16:
                 _register(segment)
-        # Finding B: credential-bearing query parameters.
+        # Finding B: credential-bearing query parameters. The NAME is
+        # decoded safely inside the classifier (DSS-WO-ENG-011), so an
+        # encoded credential name (`access%5Ftoken`, `api%2Dkey`) is
+        # recognized while an encoded ordinary name (`net%77ork`) is
+        # still never registered.
         for pair in parts.query.split("&"):
             if not pair:
                 continue

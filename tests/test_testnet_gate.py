@@ -4397,6 +4397,441 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
             evaluate_bundle_simulation(sim, forbidden=ENG010_REGISTERED)
         _assert_exception_clean(self, ctx.exception, ENG010_REGISTERED)
 
+# ── DSS-WO-ENG-011: encoded query-parameter name containment ────────────────
+#
+# All credentials below are FABRICATED and every host is a reserved
+# *.invalid name; no live provider, relay, wallet or RPC is contacted.
+
+ENG011_SHORT_TOKEN = "kx42"    # fabricated, 4 chars — bare-short, non-hex
+ENG011_SHORT_KEY = "sk1"       # fabricated, 3 chars
+ENG011_MIXED_TOKEN = "t9xq"    # fabricated, 4 chars
+ENG011_PASSWORD = "pw99!"      # fabricated, 5 chars (as ENG-010)
+ENG011_ORDINARY_VALUE = "zone"  # short NON-credential query value
+ENG011_FORM_TOKEN = "ab+cd"    # fabricated; literal '+' form-decodes to "ab cd"
+ENG011_FORM_DECODED = "ab cd"
+ENG011_PCT_PLUS_RAW = "t%2Bk9"     # fabricated; percent-encoded '+'
+ENG011_PCT_PLUS_DECODED = "t+k9"   # percent-decoded form ('%2B' → literal '+')
+
+ENG011_ENC_TOKEN_URL = (
+    "https://agent:" + ENG011_PASSWORD
+    + "@rpc.sepolia.invalid/v2/submit"
+    + "?access%5Ftoken=" + ENG011_SHORT_TOKEN
+    + "&network=" + ENG011_ORDINARY_VALUE
+)
+ENG011_ENC_TOKEN_REGISTERED = (
+    ENG011_ENC_TOKEN_URL,                  # the full credential-bearing URL
+    "agent:" + ENG011_PASSWORD,            # the complete user-information pair
+    ENG011_PASSWORD,                       # the password, regardless of length
+    ENG011_SHORT_TOKEN,                    # value behind the ENCODED name
+)
+
+ENG011_ENC_KEY_URL = (
+    "https://agent:" + ENG011_PASSWORD
+    + "@rpc.sepolia.invalid/v2/submit"
+    + "?api%2Dkey=" + ENG011_SHORT_KEY
+)
+
+ENG011_MIXED_URL = (
+    "https://agent:" + ENG011_PASSWORD
+    + "@rpc.sepolia.invalid/v2/submit"
+    + "?Access%2DToken=" + ENG011_MIXED_TOKEN
+)
+ENG011_MIXED_REGISTERED = (
+    ENG011_MIXED_URL,
+    "agent:" + ENG011_PASSWORD,
+    ENG011_PASSWORD,
+    ENG011_MIXED_TOKEN,
+)
+
+ENG011_FORM_URL = (
+    "https://agent:" + ENG011_PASSWORD
+    + "@rpc.sepolia.invalid/v2/submit"
+    + "?access%5Ftoken=" + ENG011_FORM_TOKEN
+)
+
+ENG011_PCT_PLUS_URL = (
+    "https://agent:" + ENG011_PASSWORD
+    + "@rpc.sepolia.invalid/v2/submit"
+    + "?access%5Ftoken=" + ENG011_PCT_PLUS_RAW
+)
+
+ENG011_ORDINARY_URL = (
+    "https://agent:" + ENG011_PASSWORD
+    + "@rpc.sepolia.invalid/v2/submit"
+    + "?net%77ork=" + ENG011_ORDINARY_VALUE + "&env=dev"
+)
+
+ENG011_RELAY_KEY = "rk9q"      # fabricated, 4 chars
+ENG011_RELAY_URL = (
+    "https://relay.sepolia.invalid/v1/bundle?api%2Dkey=" + ENG011_RELAY_KEY
+)
+
+
+class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
+    """DSS-WO-ENG-011: percent-encoded query-parameter NAMES are decoded
+    safely BEFORE credential classification, so a short credential whose
+    parameter name arrives encoded (`access%5Ftoken`, `api%2Dkey`, a
+    mixed-case encoded name) is registered REGARDLESS of length and
+    contained from every caller-visible surface — the exception string,
+    representation and arguments, the formatted traceback, the
+    cause/context chain, the audit JSONL and the returned
+    simulation/submission response objects. Values are registered raw,
+    percent-decoded AND form-decoded, so a bare short credential echoed
+    after query decoding and a form-style '+' representation are both
+    contained. An ordinary name containing encoded characters
+    (`net%77ork`) triggers nothing: ordinary short query values, the
+    username "agent" and route components stay available, existing
+    short-value exclusions stand and legitimate relay metadata
+    survives."""
+
+    def _session(self, tmp, rpc_url, relay_url=None):
+        relay = _RelayStub(head=99)
+        session, cfg, target, acct = _prepared_bundle(
+            tmp, relay, rpc_url=rpc_url,
+            **({"relay_url": relay_url} if relay_url else {}))
+        return session, cfg, relay
+
+    # ── classifier scope: encoded names in and out of scope ──────────────
+
+    def test_encoded_credential_names_are_classified_as_credentials(self):
+        # encoded separators, encoded underscores and encoded letters all
+        # resolve to credential names after safe decoding
+        for name in (
+            "access%5Ftoken",       # encoded underscore
+            "api%2Dkey",            # encoded hyphen
+            "API%5FKey",            # mixed case + encoded underscore
+            "Access%2DToken",       # mixed case + encoded hyphen
+            "pass%77ord",           # encoded letter ('w')
+            "%74oken",              # encoded first letter ('t')
+            "client%5Fsecret",      # encoded compound credential noun
+            "auth%5Ftoken",
+            "token",                # unchanged control (raw match)
+            "api_key",
+        ):
+            self.assertTrue(
+                _query_param_name_is_credential(name), f"{name!r} must match")
+        # ordinary names with encoded characters still never match
+        for name in (
+            "net%77ork",            # decodes to "network" — NOT a credential
+            "pro%6Aect",            # decodes to "project"
+            "%76%32",               # decodes to "v2"
+            "chain%2Did",           # decodes to "chain-id"
+            "env", "label", "region", "network", "v2",
+            "%20",                  # whitespace-only after decoding
+        ):
+            self.assertFalse(
+                _query_param_name_is_credential(name),
+                f"{name!r} must NOT match")
+
+    # ── work order regression 1: `access%5Ftoken` with a short token ─────
+
+    def test_encoded_access_token_registered_and_contained_in_per_tx_error(self):
+        reg = _registered_secrets(TestnetExecutionConfig(
+            enabled=True, rpc_url=ENG011_ENC_TOKEN_URL))
+        for secret in ENG011_ENC_TOKEN_REGISTERED:
+            self.assertIn(secret, reg)
+        # ordinary components stay unregistered
+        for ordinary in ("agent", ENG011_ORDINARY_VALUE, "v2", "submit",
+                         "network"):
+            self.assertNotIn(ordinary, reg)
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp, ENG011_ENC_TOKEN_URL)
+            relay._sim_result = {
+                "result": {"results": [
+                    {
+                        "txHash": "0x" + "ee" * 32,
+                        "gasUsed": 21000,
+                        "error": "execution reverted: "
+                                 + ENG011_SHORT_TOKEN,
+                    },
+                ]},
+            }
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, ENG011_ENC_TOKEN_REGISTERED)
+            # classification and retained relay text preserved (sanitized)
+            self.assertIn("simulation: bundle tx[0] would fail", str(exc))
+            self.assertIn("execution reverted", str(exc))
+            # proof the containment came from the NEW encoded-name
+            # registration: the structural rules alone do NOT catch a
+            # bare 4-char token
+            self.assertIn(
+                ENG011_SHORT_TOKEN,
+                _sanitize_error("x " + ENG011_SHORT_TOKEN),
+            )
+            # audit JSONL clean; outcome preserved
+            recs = _read_audit(cfg.tx_log_path)
+            self.assertEqual(
+                [r["outcome"] for r in recs], ["simulation_failed"])
+            for secret in ENG011_ENC_TOKEN_REGISTERED:
+                self.assertNotIn(secret, json.dumps(recs))
+            # a failed simulation authorizes nothing (unchanged)
+            with self.assertRaises(TestnetSafetyError):
+                session.submit()
+            self.assertEqual(relay.send_calls, [])
+
+    # ── work order regression 2: `api%2Dkey` with a short key ────────────
+
+    def test_encoded_api_key_contained_in_nested_success_metadata(self):
+        reg = _registered_secrets(TestnetExecutionConfig(
+            enabled=True, rpc_url=ENG011_ENC_KEY_URL))
+        self.assertIn(ENG011_SHORT_KEY, reg)
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp, ENG011_ENC_KEY_URL)
+            relay._sim_result = dict(
+                _ok_simulation(),
+                debug={"note": "served by " + ENG011_SHORT_KEY},
+            )
+            out = session.simulate()
+            blob = json.dumps(out)
+            for secret in (ENG011_ENC_KEY_URL, ENG011_PASSWORD,
+                           ENG011_SHORT_KEY, "agent:" + ENG011_PASSWORD):
+                self.assertNotIn(secret, blob)
+            self.assertEqual(
+                out["debug"]["note"], "served by <redacted>")
+            # legitimate relay metadata and ordinary fields intact
+            self.assertEqual(out["bundleHash"], "0x" + "cd" * 32)
+            self.assertEqual(out["totalGasUsed"], 21000)
+            self.assertEqual(out["results"][0]["gasUsed"], 21000)
+            # audit clean, success outcome preserved
+            recs = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in recs], ["simulated"])
+            for secret in (ENG011_ENC_KEY_URL, ENG011_PASSWORD,
+                           ENG011_SHORT_KEY):
+                self.assertNotIn(secret, json.dumps(recs))
+            # the submission response object is scrubbed the same way
+            out_submit = session.submit()
+            self.assertEqual(out_submit["audit"]["outcome"], "accepted")
+            for secret in (ENG011_ENC_KEY_URL, ENG011_PASSWORD,
+                           ENG011_SHORT_KEY):
+                self.assertNotIn(
+                    secret, json.dumps(out_submit["relay_result"]))
+
+    # ── work order regression 3: mixed-case encoded credential name ──────
+
+    def test_mixed_case_encoded_credential_name_registered_and_contained(self):
+        for name in ("Access%2DToken", "API%5FKey", "ACC%45SS%5FTOKEN"):
+            self.assertTrue(
+                _query_param_name_is_credential(name), f"{name!r} must match")
+        reg = _registered_secrets(TestnetExecutionConfig(
+            enabled=True, rpc_url=ENG011_MIXED_URL))
+        for secret in ENG011_MIXED_REGISTERED:
+            self.assertIn(secret, reg)
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp, ENG011_MIXED_URL)
+            relay._sim_result = {
+                "result": {"results": [
+                    {
+                        "txHash": "0x" + "ee" * 32,
+                        "gasUsed": 21000,
+                        "error": "upstream rejected key "
+                                 + ENG011_MIXED_TOKEN,
+                    },
+                ]},
+            }
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(self, exc, ENG011_MIXED_REGISTERED)
+            self.assertIn("upstream rejected key", str(exc))
+            recs = _read_audit(cfg.tx_log_path)
+            self.assertEqual(
+                [r["outcome"] for r in recs], ["simulation_failed"])
+            for secret in ENG011_MIXED_REGISTERED:
+                self.assertNotIn(secret, json.dumps(recs))
+
+    # ── work order regression 4: bare short credential echoed after ──────
+    # query decoding (percent-encoded '+' value, decoded echo)
+
+    def test_bare_short_credential_echoed_after_query_decoding(self):
+        reg = _registered_secrets(TestnetExecutionConfig(
+            enabled=True, rpc_url=ENG011_PCT_PLUS_URL))
+        # raw AND percent-decoded forms of the same configured token
+        self.assertIn(ENG011_PCT_PLUS_RAW, reg)
+        self.assertIn(ENG011_PCT_PLUS_DECODED, reg)
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp, ENG011_PCT_PLUS_URL)
+            relay._sim_result = {
+                "result": {"results": [
+                    {
+                        "txHash": "0x" + "ee" * 32,
+                        "gasUsed": 21000,
+                        "error": "quote rejected: "
+                                 + ENG011_PCT_PLUS_DECODED,
+                    },
+                ]},
+            }
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            exc = ctx.exception
+            _assert_exception_clean(
+                self, exc,
+                (ENG011_PCT_PLUS_URL, "agent:" + ENG011_PASSWORD,
+                 ENG011_PASSWORD, ENG011_PCT_PLUS_RAW,
+                 ENG011_PCT_PLUS_DECODED),
+            )
+            self.assertIn("quote rejected", str(exc))
+            recs = _read_audit(cfg.tx_log_path)
+            self.assertEqual(
+                [r["outcome"] for r in recs], ["simulation_failed"])
+            for secret in (ENG011_PCT_PLUS_RAW, ENG011_PCT_PLUS_DECODED,
+                           ENG011_PASSWORD):
+                self.assertNotIn(secret, json.dumps(recs))
+
+    # ── work order regression 5: form-style '+' representation ───────────
+
+    def test_form_plus_value_raw_and_form_decoded_forms_protected(self):
+        reg = _registered_secrets(TestnetExecutionConfig(
+            enabled=True, rpc_url=ENG011_FORM_URL))
+        # the literal '+' form and its form-decoded space form are BOTH
+        # registered for the same configured credential
+        self.assertIn(ENG011_FORM_TOKEN, reg)
+        self.assertIn(ENG011_FORM_DECODED, reg)
+        # proof: neither form is caught by the structural rules alone
+        self.assertIn(
+            ENG011_FORM_DECODED,
+            _sanitize_error("x " + ENG011_FORM_DECODED),
+        )
+        self.assertIn(
+            ENG011_FORM_TOKEN, _sanitize_error("x " + ENG011_FORM_TOKEN))
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp, ENG011_FORM_URL)
+            # the FORM-DECODED representation echoed in nested metadata
+            relay._sim_result = dict(
+                _ok_simulation(),
+                debug={"note": "served by " + ENG011_FORM_DECODED},
+            )
+            out = session.simulate()
+            self.assertEqual(
+                out["debug"]["note"], "served by <redacted>")
+            blob = json.dumps(out)
+            for secret in (ENG011_FORM_TOKEN, ENG011_FORM_DECODED,
+                           ENG011_PASSWORD):
+                self.assertNotIn(secret, blob)
+            self.assertEqual(out["bundleHash"], "0x" + "cd" * 32)
+            # the raw '+' representation echoed in a per-transaction error
+            relay._sim_result = {
+                "result": {"results": [
+                    {
+                        "txHash": "0x" + "ee" * 32,
+                        "gasUsed": 21000,
+                        "error": "auth " + ENG011_FORM_TOKEN + " failed",
+                    },
+                ]},
+            }
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                session.simulate()
+            _assert_exception_clean(
+                self, ctx.exception,
+                (ENG011_FORM_URL, "agent:" + ENG011_PASSWORD,
+                 ENG011_PASSWORD, ENG011_FORM_TOKEN, ENG011_FORM_DECODED),
+            )
+            recs = _read_audit(cfg.tx_log_path)
+            for secret in (ENG011_FORM_TOKEN, ENG011_FORM_DECODED,
+                           ENG011_PASSWORD):
+                self.assertNotIn(secret, json.dumps(recs))
+
+    # ── work order regression 6: encoded ordinary name triggers nothing ──
+
+    def test_encoded_ordinary_name_does_not_trigger_registration(self):
+        reg = _registered_secrets(TestnetExecutionConfig(
+            enabled=True, rpc_url=ENG011_ORDINARY_URL))
+        # the encoded ordinary name resolves to "network" — NOT a
+        # credential name — so its short value stays unregistered, as do
+        # the other ordinary short values
+        for ordinary in (ENG011_ORDINARY_VALUE, "dev", "agent", "v2",
+                         "submit", "network", "env"):
+            self.assertNotIn(ordinary, reg)
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp, ENG011_ORDINARY_URL)
+            relay._sim_result = dict(
+                _ok_simulation(),
+                debug={
+                    "net%77ork": ENG011_ORDINARY_VALUE,  # verbatim key+value survive
+                    "note": "route v2 handled",
+                },
+            )
+            out = session.simulate()
+            # ordinary encoded-name metadata remains fully available
+            self.assertEqual(out["debug"]["net%77ork"], "zone")
+            self.assertEqual(out["debug"]["note"], "route v2 handled")
+            self.assertIn(ENG011_ORDINARY_VALUE, json.dumps(out))
+            # legitimate relay metadata intact
+            self.assertEqual(out["bundleHash"], "0x" + "cd" * 32)
+            self.assertEqual(out["totalGasUsed"], 21000)
+
+    # ── work order regression 7: ordinary metadata and existing ──────────
+    # short-value exclusions preserved
+
+    def test_ordinary_metadata_and_existing_exclusions_preserved(self):
+        reg = _registered_secrets(TestnetExecutionConfig(
+            enabled=True, rpc_url=ENG011_ENC_TOKEN_URL))
+        # existing short-value exclusions stand
+        for ordinary in ("agent", ENG011_ORDINARY_VALUE, "v2", "submit"):
+            self.assertNotIn(ordinary, reg)
+        # benign diagnostics mentioning ordinary words are untouched
+        text = "the agent wallet verified; route v2; region zone"
+        self.assertEqual(_sanitize_error(text, *reg), text)
+        # the scrubber keeps benign "agent"/"v2" mentions in responses
+        out = _scrub_transport_payload(
+            {"note": "user agent on route v2", "status": "ok"},
+            forbidden=reg,
+        )
+        self.assertEqual(out["note"], "user agent on route v2")
+        self.assertEqual(out["status"], "ok")
+        # ...while the encoded-name credential itself is still contained
+        self.assertNotIn(
+            ENG011_SHORT_TOKEN,
+            _scrub_transport_payload(
+                {"note": "token " + ENG011_SHORT_TOKEN}, forbidden=reg,
+            )["note"],
+        )
+        # full lifecycle: ordinary metadata survives end to end
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(tmp, ENG011_ENC_TOKEN_URL)
+            relay._sim_result = dict(
+                _ok_simulation(),
+                debug={
+                    "region": ENG011_ORDINARY_VALUE,
+                    "env_label": "dev",
+                },
+            )
+            out = session.simulate()
+            self.assertEqual(out["debug"]["region"], "zone")
+            self.assertEqual(out["debug"]["env_label"], "dev")
+            self.assertIn(ENG011_ORDINARY_VALUE, json.dumps(out))
+            self.assertEqual(out["bundleHash"], "0x" + "cd" * 32)
+            self.assertEqual(out["results"][0]["gasUsed"], 21000)
+
+    # ── propagation: encoded name on the RELAY URL ───────────────────────
+
+    def test_encoded_name_on_relay_url_is_registered_and_contained(self):
+        reg = _registered_secrets(TestnetExecutionConfig(
+            enabled=True,
+            rpc_url="https://sepolia.example",
+            relay_url=ENG011_RELAY_URL,
+        ))
+        self.assertIn(ENG011_RELAY_URL, reg)
+        self.assertIn(ENG011_RELAY_KEY, reg)
+        with tempfile.TemporaryDirectory() as tmp:
+            session, cfg, relay = self._session(
+                tmp, "https://sepolia.example", relay_url=ENG011_RELAY_URL)
+            relay._sim_result = dict(
+                _ok_simulation(),
+                debug={"note": "relayed by " + ENG011_RELAY_KEY},
+            )
+            out = session.simulate()
+            self.assertEqual(out["debug"]["note"], "relayed by <redacted>")
+            self.assertEqual(out["bundleHash"], "0x" + "cd" * 32)
+            blob = json.dumps(out)
+            for secret in (ENG011_RELAY_URL, ENG011_RELAY_KEY):
+                self.assertNotIn(secret, blob)
+            recs = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in recs], ["simulated"])
+            for secret in (ENG011_RELAY_URL, ENG011_RELAY_KEY):
+                self.assertNotIn(secret, json.dumps(recs))
+
 
 if __name__ == "__main__":
     unittest.main()

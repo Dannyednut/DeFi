@@ -2476,6 +2476,53 @@ def _raw_signed_bytes(signed) -> bytes:
 
 # ── Signing / submission orchestration (direct RPC transport) ────────────────
 
+def _audit_orchestration_refusal(
+    cfg: TestnetExecutionConfig,
+    purpose: str,
+    exc: TestnetSafetyError,
+    *,
+    chain_id: Optional[int] = None,
+    target: Optional[str] = None,
+) -> TestnetSafetyError:
+    """Audit one refused orchestration attempt BEFORE any submission call
+    (DSS-WO-ENG-015 §4: successful, refused, failed and uncertain attempts
+    are all accounted for).
+
+    Until ENG-015 only the submission/receipt phases and the Flashbots
+    session interactions were audited; policy, chain and custody refusals
+    raised before the first relay/submission call escaped the audit path.
+    This helper closes that gap for BOTH orchestrations: it appends one
+    ``refused`` record to the transaction audit log and returns the ORIGINAL
+    exception object unchanged, so the caller raises the exact same refusal
+    (same type, same message) — auditing never rewrites a policy verdict.
+
+    Audits only when the gate is ENABLED: an attempt under a disabled gate
+    has no execution context (nothing can decrypt a wallet, sign or
+    submit), so disabled-gate refusals keep their historical no-audit
+    behavior and disabled-by-default runs write nothing.
+    """
+    if not getattr(cfg, "enabled", False):
+        return exc
+    try:
+        record_testnet_tx(
+            cfg.tx_log_path,
+            purpose=purpose,
+            chain_id=chain_id,
+            target=target,
+            function=None,
+            estimated_gas=None,
+            actual_gas_used=None,
+            tx_hash=None,
+            outcome="refused",
+            error=_sanitize_error(str(exc), *_registered_secrets(cfg)),
+            max_fee_exposure_wei=None,
+        )
+    except Exception:
+        # Auditing must never mask, replace or rewrite the refusal.
+        pass
+    return exc
+
+
 def sign_and_submit_testnet_tx(
     tx: dict,
     *,
@@ -2517,7 +2564,10 @@ def sign_and_submit_testnet_tx(
     Returns the audit record. Never returns or logs key material.
     """
     cfg = config or TestnetExecutionConfig.from_env()
-    cfg.require_ready()  # 1 (enabled + provisioned + secret store verified)
+    try:
+        cfg.require_ready()  # 1 (enabled + provisioned + secret store verified)
+    except TestnetSafetyError as exc:
+        raise _audit_orchestration_refusal(cfg, purpose, exc)
 
     if web3_factory is None:
         def web3_factory(url: str):
@@ -2538,7 +2588,7 @@ def sign_and_submit_testnet_tx(
         stage="RPC provider initialization",
     )
     if rpc_failure is not None:
-        raise rpc_failure  # outside the failing except: no chaining
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
 
     # 2b. Connectivity check: a RAISING check is a foreign transport
     # failure (contained); returning False is the gate refusal (kept).
@@ -2549,9 +2599,10 @@ def sign_and_submit_testnet_tx(
         stage="RPC connectivity check",
     )
     if rpc_failure is not None:
-        raise rpc_failure
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
     if not reachable:
-        raise TestnetSafetyError("testnet RPC is not reachable")
+        refusal = TestnetSafetyError("testnet RPC is not reachable")
+        raise _audit_orchestration_refusal(cfg, purpose, refusal)
 
     # 2c. Initial chain-ID read: the RPC READ is contained (a provider
     # exception can quote the credential-bearing URL); the chain-POLICY
@@ -2563,8 +2614,11 @@ def sign_and_submit_testnet_tx(
         stage="RPC chain-ID read",
     )
     if rpc_failure is not None:
-        raise rpc_failure
-    check_chain_id(reported, cfg.expected_chain_id, cfg.effective_allowlist())
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
+    try:
+        check_chain_id(reported, cfg.expected_chain_id, cfg.effective_allowlist())
+    except TestnetSafetyError as exc:
+        raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported)
 
     chain_id = reported
     tx = dict(tx)
@@ -2581,21 +2635,27 @@ def sign_and_submit_testnet_tx(
         stage="RPC transaction-default read",
     )
     if rpc_failure is not None:
-        raise rpc_failure
-    validate_transaction(
-        tx, sender=sender, chain_id=chain_id,
-        max_value_wei=cfg.max_value_wei, max_gas_units=cfg.max_gas_units,
-        max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
-        max_priority_fee_wei=cfg.max_priority_fee_wei,
-        max_total_fee_wei=cfg.max_total_fee_wei,
-        known_targets=known_targets,
-    )  # 3b
-    fee_exposure = validate_fee_exposure(
-        tx,
-        max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
-        max_priority_fee_wei=cfg.max_priority_fee_wei,
-        max_total_fee_wei=cfg.max_total_fee_wei,
-    )
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
+    try:
+        validate_transaction(
+            tx, sender=sender, chain_id=chain_id,
+            max_value_wei=cfg.max_value_wei, max_gas_units=cfg.max_gas_units,
+            max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
+            max_priority_fee_wei=cfg.max_priority_fee_wei,
+            max_total_fee_wei=cfg.max_total_fee_wei,
+            known_targets=known_targets,
+        )  # 3b
+        fee_exposure = validate_fee_exposure(
+            tx,
+            max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
+            max_priority_fee_wei=cfg.max_priority_fee_wei,
+            max_total_fee_wei=cfg.max_total_fee_wei,
+        )
+    except TestnetSafetyError as exc:
+        raise _audit_orchestration_refusal(
+            cfg, purpose, exc,
+            chain_id=chain_id, target=str(tx.get("to", "")).lower() or None,
+        )
 
     # 4. Decrypt the agent wallet; bind it to the recorded identity.
     # Caller-safe failures (DSS-WO-ENG-008 Finding A): custody and signing
@@ -2611,7 +2671,7 @@ def sign_and_submit_testnet_tx(
             exc, "agent wallet custody failed", stage="wallet decryption",
         )
     if custody_failure is not None:
-        raise custody_failure
+        raise _audit_orchestration_refusal(cfg, purpose, custody_failure)
 
     # 5a. Pre-sign chain verification (DSS-WO-ENG-009 Finding A): the RPC
     # read is contained under its own stage; the policy verdict propagates
@@ -2623,10 +2683,13 @@ def sign_and_submit_testnet_tx(
         stage="pre-sign chain verification",
     )
     if rpc_failure is not None:
-        raise rpc_failure
-    check_chain_id(  # still the expected chain immediately before signing
-        reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
-    )
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
+    try:
+        check_chain_id(  # still the expected chain immediately before signing
+            reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
+        )
+    except TestnetSafetyError as exc:
+        raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported_now)
     signing_failure: Optional[TestnetSafetyError] = None
     try:
         signed = account.sign_transaction(tx)  # 5b
@@ -2636,7 +2699,7 @@ def sign_and_submit_testnet_tx(
             exc, "transaction signing failed", stage="transaction signing",
         )
     if signing_failure is not None:
-        raise signing_failure
+        raise _audit_orchestration_refusal(cfg, purpose, signing_failure)
 
     # 6. Pre-submission chain verification (DSS-WO-ENG-009 Finding A):
     # same containment split — contained RPC read, unchanged gate verdict.
@@ -2647,10 +2710,13 @@ def sign_and_submit_testnet_tx(
         stage="pre-submission chain verification",
     )
     if rpc_failure is not None:
-        raise rpc_failure
-    check_chain_id(  # pre-submission
-        reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
-    )
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
+    try:
+        check_chain_id(  # pre-submission
+            reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
+        )
+    except TestnetSafetyError as exc:
+        raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported_now)
 
     selector = "transfer"
     data = tx.get("data") or b""
@@ -2813,7 +2879,10 @@ def prepare_flashbots_bundle(
     capability internals or mutable authorization state are exposed.
     """
     cfg = config or TestnetExecutionConfig.from_env()
-    cfg.require_ready()  # 1 — SAME explicit gate as direct RPC (ENG-005 §2)
+    try:
+        cfg.require_ready()  # 1 — SAME explicit gate as direct RPC (ENG-005 §2)
+    except TestnetSafetyError as exc:
+        raise _audit_orchestration_refusal(cfg, purpose, exc)
 
     if web3_factory is None:
         def web3_factory(url: str):
@@ -2834,7 +2903,7 @@ def prepare_flashbots_bundle(
         stage="RPC provider initialization",
     )
     if rpc_failure is not None:
-        raise rpc_failure  # outside the failing except: no chaining
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
 
     # 2b. Connectivity check: raising = contained transport failure;
     # returning False = the gate refusal (kept verbatim).
@@ -2845,9 +2914,10 @@ def prepare_flashbots_bundle(
         stage="RPC connectivity check",
     )
     if rpc_failure is not None:
-        raise rpc_failure
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
     if not reachable:
-        raise TestnetSafetyError("testnet RPC is not reachable")
+        refusal = TestnetSafetyError("testnet RPC is not reachable")
+        raise _audit_orchestration_refusal(cfg, purpose, refusal)
 
     # 2c. Initial chain-ID read: contained RPC read, unchanged gate
     # verdict below.
@@ -2858,12 +2928,16 @@ def prepare_flashbots_bundle(
         stage="RPC chain-ID read",
     )
     if rpc_failure is not None:
-        raise rpc_failure
-    check_chain_id(reported, cfg.expected_chain_id, cfg.effective_allowlist())
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
+    try:
+        check_chain_id(reported, cfg.expected_chain_id, cfg.effective_allowlist())
+    except TestnetSafetyError as exc:
+        raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported)
 
     txs = [dict(t) for t in unsigned_txs]
     if not txs:
-        raise TestnetSafetyError("empty bundle refused")
+        refusal = TestnetSafetyError("empty bundle refused")
+        raise _audit_orchestration_refusal(cfg, purpose, refusal, chain_id=reported)
     sender = cfg.load_agent_address()
     for tx in txs:
         tx["chainId"] = reported
@@ -2876,21 +2950,24 @@ def prepare_flashbots_bundle(
         stage="RPC transaction-default read",
     )
     if rpc_failure is not None:
-        raise rpc_failure
-    validated = validate_bundle(
-        txs, sender=sender, chain_id=reported,
-        max_value_wei=cfg.max_value_wei, max_gas_units=cfg.max_gas_units,
-        max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
-        max_priority_fee_wei=cfg.max_priority_fee_wei,
-        max_total_fee_wei=cfg.max_total_fee_wei,
-        known_targets=known_targets,
-    )  # 3b — includes the AGGREGATE bundle fee cap, before wallet decryption
-    total_fee_exposure = validate_bundle_fee_exposure(
-        validated,
-        max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
-        max_priority_fee_wei=cfg.max_priority_fee_wei,
-        max_total_fee_wei=cfg.max_total_fee_wei,
-    )
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
+    try:
+        validated = validate_bundle(
+            txs, sender=sender, chain_id=reported,
+            max_value_wei=cfg.max_value_wei, max_gas_units=cfg.max_gas_units,
+            max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
+            max_priority_fee_wei=cfg.max_priority_fee_wei,
+            max_total_fee_wei=cfg.max_total_fee_wei,
+            known_targets=known_targets,
+        )  # 3b — includes the AGGREGATE bundle fee cap, before wallet decryption
+        total_fee_exposure = validate_bundle_fee_exposure(
+            validated,
+            max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
+            max_priority_fee_wei=cfg.max_priority_fee_wei,
+            max_total_fee_wei=cfg.max_total_fee_wei,
+        )
+    except TestnetSafetyError as exc:
+        raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported)
 
     # 4. Decrypt the agent wallet; bind it to the recorded identity.
     # Caller-safe failures (DSS-WO-ENG-008 Finding A): no custody or
@@ -2906,7 +2983,7 @@ def prepare_flashbots_bundle(
             exc, "agent wallet custody failed", stage="wallet decryption",
         )
     if custody_failure is not None:
-        raise custody_failure
+        raise _audit_orchestration_refusal(cfg, purpose, custody_failure)
 
     # 5a. Pre-sign chain verification (DSS-WO-ENG-009 Finding B): the RPC
     # read is contained; the policy verdict propagates unchanged.
@@ -2917,10 +2994,13 @@ def prepare_flashbots_bundle(
         stage="pre-sign chain verification",
     )
     if rpc_failure is not None:
-        raise rpc_failure
-    check_chain_id(  # still the expected chain immediately before signing
-        reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
-    )
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
+    try:
+        check_chain_id(  # still the expected chain immediately before signing
+            reported_now, cfg.expected_chain_id, cfg.effective_allowlist()
+        )
+    except TestnetSafetyError as exc:
+        raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported_now)
     signing_failure: Optional[TestnetSafetyError] = None
     try:
         signed = [  # 5b
@@ -2931,7 +3011,7 @@ def prepare_flashbots_bundle(
             exc, "transaction signing failed", stage="transaction signing",
         )
     if signing_failure is not None:
-        raise signing_failure
+        raise _audit_orchestration_refusal(cfg, purpose, signing_failure)
 
     if relay_factory is None:
         def relay_factory(url: str, auth_account, relay_url: str):
@@ -2956,7 +3036,7 @@ def prepare_flashbots_bundle(
         stage="relay transport construction",
     )
     if rpc_failure is not None:
-        raise rpc_failure
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
 
     # 6a'. Block-number retrieval for the target block (DSS-WO-ENG-009
     # Finding B).
@@ -2967,7 +3047,7 @@ def prepare_flashbots_bundle(
         stage="RPC block-number read",
     )
     if rpc_failure is not None:
-        raise rpc_failure
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
     target_block = head_block + 1
     prepared = PreparedFlashbotsBundle._mint(  # 6b: the ONLY minting path
         sender=sender,
@@ -2998,5 +3078,5 @@ def prepare_flashbots_bundle(
         stage="session construction verification",
     )
     if rpc_failure is not None:
-        raise rpc_failure
+        raise _audit_orchestration_refusal(cfg, purpose, rpc_failure)
     return session

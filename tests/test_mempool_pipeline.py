@@ -121,7 +121,8 @@ def test_mempool_backrun_pipeline_end_to_end():
     w3v.eth.call.return_value = b""
 
     with patch("validation.opportunity.get_chain") as mock_get_chain, \
-         patch("executor.signer.get_sender", return_value=to_checksum_address("0x" + "11" * 20)):
+         patch("validation.opportunity.authorized_sender_address",
+               return_value=to_checksum_address("0x" + "11" * 20)):
         mock_get_chain.return_value = MagicMock(arb_exec_address=ARB_EXEC)
         validator = OpportunityValidator(w3v, chain_id=1)
         result = validator.validate(tracker_opp, block_number=101)
@@ -166,7 +167,20 @@ def test_mempool_backrun_pipeline_end_to_end():
     exec_result.block_number = 101
     fake_executor.submit.return_value = exec_result
 
-    router = create_router(tracker=tracker, executor=fake_executor, config={"EXECUTE_ONCHAIN": True})
+    # DSS-WO-ENG-015: the router is armed by an AUTHORIZED boundary; the
+    # legacy EXECUTE_ONCHAIN config boolean is not an execution authority.
+    class _AuthorizedStubBoundary:
+        def execution_available(self):
+            return True
+
+        def refusal_reason(self):
+            return "authorized (offline test stub)"
+
+    router = create_router(
+        tracker=tracker, executor=fake_executor,
+        authorization=_AuthorizedStubBoundary(),
+        config={"EXECUTE_ONCHAIN": True},
+    )
     enriched.metadata["execution_simulated"] = True
     assert router.submit_opportunity(enriched, OppSource.BACKRUN, priority=2.0) is True
 

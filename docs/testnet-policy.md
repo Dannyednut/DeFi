@@ -4,9 +4,11 @@ capability-integrity hardened per DSS-WO-ENG-006; exception containment
 and access-list fail-closure per DSS-WO-ENG-007; provider-credential
 containment and access-list type consistency per DSS-WO-ENG-008;
 complete RPC/relay preflight containment and relay-response secret
-redaction per DSS-WO-ENG-009)
+redaction per DSS-WO-ENG-009; unified execution authorization boundary
+per DSS-WO-ENG-015)
 
-Status: ACTIVE — enforced by `executor/testnet_gate.py`.
+Status: ACTIVE — enforced by `executor/testnet_gate.py` through the unified
+execution authorization boundary `executor/authorization.py`.
 The gate is **disabled by default** (`DSS_TESTNET_EXEC` unset/empty). Nothing
 in this repository signs or submits a transaction unless every condition in
 this document is met.
@@ -412,3 +414,93 @@ strings before they are returned to callers (DSS-WO-ENG-006 §4/§6;
 DSS-WO-ENG-008 Finding A). Preflight refusals — including
 infrastructure/RPC failures — are recorded with the contained cause once
 an attempt has been initiated.
+
+## 8. Unified execution authorization boundary (DSS-WO-ENG-015)
+
+DSS-WO-ENG-014 identified a split-signing architecture: the safeguards in
+this document protected the gate-controlled testnet transports, but the
+ordinary production executor signed transactions with an import-time
+`PRIVATE_KEY` signer (`executor/signer.py`) and provisioned its own
+Flashbots relay identity (`relay_signer.json` + middleware attach),
+completely outside this boundary. ENG-015 eliminates that separation.
+
+**One authoritative boundary.** `executor/authorization.py` is the single
+mandatory execution authorization boundary. It selects the applicable
+execution policy and hands out the ONLY two signing/submission
+capabilities, both of which are the gate orchestrations documented above:
+
+- `AuthorizedExecution.sign_and_submit` → `sign_and_submit_testnet_tx`
+  (direct-RPC transport);
+- `AuthorizedExecution.prepare_flashbots_bundle` → the capability/session
+  model (Flashbots transport; simulate-before-submit, payload containment).
+
+There is no second authorization implementation: the boundary performs
+policy SELECTION only, and every actual check (explicit opt-in, allowlist,
+chain identity, wallet custody, transaction policy, fee exposure, audit)
+remains in `executor/testnet_gate.py`.
+
+**Policy selection.** `resolve_execution_policy` is the single authoritative
+selection point. `CHAIN_ID` (network selection) is never read there and can
+never authorize execution. The ONLY operationally selectable policy is the
+explicit Sepolia testnet policy (`DSS_TESTNET_EXEC=1` + full provisioning,
+checked by `require_ready` at every authorization). A named
+`ProductionExecutionPolicy` class exists to make the architecture explicit
+and is PERMANENTLY DISABLED — enabling production/mainnet execution requires
+a separately reviewed authorization decision recorded as a code change.
+`EXECUTE_ONCHAIN` stays false by default and is NOT an execution authority:
+setting it true cannot enable, select or bypass any policy (it only produces
+an explicit warning).
+
+**Every transport covered.** All execution routes go through the boundary:
+
+| Route | Enforcement |
+| --- | --- |
+| Ordinary executor `submit` (detector + mempool + backrun opportunities) | `ArbExecutor.submit` authorizes via `authorize_execution` before building any transaction; submission goes through `sign_and_submit` (direct) or the gate session (Flashbots transport) |
+| Batch execution | `ArbExecutor.submit_batch` authorizes once for the batch ("arb_batch_execution") and submits the combined transaction through the same orchestrations |
+| Mempool-triggered / backrun execution (`MEVExecutionService`) | authorizes first, refuses mixed-signer bundles (the wallet-bound session model cannot carry a third-party trigger transaction), submits single private transactions through the gate session; accepts UNSIGNED intents only — no pre-signed bytes can be handed in |
+| Execution router | armed ONLY by `boundary.execution_available()`; the `EXECUTE_ONCHAIN` boolean is not consulted for authorization |
+| Validation sender (`validation/opportunity.py`, `validation/adversarial.py`) | the simulation `from` address comes from `authorized_sender_address` (the recorded PUBLIC agent address); no execution policy → validation refuses (fail closed, as the legacy signer did) |
+
+**Removed legacy paths.** The following no longer exist, so bypassing the
+boundary is structurally impossible for agent code (not merely checked):
+
+- `executor/signer.py` (import-time `PRIVATE_KEY` loading, direct signing,
+  `get_sender`) — module deleted; `config.PRIVATE_KEY` removed;
+- the executor's private relay-identity provisioning
+  (`relay_signer.json`, `Account.create()`, `flashbot()` middleware attach);
+- `relay_transaction` / `_relay_direct` / `_relay_flashbots` broadcast
+  helpers in `executor/relay.py` — the module keeps only read-only receipt
+  handling. The ONLY `send_raw_transaction` / `send_bundle` call sites in
+  the repository are the gate orchestrations (asserted by test).
+
+**Fail-closed semantics.** A refused execution (disabled policy, chain
+mismatch, policy violation, custody failure, RPC mismatch or failure at any
+verification point) raises `TestnetSafetyError` and produces an explicit
+failed `ExecutionResult` (`method="refused"`) — never a success, never a
+silent skip, and there is no legacy fallback. Missing wallet material, a
+missing/unverifiable RPC and policy violations all refuse.
+
+**Audit completeness (§7 extension).** Refusals raised before the first
+relay/submission call — policy, chain and custody refusals in BOTH
+orchestrations — are now audited as `refused` records whenever the gate is
+enabled, so successful, refused, failed and uncertain attempts are all
+accounted for. Refusals under a disabled gate write nothing (no execution
+context exists); the boundary likewise audits refused `authorize_execution`
+attempts only when a policy with an audit log is selected.
+
+**Known consequences (intentional, fail-closed).**
+
+- `KNOWN_TARGETS` remains EMPTY: an arb execution transaction targets the
+  ArbExec contract, which is neither the agent wallet nor a reviewed target,
+  so the ordinary executor is refused at the transaction policy until the
+  Coordinator authorizes a specific target in a separate change. Offline
+  tests may inject a controlled target map explicitly (same mechanism as
+  test-injected allowlists).
+- Atomic-backrun bundles that front a third-party (victim) transaction are
+  refused: the session model binds every bundle transaction to the verified
+  agent wallet. Extending the capability model to mixed-signer bundles is a
+  future, separately reviewed architecture decision.
+- Batch members are no longer individually relay-simulated: per-member
+  prepared payloads were never submitted (the batch is one combined
+  transaction), so preparing them would mint one-use authorizations for
+  unused payloads. Batch gas estimates use the detector/optimizer values.

@@ -3448,8 +3448,12 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 classification="testnet RPC preflight failed",
                 stage="RPC provider initialization",
             )
-            # no attempt was initiated: no audit record exists at all
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt IS accounted for — the
+            # contained preflight failure is audited as one refused record
+            # with sanitized error text (no credential material).
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_connectivity_check_failure_contained(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3467,7 +3471,10 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 classification="testnet RPC preflight failed",
                 stage="RPC connectivity check",
             )
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_chain_id_read_failure_contained(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3485,7 +3492,10 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 classification="testnet RPC preflight failed",
                 stage="RPC chain-ID read",
             )
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_transaction_defaults_rpc_failure_contained(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3506,7 +3516,10 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
             )
             # the failure fired before any signing/submission
             self.assertEqual(w3.submitted, 0)
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_pre_sign_chain_verification_failure_contained(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3525,7 +3538,10 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 stage="pre-sign chain verification",
             )
             self.assertEqual(w3.submitted, 0)  # signed, but never submitted
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_pre_submission_chain_verification_failure_contained(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3544,7 +3560,10 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 stage="pre-submission chain verification",
             )
             self.assertEqual(w3.submitted, 0)  # never sent
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_gate_refusals_are_not_converted_to_transport_failures(self):
         """Requirement 4/5: gate-raised TestnetSafetyErrors keep their
@@ -3653,7 +3672,10 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
             self._assert_contained(
                 ctx, foreign, stage="RPC provider initialization")
             self.assertEqual(relay_calls, [])  # relay transport never built
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL_ALL)
 
     def test_connectivity_failure_contained(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3767,7 +3789,10 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
             self.assertIn("bundle preparation failed", str(exc))
             self.assertIn("RuntimeError", str(exc))
             self.assertIn("relay transport construction", str(exc))
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL_ALL)
 
     def test_session_construction_verification_failure_contained(self):
         """The constructor's LIVE RPC verification runs inside the
@@ -3787,7 +3812,10 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 )
             self._assert_contained(
                 ctx, foreign, stage="session construction verification")
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL_ALL)
 
     def test_gate_refusals_survive_preparation_boundaries(self):
         """Chain-policy and transaction-policy refusals keep their exact

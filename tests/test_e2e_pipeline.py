@@ -9,6 +9,30 @@ import sys
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1]))
 
 
+class _AuthorizedStubBoundary:
+    """Test double for the unified execution authorization boundary
+    (DSS-WO-ENG-015): reports an available execution policy so the router
+    can be armed in offline tests. NOT a real authorization — the real
+    boundary refuses unless the testnet gate is explicitly enabled."""
+
+    def execution_available(self):
+        return True
+
+    def refusal_reason(self):
+        return "authorized (offline test stub)"
+
+
+class _UnauthorizedStubBoundary:
+    """Test double reporting NO available execution policy (the default
+    real-world state: DSS_TESTNET_EXEC unset)."""
+
+    def execution_available(self):
+        return False
+
+    def refusal_reason(self):
+        return "no execution policy enabled (offline test stub)"
+
+
 def test_full_pipeline_end_to_end():
 
     from unittest.mock import MagicMock, patch
@@ -191,7 +215,8 @@ def test_full_pipeline_end_to_end():
     w3v.eth.call.return_value = b""
 
     with patch("validation.opportunity.get_chain") as mock_get_chain, \
-         patch("executor.signer.get_sender", return_value=to_checksum_address("0x" + "11"*20)):
+         patch("validation.opportunity.authorized_sender_address",
+               return_value=to_checksum_address("0x" + "11"*20)):
         mock_get_chain.return_value = MagicMock(arb_exec_address=ARB_EXEC)
         validator = OpportunityValidator(w3v, chain_id=1)
         assert validator.contract is not None, "validator should have picked up the mocked ArbExec address"
@@ -271,7 +296,8 @@ def test_full_pipeline_end_to_end():
     w3v.eth.contract.return_value = fake_contract2
 
     with patch("validation.opportunity.get_chain") as mock_get_chain2, \
-         patch("executor.signer.get_sender", return_value=to_checksum_address("0x" + "11"*20)):
+         patch("validation.opportunity.authorized_sender_address",
+               return_value=to_checksum_address("0x" + "11"*20)):
         mock_get_chain2.return_value = MagicMock(arb_exec_address=ARB_EXEC)
         validator2 = OpportunityValidator(w3v, chain_id=1)
         result2 = validator2.validate(opp2, block_number=100)
@@ -344,10 +370,28 @@ def test_full_pipeline_end_to_end():
     execution_result.block_number = 100
     fake_executor.submit.return_value = execution_result
 
-    router = create_router(tracker=tracker, executor=fake_executor, config={
-        "EXECUTE_ONCHAIN": True, "MIN_PROFIT_USD": 0.01, "MAX_EXECUTIONS": 3,
-    })
-    assert router.execute_onchain is True, "router should be armed given EXECUTE_ONCHAIN=True + a ready executor"
+    # DSS-WO-ENG-015: the router is armed ONLY by the unified execution
+    # authorization boundary. EXECUTE_ONCHAIN=true in the config is NOT an
+    # execution authority and must not arm the router on its own.
+    boolean_only_router = create_router(
+        tracker=tracker, executor=fake_executor,
+        authorization=_UnauthorizedStubBoundary(),
+        config={"EXECUTE_ONCHAIN": True, "MIN_PROFIT_USD": 0.01, "MAX_EXECUTIONS": 3},
+    )
+    assert boolean_only_router.execute_onchain is False, (
+        "EXECUTE_ONCHAIN=true must NOT arm the router without an authorized "
+        "execution boundary"
+    )
+
+    router = create_router(
+        tracker=tracker, executor=fake_executor,
+        authorization=_AuthorizedStubBoundary(),
+        config={"MIN_PROFIT_USD": 0.01, "MAX_EXECUTIONS": 3},
+    )
+    assert router.execute_onchain is True, (
+        "router should be armed given an authorized execution boundary + a "
+        "ready executor"
+    )
 
     accepted = router.submit_opportunity(opp2, OppSource.DETECTOR_CYCLES, priority=1.0)
     print(f"  submit_opportunity() accepted: {accepted}")

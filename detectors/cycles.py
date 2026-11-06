@@ -23,7 +23,7 @@ from detectors.base import BaseDetector
 from logger import Opportunity, OppType
 from routing import ArbKind
 from graph import ArbitrageCycle
-from config import get_chain, get_extended_arb_exec_address, NATIVE_PRICE_USD, MIN_PROFIT_USD, DEFAULT_GAS_UNITS
+from config import get_chain, NATIVE_PRICE_USD, MIN_PROFIT_USD, DEFAULT_GAS_UNITS
 from tvl import token_price, profit_in_best_unit, token_decimals
 from log import get_logger
 from utils.multicall3 import multicall3_batch_yieldOut, multicall3_batch_quote_v3
@@ -39,7 +39,7 @@ log = get_logger("cycles")
 SIMULATION_AMOUNT_WEI = 10 ** 18
 
 
-ARB_EXEC_ADDRESS = get_extended_arb_exec_address(get_chain().chain_id) or get_chain().arb_exec_address
+ARB_EXEC_ADDRESS = get_chain().arb_exec_address
 
 
 def _filter_pool_conflicts(cycles: list) -> list:

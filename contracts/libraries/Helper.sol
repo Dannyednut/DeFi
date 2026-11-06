@@ -360,9 +360,9 @@ library Helper {
                 );
             } else {
                 (uint112 r0, uint112 r1,) = IUniswapV2Pair(pools[i]).getReserves();
-                current = tokens[i] == _token0(pools[i])
-                    ? getAmountOutV2WithFee(current, r0, r1, fees[i])
-                    : getAmountOutV2WithFee(current, r1, r0, fees[i]);
+                current = tokens[i] == _token0(pools[i]) 
+                    ? getAmountOutV2(current, r0, r1)
+                    : getAmountOutV2(current, r1, r0);
             }
             unchecked { ++i; }
         }

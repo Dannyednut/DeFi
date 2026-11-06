@@ -32,7 +32,7 @@ from eth_utils import to_bytes
 
 from config import (
     CHAIN_ID, DEFAULT_GAS_UNITS, MIN_PROFIT_USD,
-    ARB_EXEC_ABI, FLASHBOTS_RPCS, get_chain, get_extended_arb_exec_address,
+    ARB_EXEC_ABI, FLASHBOTS_RPCS, get_chain,
 )
 from logger import Opportunity
 from tvl import token_price
@@ -97,16 +97,13 @@ class ArbExecutor:
         self._chain   = get_chain(chain_id)
 
         self._arb_exec = None
-        self._arb_exec_extended = False
-        extended_address = get_extended_arb_exec_address(chain_id)
-        selected_address = extended_address or self._chain.arb_exec_address
+        selected_address = self._chain.arb_exec_address
         if selected_address:
             self._arb_exec = w3.eth.contract(
                 address=w3.to_checksum_address(selected_address),
                 abi=ARB_EXEC_ABI,
             )
-            self._arb_exec_extended = bool(extended_address)
-            log.info(f"ArbExecutor ready | contract={selected_address} | extended={self._arb_exec_extended}")
+            log.info(f"ArbExecutor ready | contract={selected_address}")
 
             relay_uri_available = self.chain_id in FLASHBOTS_RPCS
             try:
@@ -314,7 +311,6 @@ class ArbExecutor:
             builder_tip_bps=builder_tip_bps,
             sender=sender,
             gas_units=gas_units,
-            fast_path=self._arb_exec_extended and int(arb_data.get("amountIn", 0)) > 0,
         )
 
         # ── Step 6: Sign ──────────────────────────────────────────────────────
@@ -562,7 +558,6 @@ class ArbExecutor:
             builder_tip_bps=builder_tip,
             sender=sender,
             gas_units=gas_units,
-            fast_path=self._arb_exec_extended and int(arb_data.get("amountIn", 0)) > 0,
         )
 
         # ── Step 6: Sign ──────────────────────────────────────────────────────

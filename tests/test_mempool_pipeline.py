@@ -120,8 +120,7 @@ def test_mempool_backrun_pipeline_end_to_end():
     w3v.eth.estimate_gas.return_value = 320_000
     w3v.eth.call.return_value = b""
 
-    with patch("validation.opportunity.get_extended_arb_exec_address", return_value=ARB_EXEC), \
-         patch("validation.opportunity.get_chain") as mock_get_chain, \
+    with patch("validation.opportunity.get_chain") as mock_get_chain, \
          patch("executor.signer.get_sender", return_value=to_checksum_address("0x" + "11" * 20)):
         mock_get_chain.return_value = MagicMock(arb_exec_address=ARB_EXEC)
         validator = OpportunityValidator(w3v, chain_id=1)

@@ -10,11 +10,16 @@ class TestLiquidationScanner(unittest.TestCase):
         self.w3 = MagicMock()
         self.graph = MagicMock()
         self.logger = MagicMock()
+        self.cache = MagicMock()  # detectors now carry a PoolCache reference
+        # Deterministic gas price so _estimate_gas_usd returns real numbers
+        # (30 gwei). Offline the price oracle returns None, so the detector
+        # falls back to config.NATIVE_PRICE_USD = 3000.0 USD/ETH.
+        self.w3.eth.gas_price = 30_000_000_000
         # Mock Aave Pool address
         import config
         config.CHAINS[1].aave_pool = "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
-        
-        self.scanner = LiquidationScanner(self.w3, self.graph, self.logger, 1)
+
+        self.scanner = LiquidationScanner(self.w3, self.graph, self.logger, self.cache, 1)
 
     def test_detect_at_risk_position(self):
         # Mock getUserAccountData call returning HF = 1.02 (Imminent)

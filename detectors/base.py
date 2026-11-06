@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from cache import PoolCache
 
 from config import (
-    get_chain, ARB_EXEC_ABI, get_extended_arb_exec_address,
+    get_chain, ARB_EXEC_ABI,
     NATIVE_PRICE_USD, MIN_PROFIT_USD,
     DEFAULT_GAS_UNITS, GAS_MULTIPLIER,
 )
@@ -26,7 +26,7 @@ from executor.builder import build_arb_data
 from log import get_logger
 log = get_logger("base")
 
-ARB_EXEC_ADDRESS = get_extended_arb_exec_address(get_chain().chain_id) or get_chain().arb_exec_address
+ARB_EXEC_ADDRESS = get_chain().arb_exec_address
 
 class BaseDetector(ABC):
     """Base class for all opportunity detectors."""
@@ -176,8 +176,13 @@ class BaseDetector(ABC):
         price = _oracle_price(token_address) or NATIVE_PRICE_USD
         return (wei / 1e18) * price
     
-    def _estimate_gas_usd(self, gas_units: int = DEFAULT_GAS_UNITS) -> float:
-        """Estimate gas cost in USD."""
+    def _estimate_gas_usd(self, gas_units: int = DEFAULT_GAS_UNITS) -> tuple[float, int]:
+        """Estimate gas cost. Returns ``(gas_cost_usd, gas_cost_wei)``.
+
+        The declared ``float`` return type previously contradicted the
+        tuple actually returned on success (and ``0.0`` on failure), which
+        broke scalar consumers such as LiquidationScanner.on_block.
+        """
         try:
             from config import get_chain
             native_addr = get_chain().wrapped_native

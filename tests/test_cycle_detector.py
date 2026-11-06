@@ -13,18 +13,23 @@ class TestCycleDetection(unittest.TestCase):
         # Let's make it 1 DAI = 1/2900 WETH -> Huge profit
         
         graph = TokenGraph()
-        
+
+        # All pools carry realistic TVL: find_cycles prunes edges below
+        # MIN_POOL_LIQUIDITY_USD * 0.05 (currently $500) as a paper-profit
+        # guard, and PoolEdge defaults to tvl_usd=0.0.
+        TVL = 250_000.0
+
         # Edge 1: WETH -> USDC (3000)
-        e1a = PoolEdge("pool1", "UniV2", "WETH", "USDC", 10**18, 3000 * 10**6, 30, 2)
-        e1b = PoolEdge("pool1", "UniV2", "USDC", "WETH", 3000 * 10**6, 10**18, 30, 2)
-        
+        e1a = PoolEdge("pool1", "UniV2", "WETH", "USDC", 10**18, 3000 * 10**6, 30, 2, tvl_usd=TVL)
+        e1b = PoolEdge("pool1", "UniV2", "USDC", "WETH", 3000 * 10**6, 10**18, 30, 2, tvl_usd=TVL)
+
         # Edge 2: USDC -> DAI (1.01)
-        e2a = PoolEdge("pool2", "UniV2", "USDC", "DAI", 10**6, int(1.01 * 10**18), 30, 2)
-        e2b = PoolEdge("pool2", "UniV2", "DAI", "USDC", int(1.01 * 10**18), 10**6, 30, 2)
-        
+        e2a = PoolEdge("pool2", "UniV2", "USDC", "DAI", 10**6, int(1.01 * 10**18), 30, 2, tvl_usd=TVL)
+        e2b = PoolEdge("pool2", "UniV2", "DAI", "USDC", int(1.01 * 10**18), 10**6, 30, 2, tvl_usd=TVL)
+
         # Edge 3: DAI -> WETH (1/2900)
-        e3a = PoolEdge("pool3", "UniV2", "DAI", "WETH", 2900 * 10**18, 10**18, 30, 2)
-        e3b = PoolEdge("pool3", "UniV2", "WETH", "DAI", 10**18, 2900 * 10**18, 30, 2)
+        e3a = PoolEdge("pool3", "UniV2", "DAI", "WETH", 2900 * 10**18, 10**18, 30, 2, tvl_usd=TVL)
+        e3b = PoolEdge("pool3", "UniV2", "WETH", "DAI", 10**18, 2900 * 10**18, 30, 2, tvl_usd=TVL)
         
         graph.add_or_update_pool(e1a, e1b)
         graph.add_or_update_pool(e2a, e2b)

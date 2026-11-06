@@ -119,7 +119,6 @@ def build_execute_tx(
     builder_tip_bps: int,
     sender: str,
     gas_units: int = DEFAULT_GAS_UNITS,
-    fast_path: bool = False,
 ) -> dict:
     """
     Build the raw EIP-1559 transaction dict for ArbExec.swap().
@@ -149,8 +148,9 @@ def build_execute_tx(
             priority_fee = Web3.to_wei(2, "gwei")
     max_fee = int(base_fee * BASE_FEE_MULTIPLIER) + priority_fee
 
-    swap_fn = arb_exec.functions.swapFast if fast_path else arb_exec.functions.swap
-    tx = swap_fn(
+    # The authoritative Exec contract (Dannyednut/EVM @ 898fe82f) exposes a
+    # single swap entrypoint; the retired variant's swapFast was removed.
+    tx = arb_exec.functions.swap(
         arb_data,
         force_balancer,
         int(builder_tip_bps),

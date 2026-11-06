@@ -1,0 +1,98 @@
+name: CI
+
+# DSS-WO-ENG-001 — reproducible dependencies + CI foundation.
+#
+# Scope and guarantees:
+#   - Triggers on pull requests to main.
+#   - Least-privilege workflow permissions (contents: read).
+#   - Installs ONLY from the committed, hash-verified lock files.
+#   - Installs the pinned Solidity toolchain inputs (OpenZeppelin via
+#     contracts/package-lock.json; solc 0.8.28+commit.7893614a is fetched by
+#     scripts/exec_build.py and SHA-256 checksum-verified before compiling).
+#   - Runs the import smoke test and the offline test suite.
+#   - Test failures fail the job (red CI is preferable to misleading green).
+#   - No repository secrets, no RPC credentials, no wallet credentials,
+#     no transaction signing or broadcasting, no deployment, no auto-merge,
+#     no privileged pull_request_target workflow.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: import-smoke + offline tests (Python 3.11)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install runtime dependencies (hash-verified lock)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.txt
+
+      - name: Install development/test dependencies (hash-verified lock)
+        run: python -m pip install --require-hashes -r requirements-dev.txt
+
+      # DSS-WO-ENG-002: the authoritative Exec contract tests compile the
+      # committed Solidity sources. OpenZeppelin 5.7.0 is pinned in
+      # contracts/package-lock.json; the solc binary is fetched at run time by
+      # scripts/exec_build.py and rejected on checksum mismatch.
+      - name: Install Solidity toolchain inputs (pinned OpenZeppelin)
+        run: npm ci --prefix contracts
+
+      - name: Import smoke test (full module graph + Flashbots dependency status)
+        run: python scripts/ci_import_smoke.py
+
+      # One test file is excluded from CI, with the reason recorded here and
+      # in the failure register (docs/DEPENDENCIES.md). It cannot run on a
+      # clean CI checkout:
+      #
+      #   tests/test_multicall3_yieldout.py
+      #       Requires a local runtime artifact (logs/pending_opportunities.jsonl)
+      #       produced by a live trading run, then dials a live RPC endpoint.
+      #       It can never pass on a clean clone; classified
+      #       network/environment-dependent.
+      #
+      # tests/test_flashbots_integration.py is NO LONGER excluded:
+      # DSS-WO-ENG-003 rewrote it as an import-safe, opt-in integration test
+      # (the old version signed and broadcast at import time). It collects
+      # cleanly and skips visibly without DSS_TESTNET_FLASHBOTS_LIVE=1 plus
+      # the DSS agent keystore; CI provides neither, so CI can never sign or
+      # broadcast through it.
+      #
+      # The offline suite passes completely as of DSS-WO-ENG-003
+      # (Workstream A). Intentionally gated live-network tests appear as
+      # skipped with their reason; no failure, xfail or hidden skip remains.
+      - name: Run offline test suite (fails on any test failure)
+        run: >
+          python -m pytest tests
+          --ignore=tests/test_multicall3_yieldout.py
+          -p no:cacheprovider
+          --tb=short -ra
+          --junitxml=pytest-results.xml
+
+      - name: Publish test results summary
+        if: always()
+        run: python scripts/ci_test_summary.py pytest-results.xml
+
+      - name: Upload test results artifact
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pytest-results
+          path: pytest-results.xml
+          if-no-files-found: warn

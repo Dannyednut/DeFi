@@ -106,6 +106,7 @@ Every safety invariant of the gate is pinned here:
     signing AND before submission — exercised end-to-end with a mocked
     Web3 and a throwaway keystore; nothing touches a network.
 """
+import contextlib
 import json
 import os
 import sys
@@ -116,8 +117,13 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import executor.testnet_gate as _gate
+
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
+
+from tests.gate_r2_fixtures import IsolatedTestnetConfig, throwaway_store
+from tests.gate_r3_fixtures import frozen_map, offline_transports
 
 from executor.testnet_gate import (
     ALLOWED_TESTNET_CHAINS,
@@ -159,6 +165,32 @@ HOLESKY = 17000
 TWO_CHAIN_ALLOWLIST = {SEPOLIA: "Ethereum Sepolia", HOLESKY: "Holesky"}
 
 
+@contextlib.contextmanager
+def _opted_out():
+    """Controlled environment patch (DSS-WO-ENG-015 R1): the REAL process
+    environment is the ONLY authorization authority, so offline tests
+    simulate the disabled gate by removing the opt-in from os.environ —
+    never by passing an authorization flag through an API."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("DSS_TESTNET_EXEC", None)
+        yield
+
+
+_MODULE_OPT_IN = None
+
+
+def setUpModule():
+    """DSS-WO-ENG-015 R1: the gate reads the REAL process environment at
+    every authorization. The offline suite simulates the explicit testnet
+    opt-in by patching os.environ for this module (controlled environment
+    patching — not an operational interface); disabled-gate tests remove
+    it again via _opted_out()."""
+    global _MODULE_OPT_IN
+    _MODULE_OPT_IN = patch.dict(os.environ, {"DSS_TESTNET_EXEC": "1"}, clear=False)
+    _MODULE_OPT_IN.start()
+    unittest.addModuleCleanup(_MODULE_OPT_IN.stop)
+
+
 def _restricted_write(path: str, data: bytes) -> None:
     with open(path, "wb") as f:
         f.write(data)
@@ -179,38 +211,32 @@ def _tmp_keystore(tmpdir: str, address: str = None):
 
 class TestGateDefaults(unittest.TestCase):
     def test_gate_disabled_by_default(self):
-        cfg = TestnetExecutionConfig.from_env(env={})
-        self.assertFalse(cfg.enabled)
-        with self.assertRaises(TestnetSafetyError) as ctx:
-            cfg.require_ready()
-        self.assertIn("DISABLED", str(ctx.exception))
-
-    def test_enabled_without_credentials_fails_closed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = TestnetExecutionConfig.from_env(env={
-                "DSS_TESTNET_EXEC": "1",
-                "DSS_TESTNET_RPC_URL": "https://sepolia.example",
-            })
-            cfg = TestnetExecutionConfig(
-                enabled=True,
-                rpc_url=cfg.rpc_url,
-                keystore_path=os.path.join(tmp, "missing.json"),
-                passphrase_path=os.path.join(tmp, "missing.pass"),
-                address_path=os.path.join(tmp, "missing.addr"),
-            )
+        """R1: the gate decision comes from the REAL environment — the
+        configuration object has no `enabled` state at all."""
+        self.assertNotIn("enabled", TestnetExecutionConfig.__dataclass_fields__)
+        with _opted_out():
+            cfg = TestnetExecutionConfig.from_env(env={})
             with self.assertRaises(TestnetSafetyError) as ctx:
                 cfg.require_ready()
-            self.assertIn("missing or not a regular file", str(ctx.exception))
+            self.assertIn("DISABLED", str(ctx.exception))
+
+    def test_enabled_without_credentials_fails_closed(self):
+        # R2: the custody locations are code-controlled policy — this test
+        # redirects them (controlled mock) to an EMPTY store: no keystore,
+        # no passphrase, no recorded address exist there.
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
+            cfg = TestnetExecutionConfig.from_env(env={
+                "DSS_TESTNET_RPC_URL": "https://sepolia.example",
+            })
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                cfg.require_ready()
+        self.assertIn("missing or not a regular file", str(ctx.exception))
 
     def test_enabled_with_unknown_chain_fails_closed(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             _tmp_keystore(tmp)
             cfg = TestnetExecutionConfig(
-                enabled=True,
                 rpc_url="https://x.example",
-                keystore_path=os.path.join(tmp, "keystore.json"),
-                passphrase_path=os.path.join(tmp, "pass"),
-                address_path=os.path.join(tmp, "address"),
                 expected_chain_id=8453,  # Base — mainnet L2, not allowlisted
             )
             with self.assertRaises(TestnetSafetyError):
@@ -218,15 +244,33 @@ class TestGateDefaults(unittest.TestCase):
 
     def test_from_env_cannot_inject_allowlist_or_relay(self):
         """The environment can configure only presence-type inputs; the
-        allowlist (and relay) are reviewed code constants, never settings."""
+        allowlist (and relay) are reviewed code constants, never settings.
+        R2: the config no longer even HAS a relay field — the reviewed
+        relay lives in the code-controlled SECURITY_POLICY."""
         cfg = TestnetExecutionConfig.from_env(env={
-            "DSS_TESTNET_EXEC": "1",
             "DSS_TESTNET_RPC_URL": "https://sepolia.example",
             "DSS_TESTNET_ALLOWLIST": "1,2,3",
         })
-        self.assertIsNone(cfg.allowlist)
-        self.assertIs(cfg.effective_allowlist(), ALLOWED_TESTNET_CHAINS)
-        self.assertEqual(cfg.relay_url, "https://relay-sepolia.flashbots.net")
+        # R1: the config no longer even HAS an allowlist field, and the
+        # opt-in is never taken from the `env` mapping passed to from_env.
+        self.assertNotIn("allowlist", TestnetExecutionConfig.__dataclass_fields__)
+        self.assertIs(_gate.effective_allowlist(), ALLOWED_TESTNET_CHAINS)
+        # R2: no relay/limit/custody/audit field is caller-settable either.
+        for gone in (
+            "relay_url", "tx_log_path", "keystore_path", "passphrase_path",
+            "address_path", "max_value_wei", "max_gas_units",
+            "max_fee_per_gas_wei", "max_priority_fee_wei", "max_total_fee_wei",
+        ):
+            self.assertNotIn(gone, TestnetExecutionConfig.__dataclass_fields__)
+        self.assertEqual(
+            _gate.SECURITY_POLICY.relay_url,
+            "https://relay-sepolia.flashbots.net",
+        )
+        with _opted_out():
+            with self.assertRaises(TestnetSafetyError):
+                # DSS_TESTNET_EXEC inside a caller-supplied mapping is NOT
+                # an authority: require_ready reads the REAL environment.
+                cfg.require_ready()
 
     def test_production_guard_untouched(self):
         """EXECUTE_ONCHAIN must remain the separate, unchanged production
@@ -250,10 +294,16 @@ class TestChainIdGate(unittest.TestCase):
             check_chain_id(1)
         self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
 
-    def test_mainnet_rejected_even_on_injected_allowlist(self):
-        """Mainnet can never be smuggled in through a test allowlist."""
-        with self.assertRaises(TestnetSafetyError) as ctx:
-            check_chain_id(1, allowlist=TWO_CHAIN_ALLOWLIST)
+    def test_mainnet_rejected_even_if_the_map_is_patched(self):
+        """Mainnet can never be smuggled in — not even by patching the
+        module map (a controlled mock, DSS-WO-ENG-015 R1: no API accepts
+        an alternative allowlist)."""
+        with patch.object(
+                _gate, "ALLOWED_TESTNET_CHAINS",
+                frozen_map({**_gate.ALLOWED_TESTNET_CHAINS, 1: "smuggled mainnet"}),
+        ):
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                check_chain_id(1)
         self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
 
     def test_unknown_chains_rejected(self):
@@ -270,19 +320,25 @@ class TestChainIdGate(unittest.TestCase):
             check_chain_id(11155111, expected=999999)
         self.assertIn("mismatch", str(ctx.exception))
 
-    def test_injected_allowlist_unexpected_chain_rejected(self):
-        """ENG-004 §6: with a controlled two-chain allowlist, an allowlisted
-        RPC chain that is not the expected one hits the real mismatch
-        branch."""
-        with self.assertRaises(TestnetSafetyError) as ctx:
-            check_chain_id(HOLESKY, expected=SEPOLIA, allowlist=TWO_CHAIN_ALLOWLIST)
+    def test_allowlisted_unexpected_chain_rejected(self):
+        """ENG-004 §6: with the module map controlled-mocked to two chains,
+        an allowlisted RPC chain that is not the expected one hits the real
+        mismatch branch (R1: map patching is a test technique, never an
+        operational interface)."""
+        with patch.object(
+                _gate, "ALLOWED_TESTNET_CHAINS",
+                frozen_map({**_gate.ALLOWED_TESTNET_CHAINS, HOLESKY: "Holesky"}),
+        ):
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                check_chain_id(HOLESKY, expected=SEPOLIA)
         self.assertIn("RPC chain mismatch", str(ctx.exception))
 
-    def test_injected_allowlist_expected_chain_accepted(self):
-        self.assertEqual(
-            check_chain_id(HOLESKY, expected=HOLESKY, allowlist=TWO_CHAIN_ALLOWLIST),
-            HOLESKY,
-        )
+    def test_allowlisted_expected_chain_accepted(self):
+        with patch.object(
+                _gate, "ALLOWED_TESTNET_CHAINS",
+                frozen_map({**_gate.ALLOWED_TESTNET_CHAINS, HOLESKY: "Holesky"}),
+        ):
+            self.assertEqual(check_chain_id(HOLESKY, expected=HOLESKY), HOLESKY)
 
     def test_allowlist_contains_sepolia_only(self):
         """Initially Sepolia only; any addition requires a documented
@@ -330,12 +386,15 @@ class TestTransactionPolicy(unittest.TestCase):
         self.assertIn("unverified contract targets", str(ctx.exception))
 
     def test_known_target_allowed(self):
+        """R1: no target override exists — tests patch the module map as a
+        controlled mock; production always uses the committed map."""
         contract = "0x" + "cc" * 20
         targets = {11155111: {contract: "reviewed test deployment"}}
-        out = validate_transaction(
-            self.base_tx(to=contract),
-            sender=self.SENDER, chain_id=11155111, known_targets=targets,
-        )
+        with patch.object(_gate, "KNOWN_TARGETS", targets):
+            out = validate_transaction(
+                self.base_tx(to=contract),
+                sender=self.SENDER, chain_id=11155111,
+            )
         self.assertEqual(out["to"], contract)
 
     def test_deployment_rejected(self):
@@ -365,22 +424,26 @@ class TestTransactionPolicy(unittest.TestCase):
     def test_unlimited_approval_rejected(self):
         unlimited = (2**256 - 1).to_bytes(32, "big")
         data = bytes.fromhex("095ea7b3") + b"\x00" * 32 + unlimited  # padded address word + amount
-        with self.assertRaises(TestnetSafetyError) as ctx:
-            validate_transaction(
-                self.base_tx(to="0x" + "cc" * 20, data=data),
-                sender=self.SENDER, chain_id=11155111,
-                known_targets={11155111: {"0x" + "cc" * 20: "token"}},
-            )
+        with patch.object(
+            _gate, "KNOWN_TARGETS", {11155111: {"0x" + "cc" * 20: "token"}},
+        ):
+            with self.assertRaises(TestnetSafetyError) as ctx:
+                validate_transaction(
+                    self.base_tx(to="0x" + "cc" * 20, data=data),
+                    sender=self.SENDER, chain_id=11155111,
+                )
         self.assertIn("approval rejected", str(ctx.exception))
 
     def test_bounded_approval_allowed(self):
         bounded = (10**15).to_bytes(32, "big")
         data = bytes.fromhex("095ea7b3") + b"\x00" * 32 + bounded
-        out = validate_transaction(
-            self.base_tx(to="0x" + "cc" * 20, data=data),
-            sender=self.SENDER, chain_id=11155111,
-            known_targets={11155111: {"0x" + "cc" * 20: "token"}},
-        )
+        with patch.object(
+            _gate, "KNOWN_TARGETS", {11155111: {"0x" + "cc" * 20: "token"}},
+        ):
+            out = validate_transaction(
+                self.base_tx(to="0x" + "cc" * 20, data=data),
+                sender=self.SENDER, chain_id=11155111,
+            )
         self.assertEqual(out["to"], "0x" + "cc" * 20)
 
     def test_chain_id_binding_enforced(self):
@@ -511,82 +574,72 @@ class TestBundlePolicy(unittest.TestCase):
 
 class TestWalletCustody(unittest.TestCase):
     def _store(self, tmp):
+        """Throwaway store: the custody paths come from the (patched)
+        code-controlled policy constants, never from a config object."""
         info = _tmp_keystore(tmp)
         return (
-            TestnetExecutionConfig(
-                enabled=True,
-                rpc_url="https://sepolia.example",
-                keystore_path=os.path.join(tmp, "keystore.json"),
-                passphrase_path=os.path.join(tmp, "pass"),
-                address_path=os.path.join(tmp, "address"),
-            ),
+            IsolatedTestnetConfig(rpc_url="https://sepolia.example"),
             info["account"],
         )
 
     def test_roundtrip_returns_local_account_bound_to_recorded_address(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._store(tmp)
-            account = load_agent_wallet(cfg)
+            account = load_agent_wallet()
             self.assertIsInstance(account, LocalAccount)
             self.assertEqual(account.address.lower(), acct.address.lower())
 
     def test_identity_mismatch_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, _ = self._store(tmp)
             impostor = Account.create().address
-            _restricted_write(os.path.join(tmp, "address"), (impostor + "\n").encode())
+            _restricted_write(_gate.DEFAULT_ADDRESS_PATH, (impostor + "\n").encode())
             with self.assertRaises(TestnetSafetyError) as ctx:
-                load_agent_wallet(cfg)
+                load_agent_wallet()
             self.assertIn("identity mismatch", str(ctx.exception))
 
     def test_symlinked_keystore_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             real_dir = tempfile.mkdtemp()
             _tmp_keystore(real_dir)
             os.symlink(
                 os.path.join(real_dir, "keystore.json"),
                 os.path.join(tmp, "keystore.json"),
             )
-            _restricted_write(os.path.join(tmp, "pass"), b"78746573742d70617373706872617365")
-            cfg = TestnetExecutionConfig(
-                enabled=True, rpc_url="https://sepolia.example",
-                keystore_path=os.path.join(tmp, "keystore.json"),
-                passphrase_path=os.path.join(tmp, "pass"),
-                address_path=os.path.join(real_dir, "address"),
-            )
+            _restricted_write(_gate.DEFAULT_PASSPHRASE_PATH, b"78746573742d70617373706872617365")
             with self.assertRaises(TestnetSafetyError) as ctx:
-                verify_secret_store(cfg)
+                verify_secret_store()
             self.assertIn("symlink", str(ctx.exception))
 
     def test_loose_keystore_permissions_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, _ = self._store(tmp)
             os.chmod(cfg.keystore_path, 0o644)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                verify_secret_store(cfg)
+                verify_secret_store()
             self.assertIn("permissions too open", str(ctx.exception))
 
     def test_world_accessible_directory_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, _ = self._store(tmp)
             os.chmod(tmp, 0o755)
             try:
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    verify_secret_store(cfg)
+                    verify_secret_store()
                 self.assertIn("accessible to other users", str(ctx.exception))
             finally:
                 os.chmod(tmp, 0o700)
 
     def test_missing_passphrase_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, _ = self._store(tmp)
             os.remove(cfg.passphrase_path)
             with self.assertRaises(TestnetSafetyError):
-                verify_secret_store(cfg)
+                verify_secret_store()
 
     def test_non_hex_passphrase_refused(self):
         from executor.testnet_gate import decode_passphrase_file
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             path = os.path.join(tmp, "pass")
             _restricted_write(path, b"raw-secret-passphrase")  # not hex
             with self.assertRaises(TestnetSafetyError) as ctx:
@@ -594,11 +647,11 @@ class TestWalletCustody(unittest.TestCase):
             self.assertIn("hex-encoded", str(ctx.exception))
 
     def test_non_v3_keystore_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, _ = self._store(tmp)
             _restricted_write(cfg.keystore_path, json.dumps({"version": 1}).encode())
             with self.assertRaises(TestnetSafetyError) as ctx:
-                load_agent_wallet(cfg)
+                load_agent_wallet()
             self.assertIn("secret-storage v3", str(ctx.exception))
 
 
@@ -671,15 +724,13 @@ class _RelayStub:
             )
 
 
-def _bundle_cfg(tmp, *, enabled=True, allowlist=None):
-    return TestnetExecutionConfig(
-        enabled=enabled,
+def _bundle_cfg(tmp):
+    return IsolatedTestnetConfig(
         rpc_url="https://sepolia.example",
         keystore_path=os.path.join(tmp, "keystore.json"),
         passphrase_path=os.path.join(tmp, "pass"),
         address_path=os.path.join(tmp, "address"),
         tx_log_path=os.path.join(tmp, "txlog.jsonl"),
-        allowlist=allowlist,
     )
 
 
@@ -799,7 +850,7 @@ def _minted_capability(tmp, *, intent_tx, signed_tx,
     return prepared, relay, acct, cfg
 
 
-def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
+def _prepared_bundle(tmp, relay, *, n_txs=1,
                      fee_price_gwei=2, chain_values=(SEPOLIA,), head=99,
                      purpose="capability session test",
                      rpc_url="https://sepolia.example",
@@ -815,14 +866,12 @@ def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
     ENG-009 tests register credential-bearing RELAY URL material too."""
     info = _tmp_keystore(tmp)
     acct = info["account"]
-    cfg = TestnetExecutionConfig(
-        enabled=enabled,
+    cfg = IsolatedTestnetConfig(
         rpc_url=rpc_url,
         keystore_path=os.path.join(tmp, "keystore.json"),
         passphrase_path=os.path.join(tmp, "pass"),
         address_path=os.path.join(tmp, "address"),
         tx_log_path=os.path.join(tmp, "txlog.jsonl"),
-        allowlist=allowlist,
         relay_url=relay_url,
     )
     w3 = _PrepareW3(chain_values=chain_values, head=head)
@@ -834,11 +883,10 @@ def _prepared_bundle(tmp, relay, *, enabled=True, allowlist=None, n_txs=1,
         }
         for _ in range(n_txs)
     ]
-    session = prepare_flashbots_bundle(
-        txs, purpose=purpose, config=cfg,
-        web3_factory=lambda url: w3,
-        relay_factory=lambda url, auth, relay_url: relay,
-    )
+    with offline_transports(rpc=w3, relay=relay):
+        session = prepare_flashbots_bundle(
+            txs, purpose=purpose, config=cfg,
+        )
     target = session._prepared.target_block
     return session, cfg, target, acct
 
@@ -857,14 +905,14 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         """With DSS_TESTNET_EXEC disabled, Flashbots preparation must fail
         at the gate BEFORE the wallet is decrypted and before the relay is
         touched (ENG-005 §2 reqs 1–2)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub()
             with patch(
                 "executor.testnet_gate.load_agent_wallet",
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
-                with self.assertRaises(TestnetSafetyError) as ctx:
-                    self._prepare(tmp, relay, enabled=False)
+                with _opted_out(), self.assertRaises(TestnetSafetyError) as ctx:
+                    self._prepare(tmp, relay)
             self.assertIn("DISABLED", str(ctx.exception))
             relay.assert_not_called()
 
@@ -874,7 +922,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         have passed — and the relay is never contacted during prepare.
         The signed payload is read white-box (ENG-006 §2: no helper hands
         it out)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub()
             session, cfg, target, acct = self._prepare(tmp, relay)
             relay.assert_not_called()
@@ -889,43 +937,39 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_both_transports_use_same_gate_and_wallet_identity(self):
         """Direct RPC and Flashbots preparation pass the SAME gate and sign
         with the SAME recorded wallet identity (ENG-005 §2 req 8)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
-            base = dict(
-                rpc_url="https://sepolia.example",
-                keystore_path=os.path.join(tmp, "keystore.json"),
-                passphrase_path=os.path.join(tmp, "pass"),
-                address_path=os.path.join(tmp, "address"),
-                tx_log_path=os.path.join(tmp, "txlog.jsonl"),
-            )
-            disabled = TestnetExecutionConfig(enabled=False, **base)
-            # Both transports refuse at the gate, before any signing.
-            with self.assertRaises(TestnetSafetyError) as direct_err:
-                sign_and_submit_testnet_tx(
-                    {"to": acct.address, "value": 0, "gas": 21000, "data": b""},
-                    purpose="gate parity", config=disabled,
-                    web3_factory=lambda url: MagicMock(),
-                )
+            # R2: operational-only config; custody/audit come from the
+            # patched code-controlled policy constants.
+            disabled = IsolatedTestnetConfig(rpc_url="https://sepolia.example")
+            # Both transports refuse at the gate, before any signing. R1:
+            # the refusal comes from the authoritative REAL environment
+            # read (_opted_out removes the opt-in from os.environ).
+            with _opted_out(), self.assertRaises(TestnetSafetyError) as direct_err:
+                with offline_transports(rpc=MagicMock()):
+                    sign_and_submit_testnet_tx(
+                        {"to": acct.address, "value": 0, "gas": 21000, "data": b""},
+                        purpose="gate parity", config=disabled,
+                    )
             self.assertIn("DISABLED", str(direct_err.exception))
             relay = _RelayStub()
             with patch(
                 "executor.testnet_gate.load_agent_wallet",
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
-                with self.assertRaises(TestnetSafetyError) as fb_err:
-                    prepare_flashbots_bundle(
-                        [{"to": acct.address, "value": 0}],
-                        purpose="gate parity", config=disabled,
-                        web3_factory=lambda url: _PrepareW3(),
-                        relay_factory=lambda url, auth, relay_url: relay,
-                    )
+                with _opted_out(), self.assertRaises(TestnetSafetyError) as fb_err:
+                    with offline_transports(rpc=_PrepareW3(), relay=relay):
+                        prepare_flashbots_bundle(
+                            [{"to": acct.address, "value": 0}],
+                            purpose="gate parity", config=disabled,
+                        )
             self.assertIn("DISABLED", str(fb_err.exception))
             relay.assert_not_called()
 
             # With the gate enabled, both transports sign with the same
             # wallet — the one bound to the recorded address.
-            enabled = TestnetExecutionConfig(enabled=True, **base)
+            enabled = IsolatedTestnetConfig(rpc_url="https://sepolia.example")
             sent = []
 
             class _DirectW3:
@@ -950,18 +994,17 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             w3.eth.wait_for_transaction_receipt.return_value = {
                 "status": 1, "gasUsed": 21000,
             }
-            sign_and_submit_testnet_tx(
-                {"to": acct.address, "value": 0, "gas": 21000, "data": b""},
-                purpose="gate parity", config=enabled,
-                web3_factory=lambda url: w3,
-            )
+            with offline_transports(rpc=w3):
+                sign_and_submit_testnet_tx(
+                    {"to": acct.address, "value": 0, "gas": 21000, "data": b""},
+                    purpose="gate parity", config=enabled,
+                )
             from eth_account import Account as _A
-            fb_session = prepare_flashbots_bundle(
-                [{"to": acct.address, "value": 0}],
-                purpose="gate parity", config=enabled,
-                web3_factory=lambda url: _PrepareW3(),
-                relay_factory=lambda url, auth, relay_url: _RelayStub(),
-            )
+            with offline_transports(rpc=_PrepareW3(), relay=_RelayStub()):
+                fb_session = prepare_flashbots_bundle(
+                    [{"to": acct.address, "value": 0}],
+                    purpose="gate parity", config=enabled,
+                )
             self.assertEqual(
                 _A.recover_transaction(sent[0]).lower(), acct.address.lower()
             )
@@ -975,7 +1018,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_direct_session_construction_refused(self):
         """Only the sanctioned preparation path may create a session: every
         externally supplied object is refused (ENG-005 §3)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub()
             # legacy keyword construction no longer exists
             with self.assertRaises(TypeError):
@@ -1001,7 +1044,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_capability_minting_requires_authority(self):
         """PreparedFlashbotsBundle refuses external construction: no
         authority token → hard error (ENG-005 §3)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg = _bundle_cfg(tmp)
             with self.assertRaises(TypeError):
                 # _authority is a required keyword — missing → refused
@@ -1030,7 +1073,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         here ONLY to place a deliberately mismatched capability in front
         of the session constructor; production cannot mint capabilities
         outside prepare_flashbots_bundle."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub()
             impostor = Account.create()  # signs, but is NOT the recorded wallet
             recorded = Account.create()  # the "recorded" identity
@@ -1064,7 +1107,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         cannot gain submission authority by being passed to them, and the
         relay receives exactly the prepared payload for the prepared block
         (ENG-005 §3)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, target, acct = self._prepare(tmp, relay)
             payload = list(session._prepared._state.signed_payload)
@@ -1097,7 +1140,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         """Any alteration to the signed payload (e.g. a changed fee
         envelope produces different bytes) yields a DIFFERENT fingerprint,
         so it can never match the recorded authorization (ENG-005 §3)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, target, acct = self._prepare(tmp, relay)
             prepared = session._prepared
@@ -1117,7 +1160,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     # ── §3/§4: simulate → submit lifecycle, audit, one-use ──────────────
 
     def test_submit_without_simulation_refused_before_relay(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub()
             session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError) as ctx:
@@ -1127,7 +1170,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertIn("submission_refused", _audit_outcomes(cfg))
 
     def test_failed_simulation_prevents_submission_and_is_audited(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(sim_result={"error": {"message": "execution reverted"}})
             session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError) as ctx:
@@ -1144,7 +1187,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertNotIn(raw.hex(), log)
 
     def test_reverting_transaction_prevents_submission(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             sim = _ok_simulation()
             sim["results"][0]["error"] = "execution reverted"
             relay = _RelayStub(sim_result=sim)
@@ -1156,7 +1199,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertIn("simulation_failed", _audit_outcomes(cfg))
 
     def test_first_revert_response_prevents_submission(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             sim = _ok_simulation()
             sim["firstRevert"] = "0x" + "ee" * 32
             relay = _RelayStub(sim_result=sim)
@@ -1167,7 +1210,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertIn("simulation_failed", _audit_outcomes(cfg))
 
     def test_empty_simulation_results_fail_closed(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(sim_result={"bundleHash": "0x1", "results": []})
             session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError) as ctx:
@@ -1176,7 +1219,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertIn("simulation_failed", _audit_outcomes(cfg))
 
     def test_missing_simulation_response_fails_closed(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(sim_result=None)
             session, cfg, _, _ = self._prepare(tmp, relay)
             with self.assertRaises(TestnetSafetyError):
@@ -1185,7 +1228,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertIn("simulation_failed", _audit_outcomes(cfg))
 
     def test_result_count_mismatch_fails_closed(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(sim_result=_ok_simulation(n_txs=1))
             session, cfg, _, _ = self._prepare(tmp, relay, n_txs=2)
             with self.assertRaises(TestnetSafetyError) as ctx:
@@ -1194,7 +1237,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertIn("simulation_failed", _audit_outcomes(cfg))
 
     def test_stale_simulation_prevents_submission(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = self._prepare(tmp, relay)
             session.simulate()           # authorized at head 99, target 100
@@ -1213,14 +1256,17 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         """Allowlisted chains both; expected Sepolia. The relay transport
         reports Sepolia through preparation, session construction and
         simulation, then Holesky at submission — the binding refuses."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(chain_values=(SEPOLIA, SEPOLIA, HOLESKY))
-            session, cfg, _, _ = self._prepare(
-                tmp, relay, allowlist=TWO_CHAIN_ALLOWLIST
-            )
-            session.simulate()
-            with self.assertRaises(TestnetSafetyError) as ctx:
-                session.submit()
+            with patch.object(
+                    _gate, "ALLOWED_TESTNET_CHAINS",
+                    frozen_map({**_gate.ALLOWED_TESTNET_CHAINS,
+                                HOLESKY: "Holesky"}),
+            ):
+                session, cfg, _, _ = self._prepare(tmp, relay)
+                session.simulate()
+                with self.assertRaises(TestnetSafetyError) as ctx:
+                    session.submit()
             self.assertIn("RPC chain mismatch", str(ctx.exception))
             self.assertFalse(relay.send_calls)
             self.assertIn("submission_refused", _audit_outcomes(cfg))
@@ -1230,11 +1276,11 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         authority ONLY to place the session under a disabled gate — a
         state production can never reach because preparation requires the
         gate. submit() must still re-check the flag itself."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             info = _tmp_keystore(tmp)
             acct = info["account"]
-            cfg = _bundle_cfg(tmp, enabled=False)
+            cfg = _bundle_cfg(tmp)
             signed = acct.sign_transaction({
                 "to": acct.address, "value": 0, "gas": 21000,
                 "gasPrice": 10**9, "nonce": 0, "chainId": SEPOLIA,
@@ -1254,14 +1300,14 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             )
             session = FlashbotsBundleSession(relay, prepared)
             session.simulate()  # read-only relay op needs no gate
-            with self.assertRaises(TestnetSafetyError) as ctx:
-                session.submit()
+            with _opted_out(), self.assertRaises(TestnetSafetyError) as ctx:
+                session.submit()  # R1: re-checks the REAL environment
             self.assertIn("DSS_TESTNET_EXEC=1", str(ctx.exception))
             self.assertFalse(relay.send_calls)
             self.assertIn("submission_refused", _audit_outcomes(cfg))
 
     def test_happy_path_audits_and_consumes_authorization(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, target, _ = self._prepare(tmp, relay)
             payload = list(session._prepared._state.signed_payload)
@@ -1290,7 +1336,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         """A relay failure after the authorization is consumed must not
         leave a reusable authorization behind: retries require a NEW
         successful simulation (ENG-005 §4)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = self._prepare(tmp, relay)
             session.simulate()
@@ -1325,7 +1371,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
     def test_relay_rejection_audited(self):
         """An explicit relay error inside a 200-style response is recorded
         as a REJECTION and fails closed (ENG-005 §4)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = self._prepare(tmp, relay)
             session.simulate()
@@ -1343,7 +1389,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             self.assertIn("bundle target block in the past", rejected["error"])
 
     def test_relay_result_without_hash_is_uncertain(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = self._prepare(tmp, relay)
             session.simulate()
@@ -1362,7 +1408,7 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         exception containment per ENG-007 Finding A) — including failure
         paths. The exception must be clean across message, str(), repr(),
         args, formatted traceback and the cause/context chain."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = self._prepare(tmp, relay)
             raw = session._prepared._state.signed_payload[0]
@@ -1466,12 +1512,11 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
     def test_prepare_refuses_over_limit_bundle_before_wallet_decryption(self):
         """The aggregate check fires BEFORE the wallet is decrypted or
         anything is signed (ENG-005 §5)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub()
             info = _tmp_keystore(tmp)
             acct = info["account"]
-            cfg = TestnetExecutionConfig(
-                enabled=True,
+            cfg = IsolatedTestnetConfig(
                 rpc_url="https://sepolia.example",
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -1491,17 +1536,16 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    prepare_flashbots_bundle(
-                        over, purpose="over-limit bundle",
-                        config=cfg,
-                        web3_factory=lambda url: _PrepareW3(),
-                        relay_factory=lambda url, auth, relay_url: relay,
-                    )
+                    with offline_transports(rpc=_PrepareW3(), relay=relay):
+                        prepare_flashbots_bundle(
+                            over, purpose="over-limit bundle",
+                            config=cfg,
+                        )
             self.assertIn("aggregate bundle fee exposure", str(ctx.exception))
             relay.assert_not_called()
 
     def test_prepare_accepts_bundle_within_aggregate_cap(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub()
             session, cfg, target, acct = _prepared_bundle(
                 tmp, relay, n_txs=2, fee_price_gwei=40
@@ -1521,12 +1565,11 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
         """A bundle with an unvalidated recipient is refused before the
         wallet is ever decrypted (ENG-005 §3 — the validated intent in the
         capability can only contain policy-compliant transactions)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub()
             info = _tmp_keystore(tmp)
             acct = info["account"]
-            cfg = TestnetExecutionConfig(
-                enabled=True,
+            cfg = IsolatedTestnetConfig(
                 rpc_url="https://sepolia.example",
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -1539,13 +1582,12 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    prepare_flashbots_bundle(
-                        [{"to": stranger, "value": 1}],
-                        purpose="unvalidated recipient",
-                        config=cfg,
-                        web3_factory=lambda url: _PrepareW3(),
-                        relay_factory=lambda url, auth, relay_url: relay,
-                    )
+                    with offline_transports(rpc=_PrepareW3(), relay=relay):
+                        prepare_flashbots_bundle(
+                            [{"to": stranger, "value": 1}],
+                            purpose="unvalidated recipient",
+                            config=cfg,
+                        )
             self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
             relay.assert_not_called()
 
@@ -1610,7 +1652,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
     # ── immutability ────────────────────────────────────────────────────
 
     def test_capability_state_is_frozen_after_creation(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, target, acct, relay = self._session(tmp)
             prepared = session._prepared
             with self.assertRaises(TestnetSafetyError):
@@ -1629,7 +1671,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
             self.assertEqual(prepared.target_block, target)
 
     def test_intent_records_are_immutable_not_dicts(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, target, acct, relay = self._session(tmp)
             intents = session._prepared.intents
             self.assertEqual(len(intents), 1)
@@ -1664,7 +1706,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
         # capability creation stays inside the sanctioned preparation
         # function: the module exposes no mint helper other than _mint,
         # which requires the private token
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg = _bundle_cfg(tmp)
             with self.assertRaises(TypeError):
                 PreparedFlashbotsBundle(
@@ -1675,7 +1717,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
                 )
 
     def test_capability_has_no_signed_payload_accessor(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, target, acct, relay = self._session(tmp)
             prepared = session._prepared
             public = [n for n in dir(prepared) if not n.startswith("_")]
@@ -1690,7 +1732,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
         normalized validated intent — recovered sender, chain ID,
         recipient, nonce, value, calldata, gas limit and the fee
         envelope."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, target, acct, relay = self._session(tmp)
             st = session._prepared._state
             self.assertEqual(len(st.signed_payload), len(st.intents))
@@ -1734,7 +1776,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
         relay.assert_not_called()
 
     def test_wrong_chain_in_signed_payload_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             signed = self._base_1559(acct)
@@ -1749,7 +1791,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
     def test_wrong_recipient_in_signed_payload_refused(self):
         from eth_utils import to_checksum_address
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             signed = self._base_1559(acct)
@@ -1762,7 +1804,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
             )
 
     def test_wrong_nonce_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             signed = self._base_1559(acct)
@@ -1775,7 +1817,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
             )
 
     def test_changed_value_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             signed = self._base_1559(acct)
@@ -1788,7 +1830,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
             )
 
     def test_changed_calldata_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             signed = self._base_1559(acct)
@@ -1801,7 +1843,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
             )
 
     def test_changed_gas_limit_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             signed = self._base_1559(acct)
@@ -1814,7 +1856,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
             )
 
     def test_changed_fee_price_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             signed = self._base_1559(acct)
@@ -1830,7 +1872,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
         """The fingerprint binds the exact bytes, but the DECODED envelope
         comparison is what catches a legacy re-sign of the same intent:
         a 1559 intent must never be satisfiable by a legacy payload."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             signed = {
@@ -1847,7 +1889,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
             )
 
     def test_changed_fee_envelope_legacy_to_1559_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             signed = {
@@ -1870,7 +1912,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
     def test_unknown_envelope_refused(self):
         """A type-0x03 (or any other unknown typed) payload must fail
         closed, never reach the relay."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             intent = {
@@ -1903,7 +1945,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
     def test_decoder_refuses_unknown_envelope_directly(self):
         """The signed-transaction decoder itself refuses every envelope
         other than legacy and EIP-1559 (DSS-WO-ENG-006 §3)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             tx = {
@@ -1924,7 +1966,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
                 _decode_signed_tx(raw[: len(raw) // 2])
 
     def test_intent_count_mismatch_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             intent = {
@@ -1954,7 +1996,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
         exposure exceeds 0.002 native is refused at binding verification —
         before ANY relay interaction — even though each transaction is
         individually within the per-tx cap."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             intent = {
@@ -1992,7 +2034,7 @@ class TestCapabilityIntegrityENG006(unittest.TestCase):
     def test_fee_recheck_holds_recorded_total_against_intents(self):
         """The recorded exposure must equal the exposure re-derived from
         the frozen intents — a mismatched record refuses the session."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             acct = info["account"]
             intent = {
@@ -2026,7 +2068,7 @@ class TestPayloadContainmentENG006(unittest.TestCase):
     bytes, and preflight infrastructure failures are audited."""
 
     def test_simulation_response_is_scrubbed(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             sim = _ok_simulation()
             sim["results"][0]["signed_transaction"] = "0x" + "ab" * 60
             sim["results"][0]["raw_blob"] = "0x" + "ef" * 55
@@ -2044,7 +2086,7 @@ class TestPayloadContainmentENG006(unittest.TestCase):
             self.assertIn("simulated", _audit_outcomes(cfg))
 
     def test_submission_result_is_scrubbed(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, target, acct = _prepared_bundle(tmp, relay)
             session.simulate()
@@ -2066,7 +2108,7 @@ class TestPayloadContainmentENG006(unittest.TestCase):
         """DSS-WO-ENG-006 §6: an infrastructure/RPC failure during
         preflight must not silently escape the audit path once the
         attempt has been initiated."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _InfraFailureRelay(head=99, ok_reads=1)
             session, cfg, target, acct = _prepared_bundle(tmp, relay)
             # ENG-007 Finding A: the raw ConnectionError is replaced by a
@@ -2097,7 +2139,7 @@ class TestPayloadContainmentENG006(unittest.TestCase):
             self.assertFalse(relay.simulate_calls)  # relay never reached
 
     def test_preflight_infra_failure_on_submit_is_audited(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _InfraFailureRelay(head=99, ok_reads=2)
             session, cfg, target, acct = _prepared_bundle(tmp, relay)
             session.simulate()  # read 2 — still healthy
@@ -2127,7 +2169,7 @@ class TestPayloadContainmentENG006(unittest.TestCase):
 
 class TestAuditLog(unittest.TestCase):
     def test_record_shape_and_no_credentials(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             path = os.path.join(tmp, "txlog.jsonl")
             rec = record_testnet_tx(
                 path,
@@ -2155,8 +2197,7 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
 
     def _provisioned(self, tmp):
         info = _tmp_keystore(tmp)
-        return TestnetExecutionConfig(
-            enabled=True,
+        return IsolatedTestnetConfig(
             rpc_url="https://sepolia.example",
             keystore_path=os.path.join(tmp, "keystore.json"),
             passphrase_path=os.path.join(tmp, "pass"),
@@ -2175,17 +2216,17 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
         return w3
 
     def test_happy_path_records_mined_tx(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._provisioned(tmp)
             w3 = self._mock_w3()
-            record = sign_and_submit_testnet_tx(
-                # The runner never invents recipients: the intent itself must
-                # name the agent wallet for a self-transfer.
-                {"to": sender, "value": 0, "gas": 21000, "data": b""},
-                purpose="self 0-value relay check",
-                config=cfg,
-                web3_factory=lambda url: w3,
-            )
+            with offline_transports(rpc=w3):
+                record = sign_and_submit_testnet_tx(
+                    # The runner never invents recipients: the intent itself must
+                    # name the agent wallet for a self-transfer.
+                    {"to": sender, "value": 0, "gas": 21000, "data": b""},
+                    purpose="self 0-value relay check",
+                    config=cfg,
+                )
             self.assertEqual(record["outcome"], "mined")
             self.assertEqual(record["chain_id"], 11155111)
             self.assertEqual(record["actual_gas_used"], 21000)
@@ -2193,38 +2234,37 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
             self.assertTrue(w3.eth.send_raw_transaction.called)
 
     def test_disabled_gate_blocks_before_any_rpc_or_signing(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, _ = self._provisioned(tmp)
-            disabled = TestnetExecutionConfig(
-                enabled=False,
+            disabled = IsolatedTestnetConfig(
                 rpc_url=cfg.rpc_url,
                 keystore_path=cfg.keystore_path,
                 passphrase_path=cfg.passphrase_path,
                 address_path=cfg.address_path,
             )
             w3 = MagicMock()
-            with self.assertRaises(TestnetSafetyError):
-                sign_and_submit_testnet_tx(
-                    {"to": None, "value": 0, "gas": 21000, "data": b""},
-                    purpose="should never run",
-                    config=disabled,
-                    web3_factory=lambda url: w3,
-                )
+            with _opted_out(), self.assertRaises(TestnetSafetyError):
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": None, "value": 0, "gas": 21000, "data": b""},
+                        purpose="should never run",
+                        config=disabled,
+                    )
             w3.eth.assert_not_called() if hasattr(w3, "eth") else None
             self.assertFalse(w3.method_calls)
 
     def test_mainnet_rpc_blocks_before_signing(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, _ = self._provisioned(tmp)
             w3 = self._mock_w3()
             w3.eth.chain_id = 1  # RPC reports MAINNET
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": None, "value": 0, "gas": 21000, "data": b""},
-                    purpose="should never sign",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": None, "value": 0, "gas": 21000, "data": b""},
+                        purpose="should never sign",
+                        config=cfg,
+                    )
             self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
             # No signing occurred: the send was never reached.
             self.assertFalse(w3.eth.send_raw_transaction.called)
@@ -2233,29 +2273,32 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
         """ENG-004 §6 (replaces the old ineffective test): the REAL mismatch
         branch. The expected chain IS allowlisted (require_ready passes) and
         the RPC reports a DIFFERENT allowlisted chain — the mismatch must
-        fire before wallet signing. Production allowlist is never touched;
-        a controlled allowlist is injected explicitly."""
-        with tempfile.TemporaryDirectory() as tmp:
+        fire before wallet signing. The production map is never changed;
+        the module map is controlled-mocked for this test only (R1)."""
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, _ = self._provisioned(tmp)
-            cfg = TestnetExecutionConfig(
-                enabled=True,
+            cfg = IsolatedTestnetConfig(
                 rpc_url=cfg.rpc_url,
                 keystore_path=cfg.keystore_path,
                 passphrase_path=cfg.passphrase_path,
                 address_path=cfg.address_path,
                 tx_log_path=cfg.tx_log_path,
                 expected_chain_id=SEPOLIA,           # allowlisted → ready
-                allowlist=TWO_CHAIN_ALLOWLIST,       # controlled test injection
             )
             w3 = self._mock_w3()
-            w3.eth.chain_id = HOLESKY                # allowlisted, unexpected
-            with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": None, "value": 0, "gas": 21000, "data": b""},
-                    purpose="should never sign",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+            w3.eth.chain_id = HOLESKY           # allowlisted (mocked), unexpected
+            with patch.object(
+                    _gate, "ALLOWED_TESTNET_CHAINS",
+                    frozen_map({**_gate.ALLOWED_TESTNET_CHAINS,
+                                HOLESKY: "Holesky"}),
+            ), \
+                    self.assertRaises(TestnetSafetyError) as ctx:
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": None, "value": 0, "gas": 21000, "data": b""},
+                        purpose="should never sign",
+                        config=cfg,
+                    )
             self.assertIn("RPC chain mismatch", str(ctx.exception))
             self.assertFalse(w3.eth.send_raw_transaction.called)
 
@@ -2306,58 +2349,61 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
         """ENG-004 §6: the RPC reports Sepolia up to and including signing,
         then changes identity before submission — the pre-submission check
         must refuse to send."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._provisioned(tmp)
-            cfg = TestnetExecutionConfig(
-                enabled=True,
+            cfg = IsolatedTestnetConfig(
                 rpc_url=cfg.rpc_url,
                 keystore_path=cfg.keystore_path,
                 passphrase_path=cfg.passphrase_path,
                 address_path=cfg.address_path,
                 tx_log_path=cfg.tx_log_path,
                 expected_chain_id=SEPOLIA,
-                allowlist=TWO_CHAIN_ALLOWLIST,  # both chains allowlisted
             )
             w3 = self._flipping_w3([SEPOLIA, SEPOLIA, HOLESKY])
-            with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": sender, "value": 0, "gas": 21000, "data": b""},
-                    purpose="chain flip must never send",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+            with patch.object(
+                    _gate, "ALLOWED_TESTNET_CHAINS",
+                    frozen_map({**_gate.ALLOWED_TESTNET_CHAINS,
+                                HOLESKY: "Holesky"}),
+            ), \
+                    self.assertRaises(TestnetSafetyError) as ctx:
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": sender, "value": 0, "gas": 21000, "data": b""},
+                        purpose="chain flip must never send",
+                        config=cfg,
+                    )
             self.assertIn("RPC chain mismatch", str(ctx.exception))
             self.assertEqual(w3.submitted, 0)  # never sent
 
     def test_policy_violation_blocks_before_signing(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, _ = self._provisioned(tmp)
             w3 = self._mock_w3()
             stranger = "0x" + "bb" * 20
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": stranger, "value": 10**15, "gas": 21000, "data": b""},
-                    purpose="arbitrary transfer must never sign",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": stranger, "value": 10**15, "gas": 21000, "data": b""},
+                        purpose="arbitrary transfer must never sign",
+                        config=cfg,
+                    )
             self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
             self.assertFalse(w3.eth.send_raw_transaction.called)
 
     def test_over_cap_rpc_suggested_fee_blocks_before_signing(self):
         """If the RPC suggests a fee price above the monetary policy, the
         filled transaction is refused — never silently clipped."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._provisioned(tmp)
             w3 = self._mock_w3()
             w3.eth.get_block.return_value = {"baseFeePerGas": 400 * 10**9}
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": sender, "value": 0, "gas": 21000, "data": b""},
-                    purpose="over-cap fee must never sign",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": sender, "value": 0, "gas": 21000, "data": b""},
+                        purpose="over-cap fee must never sign",
+                        config=cfg,
+                    )
             self.assertIn("exceeds the testnet cap", str(ctx.exception))
             self.assertFalse(w3.eth.send_raw_transaction.called)
 
@@ -2382,7 +2428,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
     # ── mandatory regression 1: send_bundle transport error ─────────────
 
     def test_send_bundle_transport_error_never_reaches_the_caller(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay, payload_hex = self._leak_setup(tmp)
             session.simulate()
 
@@ -2425,7 +2471,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
     # ── mandatory regression 1b: JSON-RPC ValueError classifies rejected ─
 
     def test_json_rpc_rejection_classifies_rejected_and_stays_clean(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay, payload_hex = self._leak_setup(tmp)
             session.simulate()
 
@@ -2451,7 +2497,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
     # ── mandatory regression 2: simulation transport error ──────────────
 
     def test_simulation_transport_error_never_reaches_the_caller(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay, payload_hex = self._leak_setup(tmp)
 
             def _boom(bundle, block_tag, *args, **kwargs):
@@ -2490,7 +2536,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
     # ── mandatory regression 3: explicit relay error body ───────────────
 
     def test_explicit_relay_error_text_is_sanitized_for_the_caller(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay, payload_hex = self._leak_setup(tmp)
             session.simulate()
 
@@ -2519,7 +2565,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
         """DSS-WO-ENG-007 Finding A (hash-field hardening): a hostile
         relay cannot use the bundleHash field to write the signed payload
         into the audit log; a legitimate 32-byte hash still passes."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay, payload_hex = self._leak_setup(tmp)
             session.simulate()
             relay.send_bundle = lambda bundle, target_block_number=None, **kw: {
@@ -2539,7 +2585,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
     # ── mandatory regression 4: simulation error responses ──────────────
 
     def test_simulation_top_level_error_is_sanitized_for_the_caller(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)  # healthy for preparation
             session, cfg, _, _ = _prepared_bundle(tmp, relay)
             payload_hex = bytes(
@@ -2561,7 +2607,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
             self.assertNotIn(payload_hex, json.dumps(recs))
 
     def test_simulation_first_revert_is_sanitized_for_the_caller(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(tmp, relay)
             payload_hex = bytes(
@@ -2578,7 +2624,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
             self.assertNotIn(payload_hex, str(exc))
 
     def test_simulation_per_tx_error_is_sanitized_for_the_caller(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(tmp, relay)
             payload_hex = bytes(
@@ -2601,7 +2647,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
         refusal (before the relay call) does NOT consume the successful
         simulation's authorization; repairing the transport and
         re-submitting works without a new simulation."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(tmp, relay)
             session.simulate()
@@ -2631,7 +2677,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
         rejected / uncertain paths, no payload or credential material
         appears in any caller-visible exception surface."""
         forbidden_note = "test-passphrase"
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             # refused (preflight infra failure)
             relay = _InfraFailureRelay(head=99, ok_reads=1)
             session, cfg, _, _ = _prepared_bundle(tmp, relay)
@@ -2642,7 +2688,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
                 session._prepared._state.signed_payload[0]
             ).hex()
             _assert_exception_clean(self, ctx.exception, [raw_hex])
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             # failed (leaky simulation transport)
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(tmp, relay)
@@ -2657,7 +2703,7 @@ class TestExceptionContainmentENG007(unittest.TestCase):
             with self.assertRaises(TestnetSafetyError) as ctx:
                 session.simulate()
             _assert_exception_clean(self, ctx.exception, [raw_hex])
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             # rejected (explicit relay error quoting the payload)
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(tmp, relay)
@@ -2741,12 +2787,11 @@ class TestAccessListPolicyENG007(unittest.TestCase):
     def test_prepare_refuses_access_list_bundle_before_wallet_decryption(self):
         """The access-list refusal fires BEFORE the wallet is decrypted or
         anything is signed."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub()
             info = _tmp_keystore(tmp)
             acct = info["account"]
-            cfg = TestnetExecutionConfig(
-                enabled=True,
+            cfg = IsolatedTestnetConfig(
                 rpc_url="https://sepolia.example",
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -2763,12 +2808,11 @@ class TestAccessListPolicyENG007(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    prepare_flashbots_bundle(
-                        txs, purpose="access list must never sign",
-                        config=cfg,
-                        web3_factory=lambda url: _PrepareW3(),
-                        relay_factory=lambda url, auth, relay_url: relay,
-                    )
+                    with offline_transports(rpc=_PrepareW3(), relay=relay):
+                        prepare_flashbots_bundle(
+                            txs, purpose="access list must never sign",
+                            config=cfg,
+                        )
             self.assertIn("access lists are not supported", str(ctx.exception))
             relay.assert_not_called()
 
@@ -2804,7 +2848,7 @@ class TestAccessListPolicyENG007(unittest.TestCase):
         """A signed transaction that differs from its validated intent by
         an access list is refused at session construction — before ANY
         relay interaction."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             recipient = Account.create()  # throwaway
             signed_tx = {
                 "to": recipient.address, "value": 0, "gas": 21000,
@@ -2831,7 +2875,7 @@ class TestAccessListPolicyENG007(unittest.TestCase):
     def test_prepared_bundle_with_empty_access_list_verifies_end_to_end(self):
         """The accepted form (no access list / empty list) still signs,
         verifies and simulates end-to-end through the sanctioned path."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, target, acct = _prepared_bundle(tmp, relay)
             st = session._prepared._state
@@ -2967,7 +3011,7 @@ class TestCredentialContainmentENG008(unittest.TestCase):
     # ── mandatory regression 1: Flashbots simulation transport ──────────
 
     def test_flashbots_simulation_transport_exception_with_credential_url(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(
                 tmp, relay, rpc_url=CRED_RPC_URL)
@@ -3009,7 +3053,7 @@ class TestCredentialContainmentENG008(unittest.TestCase):
     # ── mandatory regression 2: Flashbots submission transport ──────────
 
     def test_flashbots_submission_transport_exception_with_credential(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(
                 tmp, relay, rpc_url=CRED_RPC_URL)
@@ -3043,11 +3087,10 @@ class TestCredentialContainmentENG008(unittest.TestCase):
     # ── mandatory regression 3: direct-RPC submission ────────────────────
 
     def test_direct_rpc_submission_exception_with_credential(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             info = _tmp_keystore(tmp)
             sender = info["account"].address
-            cfg = TestnetExecutionConfig(
-                enabled=True,
+            cfg = IsolatedTestnetConfig(
                 rpc_url=CRED_RPC_URL,
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -3065,12 +3108,12 @@ class TestCredentialContainmentENG008(unittest.TestCase):
             w3.eth.send_raw_transaction.side_effect = RuntimeError(
                 f"cannot reach {CRED_RPC_URL} (connection refused)")
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": sender, "value": 0, "gas": 21000, "data": b""},
-                    purpose="credential containment (direct RPC)",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": sender, "value": 0, "gas": 21000, "data": b""},
+                        purpose="credential containment (direct RPC)",
+                        config=cfg,
+                    )
             exc = ctx.exception
             _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL)
             self.assertIn("testnet submission uncertain", str(exc))
@@ -3092,7 +3135,7 @@ class TestCredentialContainmentENG008(unittest.TestCase):
         fake provider key, registered from the configured RPC URL): the
         retained relay text is sanitized before it reaches the caller
         exception and the audit log."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(
                 tmp, relay, rpc_url=CRED_RPC_URL)
@@ -3128,7 +3171,7 @@ class TestCredentialContainmentENG008(unittest.TestCase):
         simulation error carrying credential-shaped material is sanitized
         against the configured credential material plus the structural
         rules (DSS-WO-ENG-008 Finding A)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(
                 tmp, relay, rpc_url=CRED_RPC_URL)
@@ -3154,7 +3197,7 @@ class TestCredentialContainmentENG008(unittest.TestCase):
         """A credential appearing as a URL query parameter AND in
         authorization-style strings is contained even when the exception
         carries several shapes at once."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(
                 tmp, relay, rpc_url=CRED_RPC_URL)
@@ -3188,7 +3231,7 @@ class TestCredentialContainmentENG008(unittest.TestCase):
         a long signed-payload hex echoed with an uppercase `0X` prefix (or
         with no prefix) is redacted from every caller-visible surface and
         the audit log."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(head=99)
             session, cfg, _, _ = _prepared_bundle(tmp, relay)
             payload_hex = bytes(
@@ -3265,8 +3308,7 @@ class TestSanitizerCredentialRulesENG008(unittest.TestCase):
         self.assertNotIn("hunter2said", out)
 
     def test_registered_secrets_from_config(self):
-        cfg = TestnetExecutionConfig(
-            enabled=True,
+        cfg = IsolatedTestnetConfig(
             rpc_url=CRED_RPC_URL,
             relay_url="https://relay-sepolia.flashbots.net",
         )
@@ -3402,8 +3444,7 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
     def _cfg(self, tmp):
         info = _tmp_keystore(tmp)
         return (
-            TestnetExecutionConfig(
-                enabled=True,
+            IsolatedTestnetConfig(
                 rpc_url=CRED_RPC_URL,
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -3430,7 +3471,7 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
         return exc
 
     def test_provider_factory_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = RuntimeError(
                 f"cannot open provider {CRED_RPC_URL}: unauthorized (401)")
@@ -3439,66 +3480,82 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 raise foreign
 
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 factory failure",
-                    config=cfg, web3_factory=_boom,
-                )
+                # R3: the failing construction is injected by patching the
+                # gate's PRIVATE transport builder (test-only seam).
+                with patch.object(_gate, "_build_rpc_transport", _boom):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 factory failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
                 stage="RPC provider initialization",
             )
-            # no attempt was initiated: no audit record exists at all
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt IS accounted for — the
+            # contained preflight failure is audited as one refused record
+            # with sanitized error text (no credential material).
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_connectivity_check_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = IOError(
                 f"connect() to {CRED_RPC_URL} timed out: unauthorized")
             w3 = _FailingW3(connect_exc=foreign)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 connectivity failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 connectivity failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
                 stage="RPC connectivity check",
             )
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_chain_id_read_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = ConnectionError(
                 f"provider {CRED_RPC_URL} reset the connection (401)")
             w3 = _FailingW3(chain_values=[foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 chain read failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 chain read failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
                 stage="RPC chain-ID read",
             )
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_transaction_defaults_rpc_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = RuntimeError(
                 f"eth_getTransactionCount to {CRED_RPC_URL} failed: "
                 "unauthorized")
             w3 = _FailingW3(nonce_exc=foreign)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 defaults failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 defaults failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
@@ -3506,45 +3563,56 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
             )
             # the failure fired before any signing/submission
             self.assertEqual(w3.submitted, 0)
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_pre_sign_chain_verification_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = ConnectionError(
                 f"{CRED_RPC_URL} dropped the connection before signing")
             w3 = _FailingW3(chain_values=[SEPOLIA, foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 pre-sign failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 pre-sign failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
                 stage="pre-sign chain verification",
             )
             self.assertEqual(w3.submitted, 0)  # signed, but never submitted
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_pre_submission_chain_verification_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = ConnectionError(
                 f"{CRED_RPC_URL} refused the pre-submission check: 401")
             w3 = _FailingW3(chain_values=[SEPOLIA, SEPOLIA, foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 pre-submit failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 pre-submit failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
                 stage="pre-submission chain verification",
             )
             self.assertEqual(w3.submitted, 0)  # never sent
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL)
 
     def test_gate_refusals_are_not_converted_to_transport_failures(self):
         """Requirement 4/5: gate-raised TestnetSafetyErrors keep their
@@ -3553,36 +3621,39 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
         (initial and pre-sign) are byte-identical to the gate's own
         verdicts, and the policy refusal keeps its message shape (no
         `during <stage>` transport diagnostic is mixed in)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             # connectivity returns False: the gate refusal, unchanged
             w3 = _FailingW3()
             w3.is_connected = lambda: False
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 unreachable refusal",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 unreachable refusal",
+                        config=cfg,
+                    )
             self.assertEqual(str(ctx.exception),
                              "testnet RPC is not reachable")
 
             # initial chain read reports mainnet: the chain-policy refusal
             w3 = _FailingW3(chain_values=[MAINNET_CHAIN_ID])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 mainnet refusal",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 mainnet refusal",
+                        config=cfg,
+                    )
             self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
             self.assertNotIn("during", str(ctx.exception))
 
             # pre-sign recheck reports mainnet: same gate verdict
             w3 = _FailingW3(chain_values=[SEPOLIA, MAINNET_CHAIN_ID])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 pre-sign mainnet",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 pre-sign mainnet",
+                        config=cfg,
+                    )
             self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
             self.assertNotIn("during", str(ctx.exception))
             self.assertEqual(w3.submitted, 0)
@@ -3602,8 +3673,7 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
     def _cfg(self, tmp):
         info = _tmp_keystore(tmp)
         return (
-            TestnetExecutionConfig(
-                enabled=True,
+            IsolatedTestnetConfig(
                 rpc_url=CRED_RPC_URL,
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -3632,7 +3702,7 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
         return exc
 
     def test_rpc_factory_failure_contained_and_relay_never_touched(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = RuntimeError(
                 f"cannot open {CRED_RPC_URL}: unauthorized (401)")
@@ -3641,50 +3711,57 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
             def _boom(url):
                 raise foreign
 
-            def _relay(url, auth, relay_url):
-                relay_calls.append(url)
+            def _relay(rpc_url, auth_account):
+                relay_calls.append(rpc_url)
                 return _RelayStub()
 
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare factory",
-                    config=cfg, web3_factory=_boom, relay_factory=_relay,
-                )
+                # R3: the failing constructions are injected by patching
+                # the gate's PRIVATE transport builders (test-only seam).
+                with patch.object(_gate, "_build_rpc_transport", _boom), \
+                        patch.object(_gate, "_build_relay_transport", _relay):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare factory",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign, stage="RPC provider initialization")
             self.assertEqual(relay_calls, [])  # relay transport never built
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL_ALL)
 
     def test_connectivity_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = IOError(
                 f"connect() to {CRED_RPC_URL} timed out: unauthorized")
             w3 = _FailingW3(connect_exc=foreign)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare connectivity",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare connectivity",
+                        config=cfg,
+                    )
             self._assert_contained(ctx, foreign, stage="RPC connectivity check")
 
     def test_chain_id_read_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = ConnectionError(
                 f"provider {CRED_RPC_URL} reset the connection (401)")
             w3 = _FailingW3(chain_values=[foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare chain read",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare chain read",
+                        config=cfg,
+                    )
             self._assert_contained(ctx, foreign, stage="RPC chain-ID read")
 
     def test_transaction_defaults_failure_contained_before_custody(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = RuntimeError(
                 f"eth_getTransactionCount to {CRED_RPC_URL} failed: 401")
@@ -3694,53 +3771,58 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    prepare_flashbots_bundle(
-                        self._txs(sender),
-                        purpose="ENG-009 prepare defaults failure",
-                        config=cfg, web3_factory=lambda url: w3,
-                        relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                    )
+                    with offline_transports(rpc=w3, relay=_RelayStub()):
+                        prepare_flashbots_bundle(
+                            self._txs(sender),
+                            purpose="ENG-009 prepare defaults failure",
+                            config=cfg,
+                        )
             self._assert_contained(
                 ctx, foreign, stage="RPC transaction-default read")
 
     def test_pre_sign_chain_verification_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = ConnectionError(
                 f"{CRED_RPC_URL} dropped before bundle signing")
             w3 = _FailingW3(chain_values=[SEPOLIA, foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare pre-sign",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare pre-sign",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign, stage="pre-sign chain verification")
 
     def test_block_number_read_failure_contained(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = ConnectionError(
                 f"head query to {CRED_RPC_URL} returned 401")
             w3 = _FailingW3(head_exc=foreign)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare block read",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare block read",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign, stage="RPC block-number read")
 
-    def test_relay_factory_failure_contained(self):
-        """A failing relay factory must not expose credentials from EITHER
-        the configured RPC URL or the relay URL."""
-        with tempfile.TemporaryDirectory() as tmp:
+    def test_relay_transport_construction_failure_contained(self):
+        """A failing relay transport construction must not expose
+        credentials from EITHER the configured RPC URL or the relay URL.
+        The relay destination is code-controlled policy: the test
+        redirects the reviewed relay constant (controlled mock) to a
+        credential-bearing fake relay to prove its material is contained.
+        R3: the failing construction is injected by patching the gate's
+        PRIVATE relay builder (test-only seam)."""
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(
+                tmp, relay_url=CRED_RELAY_URL):
             info = _tmp_keystore(tmp)
             sender = info["account"].address
-            cfg = TestnetExecutionConfig(
-                enabled=True,
+            cfg = IsolatedTestnetConfig(
                 rpc_url=CRED_RPC_URL,
                 keystore_path=os.path.join(tmp, "keystore.json"),
                 passphrase_path=os.path.join(tmp, "pass"),
@@ -3752,56 +3834,63 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 f"relay {CRED_RELAY_URL} rejected auth key "
                 f"{FAKE_RELAY_KEY} for {CRED_RPC_URL}: unauthorized")
 
-            def _boom(url, auth, relay_url):
+            def _boom(rpc_url, auth_account):
                 raise foreign
 
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 relay factory",
-                    config=cfg, web3_factory=lambda url: _FailingW3(),
-                    relay_factory=_boom,
-                )
+                with offline_transports(rpc=_FailingW3()), \
+                        patch.object(_gate, "_build_relay_transport", _boom):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 relay factory",
+                        config=cfg,
+                    )
             exc = ctx.exception
             self.assertIsNot(exc, foreign)
             _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL_ALL)
             self.assertIn("bundle preparation failed", str(exc))
             self.assertIn("RuntimeError", str(exc))
             self.assertIn("relay transport construction", str(exc))
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL_ALL)
 
     def test_session_construction_verification_failure_contained(self):
         """The constructor's LIVE RPC verification runs inside the
         containment boundary: a foreign exception from the relay
         transport's chain read is replaced by the safe diagnostic."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             foreign = ConnectionError(
                 f"relay provider {CRED_RPC_URL} closed mid-verification")
             relay = _RelayStub(chain_values=[foreign], head=99)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender),
-                    purpose="ENG-009 session verification",
-                    config=cfg, web3_factory=lambda url: _FailingW3(),
-                    relay_factory=lambda url, auth, relay_url: relay,
-                )
+                with offline_transports(rpc=_FailingW3(), relay=relay):
+                    prepare_flashbots_bundle(
+                        self._txs(sender),
+                        purpose="ENG-009 session verification",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign, stage="session construction verification")
-            self.assertFalse(os.path.exists(cfg.tx_log_path))
+            # DSS-WO-ENG-015 §4: the attempt is audited as refused.
+            records = _read_audit(cfg.tx_log_path)
+            self.assertEqual([r["outcome"] for r in records], ["refused"])
+            _assert_log_free_of(self, cfg.tx_log_path, CRED_SECRET_MATERIAL_ALL)
 
     def test_gate_refusals_survive_preparation_boundaries(self):
         """Chain-policy and transaction-policy refusals keep their exact
         gate messages — a policy refusal is never converted into a
         foreign transport failure."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._cfg(tmp)
             w3 = _FailingW3(chain_values=[MAINNET_CHAIN_ID])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare mainnet",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare mainnet",
+                        config=cfg,
+                    )
             self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
             self.assertNotIn("during", str(ctx.exception))
 
@@ -3810,14 +3899,14 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
             w3 = _FailingW3()
             stranger = "0x" + "cc" * 20
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    [{"to": stranger, "value": 10**15, "gas": 21000,
-                      "maxFeePerGas": 2 * 10**9,
-                      "maxPriorityFeePerGas": 10**9, "data": b""}],
-                    purpose="ENG-009 prepare policy refusal",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        [{"to": stranger, "value": 10**15, "gas": 21000,
+                          "maxFeePerGas": 2 * 10**9,
+                          "maxPriorityFeePerGas": 10**9, "data": b""}],
+                        purpose="ENG-009 prepare policy refusal",
+                        config=cfg,
+                    )
             self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
             self.assertNotIn("during", str(ctx.exception))
 
@@ -3844,7 +3933,7 @@ class TestRelayResponseScrubbingENG009(unittest.TestCase):
         carrying the configured provider key as a BARE token — no URL, no
         `token=`, no `apikey=`, no authorization label — cannot be
         recovered from any exposed surface."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp)
             relay._sim_result = {
                 "result": {"results": [
@@ -3884,7 +3973,8 @@ class TestRelayResponseScrubbingENG009(unittest.TestCase):
         """The registered material includes the RELAY URL's credentials:
         a per-transaction error embedding the fabricated relay key (bare)
         is contained as well."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(
+                tmp, relay_url=CRED_RELAY_URL):
             session, cfg, relay = self._session(tmp, relay_url=CRED_RELAY_URL)
             relay._sim_result = {
                 "result": {"results": [
@@ -3906,7 +3996,7 @@ class TestRelayResponseScrubbingENG009(unittest.TestCase):
         """A SUCCESSFUL simulation response carrying configured secrets in
         nested metadata (bare and URL-shaped) is scrubbed before it
         leaves the session; ordinary metadata survives."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp)
             relay._sim_result = dict(
                 _ok_simulation(),
@@ -3948,7 +4038,7 @@ class TestRelayResponseScrubbingENG009(unittest.TestCase):
         """Credential-bearing structured fields cannot return their secret
         values merely because the secret sits under an unexpected JSON
         key."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp)
             relay._sim_result = dict(
                 _ok_simulation(),
@@ -3975,7 +4065,7 @@ class TestRelayResponseScrubbingENG009(unittest.TestCase):
         """The eth_sendBundle return path gets the same configured-secret
         scrubbing; the audit record stays clean and the outcome is
         preserved."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp)
             session.simulate()
 
@@ -4137,7 +4227,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
 
     def test_registration_includes_short_credentials_and_decoded_forms(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG010_RPC_URL))
+ENG010_RPC_URL))
         for secret in ENG010_REGISTERED:
             self.assertIn(secret, reg)
         # Finding A: an ordinary short username is NOT registered
@@ -4147,7 +4237,6 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
         # Finding A: percent-encoded user information is registered raw
         # AND safely URL-decoded
         pct_cfg = TestnetExecutionConfig(
-            enabled=True,
             rpc_url=(
                 "https://relay-agent:rk%212@relay.sepolia.invalid/v2/submit"
             ),
@@ -4184,7 +4273,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
     # ── work order regression 1: short query token, per-transaction error ─
 
     def test_short_query_token_bare_in_per_transaction_error(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG010_RPC_URL)
             relay._sim_result = {
                 "result": {"results": [
@@ -4222,7 +4311,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
     # ── work order regression 2: short query token, nested metadata ───────
 
     def test_short_query_token_bare_in_nested_success_metadata(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG010_RPC_URL)
             relay._sim_result = dict(
                 _ok_simulation(),
@@ -4257,7 +4346,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
     # ── work order regression 3: short URL password without its URL ───────
 
     def test_short_url_password_echoed_without_url(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG010_RPC_URL)
             relay._sim_result = {
                 "result": {"results": [
@@ -4289,7 +4378,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
     # ── work order regression 4: percent-encoded token, decoded echo ──────
 
     def test_percent_encoded_token_echoed_in_decoded_form(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG010_PCT_RPC_URL)
             relay._sim_result = dict(
                 _ok_simulation(),
@@ -4314,10 +4403,10 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
     def test_percent_encoded_token_raw_form_echoed(self):
         # both forms are registered for the same configured token
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG010_PCT_RPC_URL))
+ENG010_PCT_RPC_URL))
         self.assertIn(ENG010_PCT_TOKEN_RAW, reg)
         self.assertIn(ENG010_PCT_TOKEN_DECODED, reg)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG010_PCT_RPC_URL)
             relay._sim_result = dict(
                 _ok_simulation(),
@@ -4338,10 +4427,10 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
 
     def test_short_ordinary_query_value_remains_available(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG010_RPC_URL))
+ENG010_RPC_URL))
         # the ordinary value is not credential material: not registered
         self.assertNotIn(ENG010_ORDINARY_VALUE, reg)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG010_RPC_URL)
             relay._sim_result = dict(
                 _ok_simulation(),
@@ -4362,7 +4451,7 @@ class TestShortCredentialContainmentENG010(unittest.TestCase):
 
     def test_ordinary_username_agent_not_individually_redacted(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG010_RPC_URL))
+ENG010_RPC_URL))
         self.assertNotIn("agent", reg)
         # benign diagnostics mentioning the word "agent" survive
         text = "the agent wallet verified; user agent recorded"
@@ -4527,14 +4616,14 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_encoded_access_token_registered_and_contained_in_per_tx_error(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_ENC_TOKEN_URL))
+ENG011_ENC_TOKEN_URL))
         for secret in ENG011_ENC_TOKEN_REGISTERED:
             self.assertIn(secret, reg)
         # ordinary components stay unregistered
         for ordinary in ("agent", ENG011_ORDINARY_VALUE, "v2", "submit",
                          "network"):
             self.assertNotIn(ordinary, reg)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG011_ENC_TOKEN_URL)
             relay._sim_result = {
                 "result": {"results": [
@@ -4575,9 +4664,9 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_encoded_api_key_contained_in_nested_success_metadata(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_ENC_KEY_URL))
+ENG011_ENC_KEY_URL))
         self.assertIn(ENG011_SHORT_KEY, reg)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG011_ENC_KEY_URL)
             relay._sim_result = dict(
                 _ok_simulation(),
@@ -4615,10 +4704,10 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
             self.assertTrue(
                 _query_param_name_is_credential(name), f"{name!r} must match")
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_MIXED_URL))
+ENG011_MIXED_URL))
         for secret in ENG011_MIXED_REGISTERED:
             self.assertIn(secret, reg)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG011_MIXED_URL)
             relay._sim_result = {
                 "result": {"results": [
@@ -4646,11 +4735,11 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_bare_short_credential_echoed_after_query_decoding(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_PCT_PLUS_URL))
+ENG011_PCT_PLUS_URL))
         # raw AND percent-decoded forms of the same configured token
         self.assertIn(ENG011_PCT_PLUS_RAW, reg)
         self.assertIn(ENG011_PCT_PLUS_DECODED, reg)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG011_PCT_PLUS_URL)
             relay._sim_result = {
                 "result": {"results": [
@@ -4683,7 +4772,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_form_plus_value_raw_and_form_decoded_forms_protected(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_FORM_URL))
+ENG011_FORM_URL))
         # the literal '+' form and its form-decoded space form are BOTH
         # registered for the same configured credential
         self.assertIn(ENG011_FORM_TOKEN, reg)
@@ -4695,7 +4784,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
         )
         self.assertIn(
             ENG011_FORM_TOKEN, _sanitize_error("x " + ENG011_FORM_TOKEN))
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG011_FORM_URL)
             # the FORM-DECODED representation echoed in nested metadata
             relay._sim_result = dict(
@@ -4736,14 +4825,14 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_encoded_ordinary_name_does_not_trigger_registration(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_ORDINARY_URL))
+ENG011_ORDINARY_URL))
         # the encoded ordinary name resolves to "network" — NOT a
         # credential name — so its short value stays unregistered, as do
         # the other ordinary short values
         for ordinary in (ENG011_ORDINARY_VALUE, "dev", "agent", "v2",
                          "submit", "network", "env"):
             self.assertNotIn(ordinary, reg)
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG011_ORDINARY_URL)
             relay._sim_result = dict(
                 _ok_simulation(),
@@ -4766,7 +4855,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
 
     def test_ordinary_metadata_and_existing_exclusions_preserved(self):
         reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True, rpc_url=ENG011_ENC_TOKEN_URL))
+ENG011_ENC_TOKEN_URL))
         # existing short-value exclusions stand
         for ordinary in ("agent", ENG011_ORDINARY_VALUE, "v2", "submit"):
             self.assertNotIn(ordinary, reg)
@@ -4788,7 +4877,7 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
             )["note"],
         )
         # full lifecycle: ordinary metadata survives end to end
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, relay = self._session(tmp, ENG011_ENC_TOKEN_URL)
             relay._sim_result = dict(
                 _ok_simulation(),
@@ -4807,14 +4896,17 @@ class TestEncodedQueryNameContainmentENG011(unittest.TestCase):
     # ── propagation: encoded name on the RELAY URL ───────────────────────
 
     def test_encoded_name_on_relay_url_is_registered_and_contained(self):
-        reg = _registered_secrets(TestnetExecutionConfig(
-            enabled=True,
-            rpc_url="https://sepolia.example",
-            relay_url=ENG011_RELAY_URL,
-        ))
-        self.assertIn(ENG011_RELAY_URL, reg)
-        self.assertIn(ENG011_RELAY_KEY, reg)
-        with tempfile.TemporaryDirectory() as tmp:
+        # R2: the relay destination is code-controlled policy — the test
+        # redirects the reviewed relay constant (controlled mock) to a
+        # fake relay with an encoded credential name to prove containment.
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(
+                tmp, relay_url=ENG011_RELAY_URL):
+            reg = _registered_secrets(IsolatedTestnetConfig(
+                rpc_url="https://sepolia.example",
+                relay_url=ENG011_RELAY_URL,
+            ))
+            self.assertIn(ENG011_RELAY_URL, reg)
+            self.assertIn(ENG011_RELAY_KEY, reg)
             session, cfg, relay = self._session(
                 tmp, "https://sepolia.example", relay_url=ENG011_RELAY_URL)
             relay._sim_result = dict(

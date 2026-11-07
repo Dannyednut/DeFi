@@ -898,8 +898,19 @@ CHAINS: dict[int, ChainConfig] = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ARB_EXEC_ADDRESS = os.getenv("ARB_EXEC_ADDRESS", "").strip() or None
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip() or None
+# DSS-WO-ENG-015: the legacy PRIVATE_KEY-based signing path was REMOVED.
+# There is no import-time private-key loading anywhere in this repository:
+# the only wallet path is the DSS secret-store custody mechanism in
+# executor/testnet_gate.py (load_agent_wallet), reachable exclusively
+# through the unified execution authorization boundary
+# (executor/authorization.py). Do NOT reintroduce a PRIVATE_KEY setting.
 EXECUTE_ONCHAIN = os.getenv("EXECUTE_ONCHAIN", "false").lower() == "true"
+# NOTE (DSS-WO-ENG-015): EXECUTE_ONCHAIN remains the legacy production
+# switch and stays false by default, but it is NOT an execution authority:
+# setting it true cannot enable signing or submission. The unified execution
+# authorization boundary (executor/authorization.py) decides whether any
+# execution policy applies; the production policy is disabled and requires a
+# separately reviewed authorization decision.
 
 # Enhanced settings
 MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "1.0"))

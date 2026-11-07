@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from config import ARB_EXEC_ABI, get_chain
+from executor.authorization import authorized_sender_address
 from log import get_logger
 
 log = get_logger("opportunity_validation")
@@ -62,8 +63,15 @@ class OpportunityValidator:
             return self._reject("invalid route shape")
 
         try:
-            from executor.signer import get_sender
-            sender = self.w3.to_checksum_address(get_sender())
+            # DSS-WO-ENG-015: the sender address comes from the unified
+            # execution authorization boundary (the recorded PUBLIC agent
+            # address — no key material). When no execution policy is
+            # available this fails closed exactly like the removed legacy
+            # signer did, so a candidate can never be validated for
+            # execution without an authorized sender.
+            sender = self.w3.to_checksum_address(
+                authorized_sender_address(self.chain_id)
+            )
         except Exception as exc:
             return self._reject(f"sender unavailable: {exc}")
 

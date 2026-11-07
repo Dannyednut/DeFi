@@ -20,11 +20,12 @@ from web3 import Web3
 from web3 import exceptions as w3_exceptions
 
 from config import (
-    CHAIN_ID, NATIVE_PRICE_USD, EXECUTE_ONCHAIN, MIN_PROFIT_USD, get_chain, get_rpc_configs
+    CHAIN_ID, NATIVE_PRICE_USD, MIN_PROFIT_USD, get_chain, get_rpc_configs
 )
 from utils.rpc_manager import MultiRPCManager
 from graph import TokenGraph
 from executor import ArbExecutor
+from executor.authorization import get_execution_authorization
 from logger import OppLogger
 from tracker import OpportunityTracker
 from registry import bootstrap_graph
@@ -525,14 +526,28 @@ def main():
     opportunity_engine = OpportunityEngine(w3, CHAIN_ID, detectors=detectors, graph=graph)
     log.info("Canonical OpportunityEngine ready")
 
-    executor = ArbExecutor(w3, chain_id=CHAIN_ID)
+    # DSS-WO-ENG-015: ONE unified execution authorization boundary for the
+    # whole process. Without an explicitly enabled execution policy this is
+    # fail-closed disabled: nothing signs, nothing submits.
+    authorization = get_execution_authorization()
+    if not authorization.execution_available():
+        log.info(
+            "Execution authorization boundary: DISABLED (%s)",
+            authorization.refusal_reason(),
+        )
 
-    # Create execution router to centralize opp routing from detectors and mempool
+    executor = ArbExecutor(w3, chain_id=CHAIN_ID, authorization=authorization)
+
+    # Create execution router to centralize opp routing from detectors and mempool.
+    # AUTHORIZATION (DSS-WO-ENG-015): ONE shared unified execution authorization
+    # boundary is wired into BOTH the executor and the router; whether execution
+    # may proceed is decided exclusively by that boundary (never by a config
+    # boolean).
     router = create_router(
         tracker=tracker,
         executor=executor,
+        authorization=authorization,
         config={
-            "EXECUTE_ONCHAIN": EXECUTE_ONCHAIN,
             "MIN_PROFIT_USD": MIN_PROFIT_USD,
             "MAX_EXECUTIONS": 3,
             "STREAMING_MULTIPLIER": 2.0,

@@ -70,10 +70,12 @@ jobs:
       # tests/test_flashbots_integration.py is NO LONGER excluded:
       # DSS-WO-ENG-003 (PR #1) first rewrote the old import-time
       # signing/broadcast script as an import-safe, opt-in integration
-      # test, and DSS-WO-ENG-004 (PR #2) routed it through the unified
-      # testnet execution gate. It collects cleanly and its live phases
-      # skip visibly without DSS_TESTNET_FLASHBOTS_LIVE=1 plus the DSS
-      # agent keystore; CI provides neither, so CI can never sign,
+      # test; DSS-WO-ENG-004 (PR #2) routed it through the then-current
+      # execution gate; DSS-WO-ENG-015 R4 routes it through the retained
+      # Builder → Signer → Relay path with the EXECUTE_ONCHAIN master
+      # switch. It collects cleanly and its live phases skip visibly
+      # without DSS_TESTNET_FLASHBOTS_LIVE=1 plus the provisioned DSS
+      # secret store; CI provides neither, so CI can never sign,
       # broadcast or submit through it.
       #
       # The offline suite passes completely on the reconciled baseline:

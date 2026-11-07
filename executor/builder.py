@@ -1,7 +1,9 @@
 """
 executor/builder.py
 ===================
-Builds the ArbData struct and raw transaction for ArbExec.swap().
+Builds the ArbData struct and raw transaction for ArbExec.swap(), and
+enforces the transaction policy at the construction boundary
+(DSS-WO-ENG-015 R4).
 
 ArbData struct field order (must match Solidity):
   tokens      address[]
@@ -15,6 +17,25 @@ ArbData struct field order (must match Solidity):
 Two paths:
   2-pool: use sorted ArbData returned by getProfit() — already optimal
   3+ pool: build ArbData from Opportunity fields + off-chain optimal amount
+
+Transaction policy (both build paths — single AND batch — pass the SAME
+validation; batch execution is not a weaker alternative):
+
+  * expected chain identity (tx chainId == configured chain);
+  * the recipient is EXACTLY the chain's configured arbitrage execution
+    contract (``ChainConfig.arb_exec_address`` — the chain-specific
+    authority); no arbitrary recipient and no contract deployment;
+  * ZERO native-token value for the current arbitrage execution path
+    (flash-loan funded) — any unexpected native value is refused;
+  * gas within the chain's fee-policy ceiling;
+  * valid EIP-1559 or legacy fee parameters (never both, integers,
+    priority ≤ max fee) within the chain's per-gas ceilings;
+  * worst-case monetary exposure (gas × fee price) within the chain's
+    per-transaction ceiling — a gas-unit cap is not a monetary cap;
+  * no transaction access list (out of policy at this boundary);
+  * fail closed on a missing execution profile, a missing chain-specific
+    fee policy or a missing configured recipient — no permissive default
+    is ever invented for an unreviewed chain.
 """
 from __future__ import annotations
 
@@ -24,10 +45,16 @@ from eth_abi.packed import encode_packed
 from eth_utils import keccak
 import time
 
-from config import DEFAULT_GAS_UNITS, GAS_MULTIPLIER, ARB_EXEC_ABI, NATIVE_PRICE_USD
+from config import (
+    DEFAULT_GAS_UNITS, GAS_MULTIPLIER, ARB_EXEC_ABI, NATIVE_PRICE_USD,
+    get_chain,
+)
+from execution_profile import profile_for, fee_policy_for
 from tvl import token_price
 from log import get_logger
-from .chain_execution import profile_for, validate_transaction_dict
+from .chain_execution import profile_for as _profile_for_reexport  # noqa: F401  (compat re-export)
+from .errors import ExecutionRefused
+from .audit import sanitize_error
 from utils.web3_compat import encode_call
 
 log = get_logger("executor.builder")
@@ -35,8 +62,179 @@ log = get_logger("executor.builder")
 # Minimum profit in USD before we bother signing and submitting
 MIN_EXECUTION_PROFIT_USD = 0.0
 
-# EIP-1559 base fee multiplier — pays 150% of current base fee as ceiling
+# EIP-1559 base fee multiplier — pays 120% of current base fee as ceiling
 BASE_FEE_MULTIPLIER = 1.2
+
+
+# ── Transaction policy (the construction boundary) ──────────────────────────
+
+def _uint_field(value: object, name: str) -> int:
+    """Strict unsigned-integer field parsing: reject bools, floats, strings
+    and anything negative — fail closed on malformed inputs."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ExecutionRefused(
+            f"malformed transaction field {name}: expected integer wei, "
+            f"got {type(value).__name__}"
+        )
+    if value < 0:
+        raise ExecutionRefused(f"negative transaction field {name}")
+    return value
+
+
+def expected_recipient(chain_id: int) -> str:
+    """The authoritative transaction recipient for a chain: the chain-
+    specific ``ChainConfig.arb_exec_address``.
+
+    Fail closed when the chain is unconfigured or has no arbitrage
+    execution contract address — there is no default recipient.
+    """
+    try:
+        chain = get_chain(int(chain_id))
+    except Exception as exc:
+        raise ExecutionRefused(
+            f"chain {int(chain_id)} is not configured — failing closed "
+            f"({sanitize_error(exc)})"
+        ) from None
+    address = (chain.arb_exec_address or "").strip()
+    if not address:
+        raise ExecutionRefused(
+            f"chain {int(chain_id)} has no arb_exec_address configured — "
+            "failing closed (production execution stays disabled until an "
+            "address is configured)"
+        )
+    return address.lower()
+
+
+def validate_transaction_policy(tx: dict, *, chain_id: int) -> dict:
+    """Enforce the full transaction policy on an UNSIGNED transaction.
+    Returns the tx unchanged if safe; every violation raises
+    ``ExecutionRefused``.
+
+    BOTH transaction-construction paths (build_execute_tx and
+    build_execute_batch_tx) run their result through this validator, so a
+    batch transaction cannot bypass any check that a single transaction
+    passes (DSS-WO-ENG-015 R4 §2.5).
+    """
+    chain_id = int(chain_id)
+
+    # Fail closed on a missing execution profile or fee policy: a chain
+    # without reviewed limits cannot execute.
+    try:
+        profile_for(chain_id)
+        policy = fee_policy_for(chain_id)
+    except ValueError as exc:
+        raise ExecutionRefused(sanitize_error(exc)) from None
+
+    # Expected chain identity.
+    tx_chain = tx.get("chainId")
+    if tx_chain is None:
+        raise ExecutionRefused("transaction carries no chainId")
+    if int(tx_chain) != chain_id:
+        raise ExecutionRefused(
+            f"transaction chainId {tx_chain} != configured chain {chain_id}"
+        )
+
+    # Recipient: exactly the configured arbitrage execution contract.
+    to = tx.get("to")
+    if not to or not str(to).strip():
+        raise ExecutionRefused(
+            "contract deployment rejected: arbitrage transactions must "
+            "target the configured execution contract"
+        )
+    authority = expected_recipient(chain_id)
+    if str(to).strip().lower() != authority:
+        raise ExecutionRefused(
+            f"recipient {str(to).strip().lower()} is not the configured "
+            f"arbitrage execution contract {authority} — refusing (no "
+            "arbitrary recipients, no deployments)"
+        )
+
+    # Zero native-token value for the current arbitrage execution path.
+    value = _uint_field(tx.get("value", 0), "value")
+    if value > policy.max_tx_value_wei:
+        raise ExecutionRefused(
+            f"transaction carries {value} wei of native value; the current "
+            "arbitrage execution path is flash-loan funded and must carry "
+            f"at most {policy.max_tx_value_wei} — refusing unexpected "
+            "native value"
+        )
+
+    # Gas limit within the chain's ceiling.
+    gas = _uint_field(tx.get("gas"), "gas")
+    if gas <= 0 or gas > policy.max_gas_units:
+        raise ExecutionRefused(
+            f"gas limit {gas} outside the permitted range for chain "
+            f"{chain_id} (1, {policy.max_gas_units}]"
+        )
+
+    # Fee parameters: exactly one envelope, integers, within the chain's
+    # per-gas ceilings, priority ≤ max fee.
+    has_1559 = tx.get("maxFeePerGas") is not None
+    has_legacy = tx.get("gasPrice") is not None
+    if has_1559 and has_legacy:
+        raise ExecutionRefused(
+            "malformed fee inputs: transaction carries both EIP-1559 "
+            "(maxFeePerGas) and legacy (gasPrice) fee fields"
+        )
+    if has_1559:
+        price = _uint_field(tx["maxFeePerGas"], "maxFeePerGas")
+        if price > policy.max_fee_per_gas_wei:
+            raise ExecutionRefused(
+                f"maxFeePerGas {price} wei/gas exceeds the chain "
+                f"{chain_id} cap {policy.max_fee_per_gas_wei} wei/gas"
+            )
+        prio = tx.get("maxPriorityFeePerGas")
+        if prio is not None:
+            prio = _uint_field(prio, "maxPriorityFeePerGas")
+            if prio > price:
+                raise ExecutionRefused(
+                    "malformed fee inputs: maxPriorityFeePerGas exceeds "
+                    "maxFeePerGas"
+                )
+            if prio > policy.max_priority_fee_wei:
+                raise ExecutionRefused(
+                    f"maxPriorityFeePerGas {prio} wei/gas exceeds the "
+                    f"chain {chain_id} cap {policy.max_priority_fee_wei} "
+                    "wei/gas"
+                )
+    elif has_legacy:
+        price = _uint_field(tx["gasPrice"], "gasPrice")
+        if price > policy.max_fee_per_gas_wei:
+            raise ExecutionRefused(
+                f"gasPrice {price} wei/gas exceeds the chain {chain_id} "
+                f"cap {policy.max_fee_per_gas_wei} wei/gas"
+            )
+    else:
+        raise ExecutionRefused(
+            "missing fee input: transaction has neither maxFeePerGas "
+            "(EIP-1559) nor gasPrice (legacy) — refusing to bound or sign"
+        )
+
+    # Monetary fee exposure: the worst-case expenditure of ONE transaction
+    # is gas × fee price — a gas-unit cap is not a monetary cap.
+    expenditure = gas * price
+    if expenditure > policy.max_tx_fee_wei:
+        raise ExecutionRefused(
+            f"maximum fee expenditure {expenditure} wei (gas × fee price) "
+            f"exceeds the chain {chain_id} cap {policy.max_tx_fee_wei} wei"
+        )
+
+    # Access lists are out of policy at this boundary: absent/None/empty
+    # list accepted, anything else malformed or refused.
+    access_list = tx.get("accessList")
+    if access_list is not None and not isinstance(access_list, list):
+        raise ExecutionRefused(
+            "malformed accessList: expected a list — every non-list value "
+            "is rejected"
+        )
+    if access_list:
+        raise ExecutionRefused(
+            "access lists are not supported at this execution boundary: "
+            "the transaction policy rejects any supplied accessList "
+            "(fail closed)"
+        )
+
+    return tx
 
 
 def build_arb_data(
@@ -167,7 +365,9 @@ def build_execute_tx(
         "value":                0,
     })
 
-    validate_transaction_dict(tx, profile.chain_id)
+    # Full transaction policy at the construction boundary — the same
+    # validator the batch path runs (no weaker alternative).
+    validate_transaction_policy(tx, chain_id=int(w3.eth.chain_id))
     return tx
 
 def build_execute_batch_tx(
@@ -212,6 +412,11 @@ def build_execute_batch_tx(
         "value":                0,
     })
 
+    # DSS-WO-ENG-015 R4 (batch parity): the batch path runs the SAME full
+    # transaction policy as the single path — chain identity, configured
+    # recipient, zero native value, gas/fee limits and monetary exposure.
+    # Batch execution is not a weaker alternative.
+    validate_transaction_policy(tx, chain_id=int(w3.eth.chain_id))
     return tx
 
 

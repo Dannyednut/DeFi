@@ -20,12 +20,12 @@ from web3 import Web3
 from web3 import exceptions as w3_exceptions
 
 from config import (
-    CHAIN_ID, NATIVE_PRICE_USD, MIN_PROFIT_USD, get_chain, get_rpc_configs
+    CHAIN_ID, NATIVE_PRICE_USD, MIN_PROFIT_USD, get_chain, get_rpc_configs,
+    execution_enabled
 )
 from utils.rpc_manager import MultiRPCManager
 from graph import TokenGraph
 from executor import ArbExecutor
-from executor.authorization import get_execution_authorization
 from logger import OppLogger
 from tracker import OpportunityTracker
 from registry import bootstrap_graph
@@ -526,27 +526,22 @@ def main():
     opportunity_engine = OpportunityEngine(w3, CHAIN_ID, detectors=detectors, graph=graph)
     log.info("Canonical OpportunityEngine ready")
 
-    # DSS-WO-ENG-015: ONE unified execution authorization boundary for the
-    # whole process. Without an explicitly enabled execution policy this is
-    # fail-closed disabled: nothing signs, nothing submits.
-    authorization = get_execution_authorization()
-    if not authorization.execution_available():
-        log.info(
-            "Execution authorization boundary: DISABLED (%s)",
-            authorization.refusal_reason(),
-        )
+    # DSS-WO-ENG-015 R4: the master execution switch (EXECUTE_ONCHAIN) is
+    # the single execution authority. It stays disabled by default: the
+    # executor, signer and relay each re-check it at their own boundaries,
+    # so an accidentally armed router still cannot sign or submit.
+    if not execution_enabled():
+        log.info("Execution: DISABLED (EXECUTE_ONCHAIN) — monitoring only")
 
-    executor = ArbExecutor(w3, chain_id=CHAIN_ID, authorization=authorization)
+    executor = ArbExecutor(w3, chain_id=CHAIN_ID)
 
     # Create execution router to centralize opp routing from detectors and mempool.
-    # AUTHORIZATION (DSS-WO-ENG-015): ONE shared unified execution authorization
-    # boundary is wired into BOTH the executor and the router; whether execution
-    # may proceed is decided exclusively by that boundary (never by a config
-    # boolean).
+    # The router is the operational gate (it refuses to arm while the master
+    # switch is disabled); the executor/signer/relay enforce the switch
+    # independently at their own boundaries.
     router = create_router(
         tracker=tracker,
         executor=executor,
-        authorization=authorization,
         config={
             "MIN_PROFIT_USD": MIN_PROFIT_USD,
             "MAX_EXECUTIONS": 3,

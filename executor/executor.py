@@ -1,38 +1,44 @@
 """
 executor/executor.py
 ====================
-Top-level arbitrage execution orchestrator.
+Top-level arbitrage execution orchestrator (DSS-WO-ENG-015 R4).
 
-AUTHORIZATION (DSS-WO-ENG-015): every transaction-producing route of this
-module is forced through the unified execution authorization boundary
-(``executor/authorization.py``), whose signing and submission capabilities
-are the ``executor/testnet_gate.py`` orchestrations. This module CANNOT sign
-or broadcast on its own:
+The EXISTING multi-chain execution architecture is retained and
+strengthened: this module consumes Opportunity objects and executes
+profitable arbitrage through the single application execution path
 
-  * the legacy ``PRIVATE_KEY`` signer (executor/signer.py) was REMOVED —
-    there is no import-time key loading, no direct-signing implementation
-    and no fallback when the boundary refuses;
-  * the executor's private Flashbots relay-identity provisioning
-    (relay_signer.json + flashbot middleware attach) was REMOVED — the
-    Flashbots transport is the gate-controlled capability/session model
-    only;
-  * signed raw transaction bytes never exist outside the gate: transactions
-    are handed to the boundary as UNSIGNED intents, and the gate signs,
-    policy-checks, chain-verifies (before signing AND before submission),
-    submits and audits.
+    ExecutionRouter → ArbExecutor → Builder → Signer → Relay → Receipt/Result
+
+The R1–R3 parallel execution-authorization architecture was retired by
+DSS-WO-ENG-015 R4; the useful security work it introduced lives inside
+the existing components:
+
+  * the MASTER EXECUTION SWITCH (EXECUTE_ONCHAIN) is checked HERE, at
+    every submission entry point, and again independently at the signer
+    and the relay — no single refactored boundary is load-bearing alone;
+  * every transaction is BUILT through the builder's policy validation
+    (chain identity, configured arb recipient, zero native value, gas and
+    monetary fee-exposure ceilings) — the batch path runs the SAME
+    validation as the single path, so neither is a weaker alternative;
+  * every transaction is SIGNED through executor/signer.py (the single
+    authoritative wallet-loading path, wallet-identity binding, chain
+    verification before AND immediately before signing);
+  * every transaction is SUBMITTED through executor/relay.py (submission-
+    time switch check, signed-payload provenance verification, chain
+    recheck immediately before broadcast, fail-closed private submission).
 
 Flow for each Opportunity:
-  1. authorize_execution through the unified boundary (fail closed)
+  1. Master-switch check (fail closed: a refusal is a FAILED result)
   2. Extract arb_data and optimal_amount_in from metadata
      - 2-pool: arb_data comes from getProfit() via simulate_cycle()
      - 3+ pool: build arb_data from raw opp fields + golden section amount
   3. Refine optimal amount off-chain (may improve on on-chain estimate)
   4. Select lender (Aave → Balancer → pool flash swap)
   5. Profit gate: verify net profit > gas cost + min threshold
-  6. Build EIP-1559 transaction (UNSIGNED)
-  7. Submit through the boundary: sign_and_submit (direct RPC) or the
-     gate's Flashbots session (prepare → simulate → submit)
-  8. Log result
+  6. Build EIP-1559 transaction (builder enforces the transaction policy)
+  7. Sign (signer enforces switch/chain/custody)
+  8. Relay (relay enforces switch/chain/provenance; direct or Flashbots)
+  9. Log result + audit record
 
 Thread safety: ArbExecutor is designed for single-threaded use within
 process_block(). Nonce is fetched fresh per execution via "pending" tag.
@@ -47,11 +53,12 @@ from eth_utils import to_bytes
 
 from config import (
     CHAIN_ID, DEFAULT_GAS_UNITS, MIN_PROFIT_USD,
-    ARB_EXEC_ABI, FLASHBOTS_RPCS, get_chain,
+    ARB_EXEC_ABI, FLASHBOTS_RPCS, get_chain, execution_enabled,
 )
 from logger import Opportunity
 from tvl import token_price
 from optimizer import get_optimal_amount, _get_amount_out
+from utils.serializer import serialize
 from .lender import select_lender, get_balancer_vault
 from .builder import (
     build_arb_data, build_execute_tx,
@@ -59,9 +66,12 @@ from .builder import (
     is_profitable_after_gas,
     MIN_EXECUTION_PROFIT_USD,
 )
-from .authorization import AuthorizedExecution, ExecutionAuthorizationBoundary
-from .testnet_gate import TestnetSafetyError
-from .relay import wait_for_receipt
+from .signer import sign_transaction, get_sender
+from .relay import (
+    relay_transaction, wait_for_receipt, simulate_bundle, RelayResult,
+)
+from .errors import ExecutionRefused
+from . import audit as execution_audit
 from log import get_logger
 
 log = get_logger("executor")
@@ -99,33 +109,19 @@ class ExecutionResult:
 
 class ArbExecutor:
     """
-    Consumes Opportunity objects and executes profitable arbitrage on-chain —
-    EXCLUSIVELY through the unified execution authorization boundary.
+    Consumes Opportunity objects and executes profitable arbitrage on-chain
+    through the existing Builder → Signer → Relay path.
 
     Args:
-        w3:            Web3 HTTP instance (used for building transactions and
-                       reading receipts; signing/submission NEVER happen here).
-        chain_id:      Current chain ID (network SELECTION only — it never
-                       authorizes execution).
-        authorization: The unified execution authorization boundary. Defaults
-                       to a fresh environment-resolved boundary; main.py wires
-                       ONE shared instance into the executor and the router.
+        w3:       Web3 HTTP instance (reliable for tx submission).
+        chain_id: Current chain ID (config.CHAIN_ID — the configured
+                  network identity of the running process).
     """
 
-    def __init__(
-        self,
-        w3: Web3,
-        chain_id: int = CHAIN_ID,
-        authorization: ExecutionAuthorizationBoundary | None = None,
-    ):
+    def __init__(self, w3: Web3, chain_id: int = CHAIN_ID):
         self.w3       = w3
         self.chain_id = chain_id
         self._chain   = get_chain(chain_id)
-        self._authorization = (
-            authorization
-            if authorization is not None
-            else ExecutionAuthorizationBoundary()
-        )
 
         self._arb_exec = None
         selected_address = self._chain.arb_exec_address
@@ -136,12 +132,11 @@ class ArbExecutor:
             )
             log.info(f"ArbExecutor ready | contract={selected_address}")
 
-            # Transport SELECTION only (which private-relay capability this
-            # chain is configured for). Actual transport USE still requires
-            # an authorized execution session from the boundary: the
-            # Flashbots path below goes exclusively through the gate's
-            # capability/session model, never through locally attached relay
-            # middleware or a locally held relay identity.
+            # Chain-aware relay SELECTION (which private-relay capability
+            # this chain is configured for). Actual transport attachment
+            # happens lazily inside the relay module on first private
+            # submission — after the master switch, chain-identity and
+            # provenance checks — never at import or construction time.
             relay_uri_available = self.chain_id in FLASHBOTS_RPCS
             try:
                 from flashbots import FlashbotsWeb3, flashbot  # noqa: F401
@@ -154,16 +149,7 @@ class ArbExecutor:
         else:
             log.warning("ArbExecutor: no arb_exec_address configured — execution disabled")
 
-    # ── authorization ────────────────────────────────────────────────────
-
-    def _authorize(self, purpose: str) -> AuthorizedExecution:
-        """Authorize one execution context through the unified boundary.
-
-        Raises ``TestnetSafetyError`` (refusal) — callers must treat any
-        refusal as a failed execution attempt, never as a success."""
-        return self._authorization.authorize_execution(
-            purpose=purpose, chain_id=self.chain_id,
-        )
+    # ── enforcement helpers ──────────────────────────────────────────────
 
     @staticmethod
     def _refused_result(error: str) -> ExecutionResult:
@@ -174,6 +160,40 @@ class ArbExecutor:
             amount_in=0, profit_wei=0, gas_cost_usd=0.0, error=error,
         )
 
+    def _audit(self, purpose: str, result: ExecutionResult, target: str | None = None) -> None:
+        """Append one attempt/outcome record to the execution audit log.
+
+        Attempts in an ENABLED execution context are always accounted for —
+        successful, refused, failed and uncertain alike. Refusals that
+        happen because the master switch is DISABLED keep the historical
+        disabled-run behaviour: nothing is written, nothing executes, and
+        the refusal is still visible in the returned result and the log
+        stream.
+        """
+        if not execution_enabled():
+            return
+        outcome = "refused" if result.method == "refused" else (
+            "success" if result.success else "failed"
+        )
+        try:
+            execution_audit.record_execution(
+                purpose=purpose,
+                chain_id=self.chain_id,
+                target=target,
+                function=None,
+                estimated_gas=None,
+                actual_gas_used=None,
+                tx_hash=result.tx_hash or None,
+                outcome=outcome,
+                error=result.error or None,
+                max_fee_exposure_wei=None,
+            )
+        except Exception as exc:  # auditing must never mask the outcome
+            log.error(
+                "failed to write execution audit record for %s: %s",
+                purpose, type(exc).__name__,
+            )
+
     # ── public entry points ──────────────────────────────────────────────
 
     def submit(self, opp: Opportunity) -> ExecutionResult | None:
@@ -181,60 +201,69 @@ class ArbExecutor:
         Attempt to execute an arbitrage opportunity.
 
         Returns ExecutionResult on attempt, None if skipped (pre-flight fail).
-        Every signing/submission attempt is authorized through the unified
-        boundary first; a refusal yields a failed (success=False) result.
+        The master execution switch is checked at this boundary; the signer
+        and the relay check it again independently at theirs.
         """
         if not self._arb_exec:
             return None
 
-        try:
-            auth = self._authorize("arb_execution")
-        except TestnetSafetyError as e:
-            log.warning(f"Execution refused by the authorization boundary: {e}")
-            return self._refused_result(f"authorization refused: {e}")
+        if not execution_enabled():
+            log.warning("Execution refused: EXECUTE_ONCHAIN is disabled (executor boundary)")
+            result = self._refused_result("execution disabled (EXECUTE_ONCHAIN)")
+            self._audit("arb_execution", result)
+            return result
 
         try:
-            return self._execute(opp, auth=auth)
-        except TestnetSafetyError as e:
-            log.warning(f"Execution refused at the authorization boundary: {e}")
-            return self._refused_result(f"authorization refused: {e}")
+            result = self._execute(opp)
+        except ExecutionRefused as e:
+            log.warning(f"Execution refused: {e}")
+            result = self._refused_result(str(e))
+            self._audit("arb_execution", result)
+            return result
         except Exception as e:
             log.error(f"Executor error: {e}")
-            return ExecutionResult(
+            result = ExecutionResult(
                 success=False, tx_hash="", method="", lender="",
                 amount_in=0, profit_wei=0, gas_cost_usd=0.0, error=str(e),
             )
+        self._audit("arb_execution", result)
+        return result
 
     def submit_batch(self, opps: list[Opportunity], block_number: int) -> ExecutionResult | None:
         """
         Attempt to execute a batch of arbitrage opportunities as ONE combined
-        transaction. The batch route uses the SAME authorization boundary as
-        the single-opportunity route.
+        transaction. The batch route uses the SAME builder validation, signer
+        and relay as the single-opportunity route — it cannot bypass the
+        transaction policy.
         """
         if not self._arb_exec:
             return None
 
-        try:
-            auth = self._authorize("arb_batch_execution")
-        except TestnetSafetyError as e:
-            log.warning(f"Batch execution refused by the authorization boundary: {e}")
-            return self._refused_result(f"authorization refused: {e}")
+        if not execution_enabled():
+            log.warning("Batch execution refused: EXECUTE_ONCHAIN is disabled (executor boundary)")
+            result = self._refused_result("execution disabled (EXECUTE_ONCHAIN)")
+            self._audit("arb_batch_execution", result)
+            return result
 
         try:
-            return self._execute_batch(opps, block_number, auth=auth)
-        except TestnetSafetyError as e:
-            log.warning(f"Batch execution refused at the authorization boundary: {e}")
-            return self._refused_result(f"authorization refused: {e}")
+            result = self._execute_batch(opps, block_number)
+        except ExecutionRefused as e:
+            log.warning(f"Batch execution refused: {e}")
+            result = self._refused_result(str(e))
+            self._audit("arb_batch_execution", result)
+            return result
         except Exception as e:
             log.error(f"Executor error: {e}")
-            return ExecutionResult(
+            result = ExecutionResult(
                 success=False, tx_hash="", method="", lender="",
                 amount_in=0, profit_wei=0, gas_cost_usd=0.0, error=str(e),
             )
+        self._audit("arb_batch_execution", result)
+        return result
 
     # ── execution pipeline ───────────────────────────────────────────────
 
-    def _execute(self, opp: Opportunity, *, auth: AuthorizedExecution, for_batch = False) -> ExecutionResult | None:
+    def _execute(self, opp: Opportunity, for_batch = False) -> ExecutionResult | None:
         meta          = opp.metadata or {}
         ad_tuple      = meta.get("arb_data")       # from getProfit() for 2-pool
         fees_pip      = meta.get("fees_pip", [f * 100 for f in meta.get("fees_bps", [])])
@@ -326,28 +355,18 @@ class ArbExecutor:
                 min_profit=min_profit,
             )
 
-        # ── Pre-flight simulation through the boundary's gate session ────
-        sim_result: dict = {}
-        if self.use_flashbots and not for_batch:
-            probe_tx = build_execute_tx(
-                w3=self.w3,
-                arb_exec=self._arb_exec,
+        # ── Simulate transaction (Flashbots chains only) ─────────────────
+        sim_result = {}
+        if self.use_flashbots:
+            log.debug(f"Simulating arb | lender={lender.lender_name} mode={lender.mode} amount={amount_in} hops={hop_count}")
+            sim_result = self.execution_simulation(
                 arb_data=arb_data,
                 force_balancer=lender.force_balancer,
-                builder_tip_bps=builder_tip_bps,
-                sender=auth.sender,
+                builder_tip=builder_tip_bps,
                 gas_units=gas_units,
+                target_block=opp.block_number + 1,
+                target_tx=trigger_tx if from_mempool else "",
             )
-            try:
-                sim_result = self.execution_simulation(
-                    auth,
-                    probe_tx,
-                    target_block=opp.block_number + 1,
-                    target_tx=trigger_tx if from_mempool else "",
-                )
-            except TestnetSafetyError as e:
-                log.debug(f"Skipping: boundary simulation refused: {e}")
-                return [None] * 4 if for_batch else None
             if not sim_result or not sim_result.get("success"):
                 error = sim_result.get("error") if sim_result else "Unknown simulation error"
                 log.debug(f"Skipping: simulation failed | error={error}")
@@ -357,269 +376,133 @@ class ArbExecutor:
 
             arb_data["minProfit"] = int(sim_result.get("gas_fee_wei", 0) * 1.2)  # increase minProfit to account for simulation uncertainty
             gas_units = sim_result.get("gas_used", gas_units)
-        # for_batch members skip relay simulation: each member's prepared
-        # payload is never submitted on its own (the batch is ONE combined
-        # transaction), so preparing per-member signed payloads would mint
-        # one-use authorizations for payloads that are never used.
 
         if for_batch:
             return arb_data, gas_units, gas_cost_usd, builder_tip_bps
 
-        # ── Step 5: Build UNSIGNED transaction ────────────────────────────────
+        # ── Step 5: Build transaction (builder enforces the tx policy) ────────
+        try:
+            sender = get_sender()
+        except ExecutionRefused as e:
+            log.error(f"Cannot execute: {e}")
+            raise
+
         tx = build_execute_tx(
             w3=self.w3,
             arb_exec = self._arb_exec,
             arb_data=arb_data,
             force_balancer=lender.force_balancer,
             builder_tip_bps=builder_tip_bps,
-            sender=auth.sender,
+            sender=sender,
             gas_units=gas_units,
         )
 
-        # ── Step 6: Sign + relay EXCLUSIVELY through the boundary ────────────
+        # ── Step 6: Sign (signer enforces switch/chain/custody) ───────────────
+        raw_tx = sign_transaction(self.w3, tx, chain_id=self.chain_id)
+
+        # ── Step 7: Relay (relay enforces switch/chain/provenance) ────────────
         log.info(
             f"Executing arb | lender={lender.lender_name} mode={lender.mode} "
             f"amount={amount_in} profit_wei={profit_wei} "
             f"gas_usd=${gas_cost_usd:.3f} hops={hop_count}"
         )
 
-        if self.use_flashbots:
-            return self._submit_via_flashbots_session(
-                auth, tx, lender=lender.lender_name, amount_in=amount_in,
-                profit_wei=profit_wei, gas_cost_usd=gas_cost_usd,
-            )
-        return self._submit_via_boundary_direct(
-            auth, tx, lender=lender.lender_name, amount_in=amount_in,
-            profit_wei=profit_wei, gas_cost_usd=gas_cost_usd,
+        result: RelayResult = relay_transaction(
+            w3=self.w3,
+            raw_tx=raw_tx,
+            expected_chain_id=self.chain_id,
+            target_tx=sim_result.get("target_raw_tx", b"") or b"",
+            target_block=sim_result.get("target_block") or opp.block_number + 1,
+            use_flashbots = self.use_flashbots
         )
 
-    def _execute_batch(self, opps: list[Opportunity], block_number, *, auth: AuthorizedExecution) -> ExecutionResult | None:
-        # ── Step 5: Build transaction (members prepared WITHOUT signing) ─────
-        calls, total_gas, total_gas_usd = build_batch_calls(
-            lambda opp, for_batch: self._execute(opp, auth=auth, for_batch=for_batch),
-            self._arb_exec, opps,
+        # ── Step 8: Receipt (direct only) ─────────────────────────────────────
+        receipt = None
+        if result.success and result.method == "direct":
+            receipt = wait_for_receipt(self.w3, result.tx_hash, timeout=30)
+            if receipt:
+                status = receipt.get("status", 0)
+                if status == 1:
+                    profit = self.extract_profit(receipt)
+                    log.info(f"✅ Arb confirmed | tx={result.tx_hash[:16]} profit_wei={profit}")
+                else:
+                    log.warning(f"❌ Arb reverted on-chain | tx={result.tx_hash[:16]}")
+                    result.success = False
+
+        return ExecutionResult(
+            success=result.success,
+            tx_hash=result.tx_hash,
+            method=result.method,
+            lender=lender.lender_name,
+            amount_in=amount_in,
+            profit_wei=profit_wei,
+            gas_cost_usd=gas_cost_usd,
+            error=result.error,
+            receipt=receipt,
         )
+
+    def _execute_batch(self, opps: list[Opportunity], block_number) -> ExecutionResult | None:
+        # ── Step 5: Build transaction (members prepared WITHOUT signing) ─────
+        calls, total_gas, total_gas_usd = build_batch_calls(self._execute, self._arb_exec, opps)
+        try:
+            sender = get_sender()
+        except ExecutionRefused as e:
+            log.error(f"Cannot execute batch: {e}")
+            raise
+
         tx = build_execute_batch_tx(
             w3=self.w3,
             arb_exec=self._arb_exec,
             calls=calls,
-            sender=auth.sender,
+            sender=sender,
             gas_units=total_gas,
         )
 
-        # ── Step 6: Sign + relay EXCLUSIVELY through the boundary ────────────
+        # ── Step 6: Sign ──────────────────────────────────────────────────────
+        raw_tx = sign_transaction(self.w3, tx, chain_id=self.chain_id)
+
+        # ── Step 7: Relay ─────────────────────────────────────────────────────
         log.info(
             f"Batch execution |opps_count={len(opps)} lender=pool_flash_swap mode=1 "
             f"gas_usd=${total_gas_usd:.3f}"
         )
 
-        if self.use_flashbots:
-            session = auth.prepare_flashbots_bundle(
-                [tx],
-            )
-            session.simulate()  # mandatory before submission (gate-enforced)
-            submission = session.submit()
-            audit = submission.get("audit", {}) or {}
-            log.info(
-                f"✅ Batch arb submitted via gate session | bundle={str(audit.get('tx_hash'))[:16]}"
-            )
-            return ExecutionResult(
-                success=True,
-                tx_hash=str(audit.get("tx_hash") or ""),
-                method="flashbots",
-                amount_in=None,
-                lender="pool_flash_swap",
-                profit_wei=0,
-                profit_usd=0,
-                gas_cost_usd=total_gas_usd,
-                error="",
-            )
+        result: RelayResult = relay_transaction(
+            w3=self.w3,
+            raw_tx=raw_tx,
+            expected_chain_id=self.chain_id,
+            target_block=block_number + 1,
+            use_flashbots = self.use_flashbots
+        )
 
-        record = auth.sign_and_submit(tx)
-        tx_hash = str(record.get("tx_hash") or "")
-        outcome = str(record.get("outcome") or "")
-
-        # ── Step 7: Receipt (direct only) ────────────────────────────────────
+        # ── Step 8: Receipt (direct only) ─────────────────────────────────────
         receipt = None
         batch_result = {}
         summary = None
-        success = outcome in ("mined", "submitted", "receipt_unavailable")
-        if success and tx_hash:
-            receipt = wait_for_receipt(self.w3, tx_hash, timeout=30)
+        if result.success and result.method == "direct":
+            receipt = wait_for_receipt(self.w3, result.tx_hash, timeout=30)
             if receipt:
                 status = receipt.get("status", 0)
                 if status == 1:
-                    batch_result = self.extract_batch_result(receipt) or {}
+                    batch_result = self.extract_batch_result(receipt)
                     summary = batch_result.get('summary')
-                    log.info(f"✅ Batch Arb confirmed | tx={tx_hash[:16]} | summary: ({summary.successful} successful, {summary.failed} failed)" if summary else f"✅ Batch Arb confirmed | tx={tx_hash[:16]}")
+                    log.info(f"✅ Batch Arb confirmed | tx={result.tx_hash[:16]} | summary: ({summary.successful} successful, {summary.failed} failed)" if summary else f"✅ Batch Arb confirmed | tx={result.tx_hash[:16]}")
                 else:
-                    log.warning(f"❌ Batch Arb reverted on-chain | tx={tx_hash[:16]}")
-                    success = False
+                    log.warning(f"❌ Batch Arb reverted on-chain | tx={result.tx_hash[:16]}")
+                    result.success = False
         return ExecutionResult(
-            success=success,
-            tx_hash=tx_hash,
-            method="direct",
+            success=result.success,
+            tx_hash=result.tx_hash,
+            method=result.method,
             amount_in=None,
             lender="pool_flash_swap",
             profit_wei=batch_result.get("est_profit_wei") if batch_result else 0,
             profit_usd=batch_result.get("est_profit_usd") if batch_result else 0,
             gas_cost_usd=batch_result.get("gas_usd") if batch_result else total_gas_usd,
             summary=summary if batch_result else None,
-            error=str(record.get("error") or ""),
+            error=result.error,
             receipt=receipt,
         )
-
-    # ── boundary-mediated submission ─────────────────────────────────────
-
-    def _submit_via_boundary_direct(
-        self,
-        auth: AuthorizedExecution,
-        tx: dict,
-        *,
-        lender: str,
-        amount_in: int,
-        profit_wei: int,
-        gas_cost_usd: float,
-    ) -> ExecutionResult:
-        """Direct-RPC submission through the unified boundary's gate
-        orchestration: chain verification before signing AND immediately
-        before submission, transaction policy, wallet custody binding,
-        submission, receipt and audit — all inside the gate. Signed raw
-        bytes never exist outside it."""
-        record = auth.sign_and_submit(tx)
-        tx_hash = str(record.get("tx_hash") or "")
-        outcome = str(record.get("outcome") or "")
-
-        success = outcome in ("mined", "submitted", "receipt_unavailable")
-
-        # ── Receipt (direct only) ────────────────────────────────────────────
-        receipt = None
-        if success and tx_hash:
-            receipt = wait_for_receipt(self.w3, tx_hash, timeout=30)
-            if receipt:
-                status = receipt.get("status", 0)
-                if status == 1:
-                    profit = self.extract_profit(receipt)
-                    log.info(f"✅ Arb confirmed | tx={tx_hash[:16]} profit_wei={profit}")
-                else:
-                    log.warning(f"❌ Arb reverted on-chain | tx={tx_hash[:16]}")
-                    success = False
-
-        return ExecutionResult(
-            success=success,
-            tx_hash=tx_hash,
-            method="direct",
-            lender=lender,
-            amount_in=amount_in,
-            profit_wei=profit_wei,
-            gas_cost_usd=gas_cost_usd,
-            error=str(record.get("error") or ""),
-            receipt=receipt,
-        )
-
-    def _submit_via_flashbots_session(
-        self,
-        auth: AuthorizedExecution,
-        tx: dict,
-        *,
-        lender: str,
-        amount_in: int,
-        profit_wei: int,
-        gas_cost_usd: float,
-    ) -> ExecutionResult | None:
-        """Flashbots submission through the gate-controlled capability/
-        session model: prepare (signs inside the gate) → simulate (mandatory)
-        → submit (one-use authorization). The relay is a transport only.
-
-        The submitted payload is always the exact simulated payload: the
-        minProfit adjustment is baked into THIS transaction before its
-        session is prepared, so there is no unsubmitted-payload gap."""
-        try:
-            session = auth.prepare_flashbots_bundle([tx])
-        except TestnetSafetyError:
-            # preparation refusal — audited by the gate; a REFUSED attempt
-            raise
-        try:
-            session.simulate()
-            submission = session.submit()
-        except TestnetSafetyError as e:
-            # simulation failure/refusal → skip (fail closed, audited);
-            # submission failure → failed result
-            log.warning(f"Gate session refused or failed: {e}")
-            return None
-        audit = submission.get("audit", {}) or {}
-        tx_hash = str(audit.get("tx_hash") or "")
-        log.info(f"✅ Arb submitted via gate session | bundle={tx_hash[:16]}")
-        return ExecutionResult(
-            success=True,
-            tx_hash=tx_hash,
-            method="flashbots",
-            lender=lender,
-            amount_in=amount_in,
-            profit_wei=profit_wei,
-            gas_cost_usd=gas_cost_usd,
-            error="",
-        )
-
-    def execution_simulation(
-        self,
-        auth: AuthorizedExecution,
-        tx: dict,
-        target_block: int = None,
-        target_tx: str = "") -> dict:
-        """
-        Simulate a BUILT transaction through the boundary's gate session
-        (Flashbots transport only). The transaction is signed INSIDE the
-        gate by the prepared session — this method never signs locally and
-        never returns signed bytes.
-
-        Used as a pre-flight refinement of the profit estimate. Simulation
-        failures/refusals raise ``TestnetSafetyError`` (audited by the gate)
-        or return a failure dict for revert-style outcomes.
-        """
-        if not self.use_flashbots:
-            log.warning("Simulation requested but the Flashbots transport is not enabled")
-            return {
-                "success": False,
-                "error": "Flashbots transport not enabled",
-            }
-
-        if target_tx:
-            # A third-party trigger transaction cannot be carried through
-            # the gate's wallet-bound bundle model: every signed transaction
-            # in a prepared bundle must be signed by the verified agent
-            # wallet. Mixed-signer (victim + searcher) bundles are refused
-            # fail-closed; enabling them requires a separately reviewed
-            # extension of the gate's capability model (DSS-WO-ENG-015).
-            return {
-                "success": False,
-                "error": (
-                    "atomic backrun bundles with third-party trigger "
-                    "transactions are not executable through the "
-                    "authorization boundary's wallet-bound Flashbots "
-                    "session"
-                ),
-            }
-
-        session = auth.prepare_flashbots_bundle([tx])
-        try:
-            sim = session.simulate()
-        except TestnetSafetyError:
-            raise  # audited by the session; fail closed
-        results = sim.get("results") or []
-        gas_fee_wei = 0
-        if results:
-            try:
-                gas_fee_wei = int(results[0].get("gasFees", 0) or 0)
-            except (TypeError, ValueError):
-                gas_fee_wei = 0
-        return {
-            "success": True,
-            "gas_used": sim.get("totalGasUsed"),
-            "gas_fee_wei": gas_fee_wei,
-            "target_block": sim.get("blockNumber"),
-            "target_raw_tx": None,
-        }
 
     def _best_amount(
         self,
@@ -713,4 +596,87 @@ class ArbExecutor:
             'est_profit_wei': est_profit_wei,
             'gas_usd': gas_usd,
             'summary': summary
+        }
+
+    def execution_simulation(
+            self,
+            arb_data,
+            force_balancer,
+            builder_tip,
+            gas_units,
+            target_block: int = None,
+            target_tx: str = "") -> int:
+        """
+        Simulate the execution of an opportunity to get a more accurate profit estimate.
+        This can be used for pre-flight checks or for post-detection refinement.
+
+        The probe transaction is built (policy-validated) and signed through
+        the SAME strengthened signer path as a live transaction, then
+        simulated through the relay module's Flashbots transport.
+        """
+        # ── Step 5: Build transaction ─────────────────────────────────────────
+        if not self.use_flashbots:
+            log.warning("Simulation requested but Flashbots relay is not enabled")
+            return {
+                "success": False,
+                "error": "Flashbots relay not enabled",
+            }
+
+        try:
+            sender = get_sender()
+        except ExecutionRefused as e:
+            log.error(f"Cannot simulate: {e}")
+            raise
+
+        tx = build_execute_tx(
+            w3=self.w3,
+            arb_exec = self._arb_exec,
+            arb_data=arb_data,
+            force_balancer=force_balancer,
+            builder_tip_bps=builder_tip,
+            sender=sender,
+            gas_units=gas_units,
+        )
+
+        # ── Step 6: Sign (single authoritative signer path) ──────────────────
+        raw_tx = sign_transaction(self.w3, tx, chain_id=self.chain_id)
+
+        if target_tx:
+            full_tx = self.w3.eth.get_transaction(target_tx)
+            target_raw_tx = serialize(full_tx)
+            log.info(f"Target tx for bundle | hash={target_tx} from={full_tx['from']} to={full_tx['to']} value={full_tx['value']}")
+            bundle = [
+                {"signed_transaction": target_raw_tx, "hash": target_tx},
+                {"signed_transaction": raw_tx},
+            ]
+        else:
+            bundle = [{"signed_transaction": raw_tx}]
+
+        try:
+            sim = simulate_bundle(self.w3, bundle, max(target_block, self.w3.eth.block_number))
+        except ExecutionRefused as e:
+            log.warning(f"Simulation refused: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+        if sim.get("results"):
+            revert_data = sim["results"][0].get("revert")
+            if revert_data:
+                error = decode(["string"], to_bytes(hexstr="0x" + revert_data[10:])) if len(revert_data) > 64 else revert_data
+                return {
+                    "success": False,
+                    "error": error,
+                }
+            return {
+                "success": True,
+                "gas_used": sim["totalGasUsed"],
+                "gas_fee_wei": sim["results"][0].get("gasFees", 0),
+                "target_block": sim.get("blockNumber"),
+                "target_raw_tx": target_raw_tx if target_tx else None,
+            }
+        return {
+            "success": False,
+            "error": "simulation returned no results",
         }

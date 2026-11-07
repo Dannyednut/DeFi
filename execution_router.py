@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from dataclasses import dataclass
 from enum import Enum
 
-from executor.authorization import ExecutionAuthorizationBoundary
+from config import execution_enabled
 from log import get_logger
 
 if TYPE_CHECKING:
@@ -60,16 +60,17 @@ class ExecutionRouter:
     - Result processing and lifecycle updates
     - Batch execution coordination
 
-    AUTHORIZATION (DSS-WO-ENG-015): the router does NOT treat a
-    configuration boolean as execution authority. It delegates execution
-    authorization to the unified execution authorization boundary
-    (``executor/authorization.py``): the router is armed only when BOTH the
-    executor is ready AND the boundary authorizes execution. Policy
-    selection and authorization live in exactly one place — the boundary —
-    and are never re-implemented here.
+    EXECUTION GATING (DSS-WO-ENG-015 R4): the router retains its existing
+    responsibility for deciding whether opportunities enter the execution
+    pipeline. It refuses normal execution while the master switch
+    (EXECUTE_ONCHAIN) is disabled — read through ``config.execution_enabled()``
+    at decision time, never a cached snapshot — and while the executor is
+    not ready. The router is an OPERATIONAL control, not the only security
+    boundary: direct calls to the executor, signer or relay are enforced
+    independently at those boundaries.
 
     Usage:
-        router = ExecutionRouter(tracker, executor, authorization=boundary)
+        router = ExecutionRouter(tracker, executor)
         router.start()
 
         # From detectors
@@ -86,7 +87,6 @@ class ExecutionRouter:
         tracker: "OpportunityTracker",
         executor: "ArbExecutor | None",
         *,
-        authorization: ExecutionAuthorizationBoundary | None = None,
         min_profit_usd: float = 0.01,
         max_executions_per_block: int = 3,
         streaming_multiplier: float = 2.0,
@@ -95,23 +95,8 @@ class ExecutionRouter:
     ):
         self.tracker = tracker
         self.executor = executor
-        # Check if executor is properly configured with arb_exec contract
-        executor_ready = executor is not None and getattr(executor, '_arb_exec', None) is not None
-        # Execution authorization is delegated to the unified boundary —
-        # there is no duplicate environment-variable check here.
-        self.authorization = (
-            authorization
-            if authorization is not None
-            else ExecutionAuthorizationBoundary()
-        )
-        policy_authorized = self.authorization.execution_available()
-        self.execute_onchain = executor_ready and policy_authorized
-        if executor_ready and not policy_authorized:
-            log.warning(
-                "[ROUTER] Execution disabled by the execution authorization "
-                "boundary: %s",
-                self.authorization.refusal_reason(),
-            )
+        if self.executor is not None and getattr(self.executor, '_arb_exec', None) is None:
+            log.warning("[ROUTER] Executor has no arb_exec contract configured")
         self.min_profit_usd = min_profit_usd
         self.streaming_threshold = min_profit_usd * streaming_multiplier
         self.max_executions = max_executions_per_block
@@ -137,6 +122,26 @@ class ExecutionRouter:
     # Public API
     # ═══════════════════════════════════════════════════════════════════════════
     
+    @property
+    def execute_onchain(self) -> bool:
+        """Whether this router currently routes opportunities into the
+        execution pipeline: the executor must be ready AND the master
+        execution switch must be enabled.
+
+        DSS-WO-ENG-015 R4: this is re-evaluated at every access through
+        ``config.execution_enabled()`` — the authoritative process read —
+        so the decision is checked at the actual operation boundaries
+        (arming, submission, batch gating), not merely at construction
+        time. There is no second switch and no authorization object: the
+        executor, signer and relay enforce the same switch independently
+        at their own boundaries.
+        """
+        executor_ready = (
+            self.executor is not None
+            and getattr(self.executor, '_arb_exec', None) is not None
+        )
+        return executor_ready and execution_enabled()
+
     def start(self) -> None:
         """Start execution worker threads."""
         if not self.execute_onchain:
@@ -145,11 +150,7 @@ class ExecutionRouter:
             elif getattr(self.executor, '_arb_exec', None) is None:
                 log.warning("[ROUTER] Execution disabled (no arb_exec contract configured)")
             else:
-                log.warning(
-                    "[ROUTER] Execution disabled by the execution authorization "
-                    "boundary: %s",
-                    self.authorization.refusal_reason(),
-                )
+                log.warning("[ROUTER] Execution disabled (EXECUTE_ONCHAIN is disabled)")
             return
             
         log.info(f"[ROUTER] Starting execution router | workers={self._async_workers}")
@@ -530,29 +531,28 @@ def create_router(
     tracker: "OpportunityTracker",
     executor: "ArbExecutor | None",
     config: dict | None = None,
-    authorization: ExecutionAuthorizationBoundary | None = None,
 ) -> ExecutionRouter:
     """Factory function to create execution router from config.
 
-    AUTHORIZATION (DSS-WO-ENG-015): ``EXECUTE_ONCHAIN`` is NOT an execution
-    authority and is deliberately not consulted here — whether execution may
-    proceed is decided exclusively by the unified execution authorization
-    boundary. A config entry is accepted only for backward-compatible call
-    sites and is ignored for authorization purposes (an explicit warning is
-    logged when it is set true, so an operator relying on the old boolean
-    sees why nothing executes).
+    DSS-WO-ENG-015 R4: whether execution may proceed is decided by the
+    master execution switch in the REAL process environment
+    (``config.execution_enabled()``), never by a config dict. A config
+    entry named EXECUTE_ONCHAIN is accepted only for backward-compatible
+    call sites and is ignored for the gating decision (an explicit warning
+    is logged when it is present, so an operator relying on the old
+    boolean sees why nothing executes).
     """
     cfg = config or {}
-    if cfg.get("EXECUTE_ONCHAIN"):
+    if "EXECUTE_ONCHAIN" in cfg:
         log.warning(
-            "[ROUTER] config contains EXECUTE_ONCHAIN=true, but that switch "
-            "cannot authorize execution: the unified execution authorization "
-            "boundary decides whether execution may proceed"
+            "[ROUTER] config contains EXECUTE_ONCHAIN=%s, but the master "
+            "execution switch is the EXECUTE_ONCHAIN PROCESS ENVIRONMENT "
+            "setting — a config-dict entry does not gate execution",
+            cfg["EXECUTE_ONCHAIN"],
         )
     return ExecutionRouter(
         tracker=tracker,
         executor=executor,
-        authorization=authorization,
         min_profit_usd=cfg.get("MIN_PROFIT_USD", 0.01),
         max_executions_per_block=cfg.get("MAX_EXECUTIONS", 3),
         streaming_multiplier=cfg.get("STREAMING_MULTIPLIER", 2.0),

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from config import ARB_EXEC_ABI, get_chain
-from executor.authorization import authorized_sender_address
+from executor.signer import recorded_agent_address
 from log import get_logger
 
 log = get_logger("adversarial_validation")
@@ -93,13 +93,13 @@ class AdversarialSimulator:
             latest = int(self.w3.eth.block_number)
             if latest != int(block_number):
                 return AdversarialResult(False, "rejected", f"state moved from {block_number} to {latest}")
-            # DSS-WO-ENG-015: the sender address comes from the unified
-            # execution authorization boundary (the recorded PUBLIC agent
-            # address). No key material is involved; when no execution
-            # policy is available this fails closed exactly like the
-            # removed legacy signer did.
+            # DSS-WO-ENG-015 R4: the sender address is the recorded PUBLIC
+            # agent identity from the single wallet-custody path
+            # (executor/signer.py). No key material is involved; when no
+            # secret store is provisioned this fails closed exactly like
+            # the legacy signer did.
             sender = self.w3.to_checksum_address(
-                authorized_sender_address(self.chain_id)
+                recorded_agent_address()
             )
             target = self.w3.eth.get_transaction(target_tx_hash)
             candidate = self._build_candidate_tx(opp, sender, block_number)

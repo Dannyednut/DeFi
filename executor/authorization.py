@@ -63,6 +63,19 @@ re-derives every authorization decision from the authoritative sources
 inside the gate. Offline tests use environment patching and controlled
 mocks, which are not operational interfaces.
 
+DSS-WO-ENG-015 R2 — SECURITY POLICY IS NOT CALLER-CONFIGURABLE: the gate
+carries the code-controlled ``SECURITY_POLICY`` (allowed chains, the
+opt-in requirement, the transaction value/gas limits, the per-
+transaction and aggregate fee ceilings, the approved targets, the wallet
+custody locations, the audit destination and the reviewed relay
+destination), and every enforcement point reads it directly.
+``TestnetExecutionConfig`` is operational-only (RPC endpoint and expected
+chain), so NEITHER a caller-supplied policy injected into this boundary
+NOR a hand-built configuration can produce an authorized handle with
+weakened gate settings: every authorize() call re-derives the decision
+from the real environment and the gate re-enforces every security control
+from ``SECURITY_POLICY`` regardless of which policy object selected it.
+
 HONEST BOUNDARY (inherited from executor/testnet_gate.py): this is an
 application-level boundary for the agent's own code paths. Arbitrary hostile
 code executing inside the same interpreter can defeat Python-level
@@ -80,11 +93,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
 from .testnet_gate import (
+    SECURITY_POLICY,
     TestnetExecutionConfig,
     TestnetSafetyError,
     _sanitize_error,
     _registered_secrets,
     gate_opted_in,
+    load_agent_address,
     prepare_flashbots_bundle,
     record_testnet_tx,
     sign_and_submit_testnet_tx,
@@ -173,7 +188,15 @@ class TestnetExecutionPolicy(ExecutionPolicy):
     allowlist membership of the expected chain in the code-controlled
     production map and the full secret-store custody checks. The gate
     then re-verifies the RPC-reported chain ID before signing and before
-    submission."""
+    submission.
+
+    DSS-WO-ENG-015 R2: the ``config`` this policy carries is
+    operational-only (RPC endpoint and expected chain); every security
+    control is enforced by the gate from the code-controlled
+    ``SECURITY_POLICY``, so this policy object — like any custom policy
+    injected into the boundary — cannot weaken the gate settings it
+    selects.
+    """
 
     # Not a pytest test class despite the Test prefix.
     __test__ = False
@@ -381,6 +404,15 @@ class ExecutionAuthorizationBoundary:
         ``authorize`` re-derives the decision from the authoritative
         sources (real-environment opt-in, code-controlled allowlist, real
         wallet custody) inside the gate at every call.
+
+        DSS-WO-ENG-015 R2: custom policy injection CANNOT produce an
+        authorized handle with weakened gate settings. A policy object
+        selects only WHICH gate configuration governs a request, and that
+        configuration is operational-only; the gate re-enforces every
+        security control (opt-in, allowlist, caps, custody, audit,
+        relay, targets) from the code-controlled ``SECURITY_POLICY`` at
+        every authorization and every signing/submission call, so the
+        injected policy cannot weaken what the gate enforces.
         """
         self._policy = (
             policy if policy is not None else resolve_execution_policy()
@@ -419,7 +451,7 @@ class ExecutionAuthorizationBoundary:
             policy_name=self._policy.name,
             network=self._policy.network,
             chain_id=int(cfg.expected_chain_id),
-            sender=cfg.load_agent_address(),
+            sender=load_agent_address(),
             purpose=purpose,
             config=cfg,
         )
@@ -434,7 +466,7 @@ class ExecutionAuthorizationBoundary:
         available or the chain does not match the policy's chain.
         """
         cfg = self._policy.authorize("authorized-sender-address", chain_id)
-        return cfg.load_agent_address()
+        return load_agent_address()
 
     def _audit_refusal(
         self,
@@ -462,7 +494,7 @@ class ExecutionAuthorizationBoundary:
             return
         try:
             record_testnet_tx(
-                cfg.tx_log_path,
+                SECURITY_POLICY.tx_log_path,
                 purpose=purpose,
                 chain_id=chain_id,
                 target=None,

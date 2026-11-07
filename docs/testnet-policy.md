@@ -573,3 +573,94 @@ the repository for EVERY broadcast mechanism — `send_raw_transaction`,
 asserts no production module issues a send-shaped JSON-RPC method through
 `make_request`. Wallet custody, chain verification, transaction
 restrictions and fee-exposure checks are unchanged.
+
+### 8.2 Security policy is not caller-configurable (DSS-WO-ENG-015 R2)
+
+The R1 review confirmed the authorization inputs (opt-in, allowlist,
+targets) are isolated from callers; R2 closes the remaining gap the
+Coordinator identified: `TestnetExecutionConfig` still exposed
+security-critical fields, and the gate orchestrations trusted them.
+
+**The security policy is the code-controlled `SECURITY_POLICY` singleton**
+(`executor/testnet_gate.TestnetSecurityPolicy`). It is an instance WITHOUT
+state (`__slots__ = ()`); every property reads a reviewed module constant
+at access time, so no per-instance override exists:
+
+| Policy decision | Authoritative constant |
+| --- | --- |
+| Allowed chain IDs | `ALLOWED_TESTNET_CHAINS` (Sepolia only) |
+| Execution opt-in | `DSS_TESTNET_EXEC=1` in the REAL process environment (`gate_opted_in()`) |
+| Max transaction value | `MAX_TESTNET_TX_VALUE_WEI` |
+| Max gas units | `MAX_TESTNET_GAS_UNITS` |
+| Max fee per gas | `MAX_TESTNET_MAX_FEE_PER_GAS_WEI` |
+| Max priority fee | `MAX_TESTNET_MAX_PRIORITY_FEE_WEI` |
+| Max per-tx AND aggregate bundle fee | `MAX_TESTNET_TX_FEE_WEI` |
+| Approved contract targets | `KNOWN_TARGETS` (deliberately EMPTY) |
+| Wallet custody locations | `DEFAULT_KEYSTORE_PATH` / `DEFAULT_PASSPHRASE_PATH` / `DEFAULT_ADDRESS_PATH` (the DSS secret store) |
+| Audit destination | `DEFAULT_TX_LOG_PATH` |
+| Reviewed relay | `FLASHBOTS_SEPOLIA_RELAY` |
+
+**Operational configuration is strictly separated.**
+`TestnetExecutionConfig` now carries EXACTLY `rpc_url` and
+`expected_chain_id` — genuinely operational selections. The security
+fields (`max_value_wei`, `max_gas_units`, `max_fee_per_gas_wei`,
+`max_priority_fee_wei`, `max_total_fee_wei`, `keystore_path`,
+`passphrase_path`, `address_path`, `tx_log_path`, `relay_url`) are GONE:
+constructing a config with any of them raises `TypeError`, and no
+environment variable is read for any of them. The policy-validation
+primitives (`validate_transaction`, `validate_bundle`,
+`validate_fee_exposure`, `validate_bundle_fee_exposure`) accept no limit
+override parameter at all — both orchestrations (direct RPC and
+Flashbots) enforce the SAME immutable constants, including the aggregate
+bundle fee ceiling re-checked before every relay interaction.
+
+**Wallet custody** always uses the designated DSS secret-store paths:
+`verify_secret_store()` and `load_agent_wallet()` take no configuration —
+there is no parameter through which a caller could substitute a keystore,
+passphrase or recorded address. All existing secret-file type, permission,
+symlink, directory-exposure, keystore-format and identity-binding checks
+are unchanged.
+
+**Audit** always goes to the designated destination. Refused, failed,
+uncertain and successful outcomes remain accounted for; an audit-write
+failure never rewrites a verdict — the original refusal is still raised
+and the write failure is logged.
+
+**Relay** is always the reviewed Sepolia Flashbots relay; the gate hands
+exactly `FLASHBOTS_SEPOLIA_RELAY` to the relay transport — a caller
+cannot redirect the signing/submission session.
+
+**Policy injection cannot weaken the gate.** The optional `policy`
+argument on `ExecutionAuthorizationBoundary` selects WHICH operational
+config governs a request; the gate re-enforces every security control
+from `SECURITY_POLICY` (and the real environment) at every authorization
+and every signing/submission call, so an injected policy — or a
+hand-minted `AuthorizedExecution` — cannot produce an authorized handle
+with weakened gate settings.
+
+**Test isolation.** Offline tests redirect the custody/audit (and, for
+credential-containment coverage, relay) constants with
+`tests/gate_r2_fixtures.throwaway_store` — `unittest.mock.patch.object`
+scopes on the module constants, the same controlled-mock technique used
+for the allowlist and target maps. `IsolatedTestnetConfig` is a test-only
+operational config whose security-named attributes are live reads of the
+policy and whose constructor REFUSES divergent values; it is immutable
+and never imported by production code. Test injection is not an
+operational interface.
+
+**Regression coverage (R2 §5).** `tests/test_r2_policy_isolation.py`
+pins: enormous configured value/gas limits cannot weaken the real caps;
+enormous fee-per-gas/priority ceilings cannot weaken the fee caps; an
+enormous aggregate ceiling cannot weaken the Flashbots bundle cap;
+caller-supplied custody paths cannot replace the designated store;
+caller-supplied audit paths cannot redirect or suppress records and an
+audit-path failure keeps the refusal fail-closed; caller-supplied relay
+URLs cannot redirect the session; direct orchestration calls, injected
+policies and hand-minted handles cannot bypass the central policy; both
+transports enforce identical constants; every refusal path leaves the
+wallet undecrypted, nothing signed and nothing broadcast; and the
+standard application route stays disabled without the real opt-in.
+Structural invariants pin the orchestration signatures, the
+operational-only config fields, the `SECURITY_POLICY` destinations in
+the orchestration sources, and — repo-wide — that the ONLY broadcast
+markers in non-test code live in `executor/testnet_gate.py`.

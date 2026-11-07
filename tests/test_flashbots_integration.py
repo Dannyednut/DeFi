@@ -127,6 +127,10 @@ def setUpModule():
     unittest.addModuleCleanup(_MODULE_OPT_IN.stop)
 
 
+import executor.testnet_gate as _gate
+
+from tests.gate_r2_fixtures import IsolatedTestnetConfig, throwaway_store
+
 from executor.testnet_gate import (
     FLASHBOTS_SEPOLIA_RELAY,
     MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
@@ -135,6 +139,7 @@ from executor.testnet_gate import (
     PreparedFlashbotsBundle,
     TestnetExecutionConfig,
     TestnetSafetyError,
+    load_agent_address,
     prepare_flashbots_bundle,
     verify_secret_store,
 )
@@ -156,11 +161,11 @@ def _skip_reason() -> str | None:
             "opt-in live testnet test: set DSS_TESTNET_FLASHBOTS_LIVE=1 "
             "(never set in CI)"
         )
-    # Secret store presence + permissions through the gate's custody check.
-    # The config carries no RPC URL yet; verify only the secret-store part.
-    probe = TestnetExecutionConfig(rpc_url=None)
+    # Secret store presence + permissions through the gate's custody check
+    # (R2: the custody locations are the code-controlled policy paths —
+    # no config object is involved).
     try:
-        verify_secret_store(probe)
+        verify_secret_store()
     except TestnetSafetyError as exc:
         return f"DSS agent secret store failed custody check: {exc}"
     if not os.environ.get("DSS_TESTNET_RPC_URL"):
@@ -168,10 +173,11 @@ def _skip_reason() -> str | None:
     return None
 
 
-def _read_recorded_address(cfg: TestnetExecutionConfig) -> str:
+def _read_recorded_address() -> str:
     """Public metadata only — the recorded agent address, read through the
-    gate so a malformed record fails closed."""
-    return cfg.load_agent_address()
+    gate so a malformed record fails closed (R2: the recorded-address
+    location is code-controlled policy, not caller state)."""
+    return load_agent_address()
 
 
 def _offline_cfg(tmp):
@@ -187,7 +193,7 @@ def _offline_cfg(tmp):
     w(os.path.join(tmp, "keystore.json"), json.dumps(keystore).encode())
     w(os.path.join(tmp, "pass"), b"throwaway-passphrase".hex().encode())
     w(os.path.join(tmp, "address"), (acct.address + "\n").encode())
-    cfg = TestnetExecutionConfig(
+    cfg = IsolatedTestnetConfig(
         rpc_url="https://sepolia.example",
         keystore_path=os.path.join(tmp, "keystore.json"),
         passphrase_path=os.path.join(tmp, "pass"),
@@ -262,10 +268,11 @@ class TestWalletIdentityBindings(unittest.TestCase):
 
     def test_from_env_provides_no_wallet_override(self):
         """No environment variable can redirect the wallet: from_env only
-        reads the exec flag, RPC URL and expected chain id. The credential
-        paths are structural defaults pointing at the DSS secret store."""
+        reads the RPC URL and expected chain id (the exec flag is read
+        from the REAL environment at authorization time). R2: the custody
+        paths are not config fields at all — they are the designated DSS
+        secret-store locations in the code-controlled SECURITY_POLICY."""
         cfg = TestnetExecutionConfig.from_env(env={
-            "DSS_TESTNET_EXEC": "1",
             "DSS_TESTNET_RPC_URL": "https://sepolia.example",
             # Key names built via concatenation so this file's source does
             # not contain the override variable names verbatim (the source
@@ -275,22 +282,31 @@ class TestWalletIdentityBindings(unittest.TestCase):
             ("DSS_TESTNET_KEYSTORE" + "_PASSPHRASE"): "evil",
             "PRIVATE" + "_KEY": "evil",
         })
+        # R2: the config does not carry custody/relay fields AT ALL, so
+        # no environment variable can set them.
+        for gone in (
+            "keystore_path", "passphrase_path", "address_path",
+            "tx_log_path", "relay_url",
+        ):
+            self.assertNotIn(gone, TestnetExecutionConfig.__dataclass_fields__)
+        # The designated custody locations and reviewed relay live in the
+        # code-controlled security policy:
         self.assertEqual(
-            cfg.keystore_path,
+            _gate.SECURITY_POLICY.keystore_path,
             os.path.join("/home/z/my-project/.secrets",
                          "dss_testnet_wallet.keystore.json"),
         )
         self.assertEqual(
-            cfg.passphrase_path,
+            _gate.SECURITY_POLICY.passphrase_path,
             os.path.join("/home/z/my-project/.secrets",
                          "dss_testnet_wallet.pass"),
         )
         self.assertEqual(
-            cfg.address_path,
+            _gate.SECURITY_POLICY.address_path,
             os.path.join("/home/z/my-project/.secrets",
                          "dss_testnet_wallet.address"),
         )
-        self.assertEqual(cfg.relay_url, FLASHBOTS_SEPOLIA_RELAY)
+        self.assertEqual(_gate.SECURITY_POLICY.relay_url, FLASHBOTS_SEPOLIA_RELAY)
 
     def test_source_pins_no_independent_wallet_or_env_path(self):
         """This file must not contain any independent wallet-loading,
@@ -343,15 +359,9 @@ class TestPreparePathOffline(unittest.TestCase):
         """DSS-WO-ENG-005 §2: with the gate disabled, Flashbots
         preparation must refuse BEFORE the wallet is decrypted and before
         the relay transport is built."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._provisioned(tmp)
-            disabled = TestnetExecutionConfig(
-                rpc_url=cfg.rpc_url,
-                keystore_path=cfg.keystore_path,
-                passphrase_path=cfg.passphrase_path,
-                address_path=cfg.address_path,
-                tx_log_path=cfg.tx_log_path,
-            )
+            disabled = IsolatedTestnetConfig(rpc_url=cfg.rpc_url)
             relay = MagicMock()
             with patch(
                 "executor.testnet_gate.load_agent_wallet",
@@ -374,7 +384,7 @@ class TestPreparePathOffline(unittest.TestCase):
         target block, no capability object — and the relay is never
         contacted during prepare. The session is bound to the verified
         wallet identity through the capability (DSS-WO-ENG-005 §3)."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._provisioned(tmp)
             w3 = self._mock_w3()
             relay = MagicMock()
@@ -398,7 +408,7 @@ class TestPreparePathOffline(unittest.TestCase):
             relay.assert_not_called()  # no transport interaction in prepare
 
     def test_prepare_refuses_policy_violation_before_relay(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._provisioned(tmp)
             stranger = "0x" + "bb" * 20
             relay = MagicMock()
@@ -414,14 +424,10 @@ class TestPreparePathOffline(unittest.TestCase):
             relay.assert_not_called()
 
     def test_prepare_refuses_allowlisted_but_unexpected_chain(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._provisioned(tmp)
-            cfg = TestnetExecutionConfig(
+            cfg = IsolatedTestnetConfig(
                 rpc_url=cfg.rpc_url,
-                keystore_path=cfg.keystore_path,
-                passphrase_path=cfg.passphrase_path,
-                address_path=cfg.address_path,
-                tx_log_path=cfg.tx_log_path,
                 expected_chain_id=SEPOLIA_CHAIN_ID,
             )
             w3 = self._mock_w3()
@@ -443,7 +449,7 @@ class TestPreparePathOffline(unittest.TestCase):
             relay.assert_not_called()
 
     def test_prepare_refuses_over_cap_rpc_suggested_fee(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._provisioned(tmp)
             w3 = self._mock_w3()
             w3.eth.get_block.return_value = {"baseFeePerGas": 400 * 10**9}
@@ -528,7 +534,7 @@ class TestPayloadContainment(unittest.TestCase):
                 )
 
     def test_preparation_returns_only_the_session(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, acct, relay = self._prepare(tmp)
             self.assertIsInstance(session, FlashbotsBundleSession)
             with self.assertRaises(TypeError):
@@ -541,7 +547,7 @@ class TestPayloadContainment(unittest.TestCase):
         the capability, plus the returned simulation/submission objects,
         is scanned: no bytes object of broadcastable size (a signed
         transaction is ≥ ~100 bytes) and no long hex blob may appear."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, acct, relay = self._prepare(tmp)
             simulation = session.simulate()
             submission = session.submit()
@@ -568,7 +574,7 @@ class TestPayloadContainment(unittest.TestCase):
                             )
 
     def test_capability_has_no_payload_accessor(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, acct, relay = self._prepare(tmp)
             prepared = session._prepared
             public_names = [
@@ -597,7 +603,7 @@ class TestPayloadContainment(unittest.TestCase):
         public session methods: they accept no arguments at all."""
         import inspect
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, acct, relay = self._prepare(tmp)
             self.assertEqual(
                 list(inspect.signature(session.simulate).parameters), []
@@ -615,7 +621,7 @@ class TestPayloadContainment(unittest.TestCase):
                     call()
 
     def test_audit_log_stays_free_of_long_hex_and_credentials(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             session, cfg, acct, relay = self._prepare(tmp)
             session.simulate()
             session.submit()
@@ -655,7 +661,7 @@ class TestFlashbotsSepoliaSimulation(unittest.TestCase):
         from web3 import Web3, HTTPProvider
 
         cfg = TestnetExecutionConfig.from_env()
-        recorded = _read_recorded_address(cfg)
+        recorded = _read_recorded_address()
 
         # Read-only funding check (public RPC, no wallet).
         probe = Web3(HTTPProvider(os.environ["DSS_TESTNET_RPC_URL"]))
@@ -704,7 +710,7 @@ class TestFlashbotsSepoliaSubmission(unittest.TestCase):
             )
 
         cfg = TestnetExecutionConfig.from_env()
-        recorded = _read_recorded_address(cfg)
+        recorded = _read_recorded_address()
 
         from web3 import Web3, HTTPProvider
         probe = Web3(HTTPProvider(os.environ["DSS_TESTNET_RPC_URL"]))

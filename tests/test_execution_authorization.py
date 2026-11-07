@@ -79,6 +79,7 @@ from executor.testnet_gate import (
     TestnetSafetyError,
     _decode_signed_tx,
 )
+from tests.gate_r2_fixtures import IsolatedTestnetConfig, throwaway_store
 from executor.relay import RelayResult
 from executor.mev_execution import MEVExecutionService
 
@@ -140,7 +141,7 @@ def _testnet_config(tmpdir: str, *, account=None,
     `allowlist`. Authorization is decided from the REAL process environment
     (patched per-module by setUpModule) and the code-controlled maps."""
     acct = account or _tmp_secret_store(tmpdir)
-    return TestnetExecutionConfig(
+    return IsolatedTestnetConfig(
         rpc_url=rpc_url,
         keystore_path=os.path.join(tmpdir, "keystore.json"),
         passphrase_path=os.path.join(tmpdir, "pass"),
@@ -507,7 +508,7 @@ class TestBoundaryAuthorization(unittest.TestCase):
         self.assertIn("DSS_TESTNET_EXEC", str(ctx.exception))
 
     def test_authorized_boundary_returns_handle(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             self.assertTrue(boundary.execution_available())
             auth = boundary.authorize_execution("arb_execution", chain_id=SEPOLIA)
@@ -517,7 +518,7 @@ class TestBoundaryAuthorization(unittest.TestCase):
             self.assertEqual(auth.chain_id, SEPOLIA)
 
     def test_mainnet_chain_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             with self.assertRaises(AuthorizationRefused) as ctx:
                 boundary.authorize_execution("arb_execution", chain_id=MAINNET)
@@ -527,7 +528,7 @@ class TestBoundaryAuthorization(unittest.TestCase):
             self.assertEqual([r["outcome"] for r in records], ["refused"])
 
     def test_non_sepolia_chain_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             for chain in (HOLESKY, 8453, 42161, 9999999):
                 with self.assertRaises(AuthorizationRefused):
@@ -535,14 +536,11 @@ class TestBoundaryAuthorization(unittest.TestCase):
 
     def test_missing_credentials_fail_closed(self):
         # real-environment opt-in without any secret store: authorization
-        # still refuses (custody is re-verified at every authorization)
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = TestnetExecutionConfig(
-                rpc_url="https://sepolia.example",
-                keystore_path=os.path.join(tmp, "nope.json"),
-                passphrase_path=os.path.join(tmp, "nope.pass"),
-                address_path=os.path.join(tmp, "nope.address"),
-            )
+        # still refuses (custody is re-verified at every authorization).
+        # R2: the custody locations are the code-controlled policy paths —
+        # the test redirects them (controlled mock) to an EMPTY store.
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
+            cfg = IsolatedTestnetConfig(rpc_url="https://sepolia.example")
             boundary = ExecutionAuthorizationBoundary(
                 policy=TestnetExecutionPolicy(cfg)
             )
@@ -575,7 +573,7 @@ class TestSenderAddress(unittest.TestCase):
             boundary.sender_address_for_chain(SEPOLIA)
 
     def test_sender_returns_recorded_public_address_only(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             sender = boundary.sender_address_for_chain(SEPOLIA)
             self.assertEqual(sender.lower(), acct.address.lower())
@@ -583,7 +581,7 @@ class TestSenderAddress(unittest.TestCase):
             self.assertEqual(len(sender), 42)
 
     def test_sender_chain_mismatch_refused(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             with self.assertRaises(TestnetSafetyError):
                 boundary.sender_address_for_chain(MAINNET)
@@ -813,7 +811,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
         ordinary executor's arb transaction (recipient = arb_exec contract)
         is refused by the transaction policy at the boundary — arbitrary
         contract targets are not executable."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             executor = self._make_executor(boundary)
             gate_w3 = _GateW3()
@@ -841,7 +839,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
         one signature, one broadcast, one audited mined record."""
         arb_addr = to_checksum_address("0x" + "99" * 20)
         known = {SEPOLIA: {arb_addr.lower(): "offline test arb exec"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             executor = self._make_executor(boundary)
             gate_w3 = _GateW3()
@@ -878,7 +876,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
     def test_submit_batch_route_full_flow_through_boundary(self):
         arb_addr = to_checksum_address("0x" + "99" * 20)
         known = {SEPOLIA: {arb_addr.lower(): "offline test arb exec"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             executor = self._make_executor(boundary)
             gate_w3 = _GateW3()
@@ -906,7 +904,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
         submission; a change after signing refuses the broadcast."""
         arb_addr = to_checksum_address("0x" + "99" * 20)
         known = {SEPOLIA: {arb_addr.lower(): "offline test arb exec"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             executor = self._make_executor(boundary)
             # initial read + pre-sign read = SEPOLIA; pre-submit = MAINNET
@@ -930,7 +928,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
     def test_rpc_chain_check_failure_refuses(self):
         arb_addr = to_checksum_address("0x" + "99" * 20)
         known = {SEPOLIA: {arb_addr.lower(): "offline test arb exec"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             executor = self._make_executor(boundary)
             gate_w3 = _GateW3(
@@ -952,7 +950,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
     def test_rpc_reporting_mainnet_refuses(self):
         arb_addr = to_checksum_address("0x" + "99" * 20)
         known = {SEPOLIA: {arb_addr.lower(): "offline test arb exec"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             executor = self._make_executor(boundary)
             gate_w3 = _GateW3(chain_values=[MAINNET])
@@ -975,7 +973,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
         a keystore that does not match refuses before any signature."""
         arb_addr = to_checksum_address("0x" + "99" * 20)
         known = {SEPOLIA: {arb_addr.lower(): "offline test arb exec"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             # replace the recorded address with a DIFFERENT address
             other = Account.create().address
@@ -1000,7 +998,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
     def test_submission_failure_is_failed_not_successful(self):
         arb_addr = to_checksum_address("0x" + "99" * 20)
         known = {SEPOLIA: {arb_addr.lower(): "offline test arb exec"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             executor = self._make_executor(boundary)
             gate_w3 = _GateW3(fail_submit=ValueError("nonce too low"))
@@ -1021,7 +1019,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
     def test_uncertain_submission_outcome_is_accounted(self):
         arb_addr = to_checksum_address("0x" + "99" * 20)
         known = {SEPOLIA: {arb_addr.lower(): "offline test arb exec"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             executor = self._make_executor(boundary)
             gate_w3 = _GateW3(fail_submit=ConnectionError("provider dropped"))
@@ -1042,7 +1040,7 @@ class TestExecutorThroughBoundary(unittest.TestCase):
     def test_audit_never_contains_payload_or_credentials(self):
         arb_addr = to_checksum_address("0x" + "99" * 20)
         known = {SEPOLIA: {arb_addr.lower(): "offline test arb exec"}}
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             executor = self._make_executor(boundary)
             gate_w3 = _GateW3()
@@ -1108,7 +1106,7 @@ class TestTransactionRestrictionsViaBoundary(unittest.TestCase):
             return auth.sign_and_submit(tx)
 
     def test_deployment_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             auth, cfg, acct, gate_w3 = self._auth(tmp)
             with self.assertRaises(TestnetSafetyError) as ctx:
                 self._submit(auth, gate_w3, _self_transfer_tx(acct.address, to=None))
@@ -1116,7 +1114,7 @@ class TestTransactionRestrictionsViaBoundary(unittest.TestCase):
             self.assertEqual(gate_w3.raw_submissions, [])
 
     def test_unknown_recipient_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             auth, cfg, acct, gate_w3 = self._auth(tmp)
             stranger = to_checksum_address("0x" + "dd" * 20)
             with self.assertRaises(TestnetSafetyError) as ctx:
@@ -1126,7 +1124,7 @@ class TestTransactionRestrictionsViaBoundary(unittest.TestCase):
             self.assertEqual(gate_w3.raw_submissions, [])
 
     def test_unbounded_approval_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             auth, cfg, acct, gate_w3 = self._auth(tmp)
             # an approval to SELF (the only permitted recipient) with an
             # unlimited amount must still be rejected by the amount policy
@@ -1140,7 +1138,7 @@ class TestTransactionRestrictionsViaBoundary(unittest.TestCase):
             self.assertEqual(gate_w3.raw_submissions, [])
 
     def test_value_cap_enforced(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             auth, cfg, acct, gate_w3 = self._auth(tmp)
             with self.assertRaises(TestnetSafetyError) as ctx:
                 self._submit(auth, gate_w3, _self_transfer_tx(
@@ -1149,7 +1147,7 @@ class TestTransactionRestrictionsViaBoundary(unittest.TestCase):
             self.assertEqual(gate_w3.raw_submissions, [])
 
     def test_fee_price_cap_enforced(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             auth, cfg, acct, gate_w3 = self._auth(tmp)
             tx = _self_transfer_tx(acct.address)
             tx["maxFeePerGas"] = MAX_TESTNET_MAX_FEE_PER_GAS_WEI + 1
@@ -1158,7 +1156,7 @@ class TestTransactionRestrictionsViaBoundary(unittest.TestCase):
             self.assertEqual(gate_w3.raw_submissions, [])
 
     def test_gas_over_cap_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             auth, cfg, acct, gate_w3 = self._auth(tmp)
             tx = _self_transfer_tx(acct.address)
             tx["gas"] = 1_000_000  # > MAX_TESTNET_GAS_UNITS (500k)
@@ -1183,7 +1181,7 @@ class TestFlashbotsViaBoundary(unittest.TestCase):
             boundary._policy.authorize("test")
 
     def test_mixed_signer_bundle_refused_for_backrun_service(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             relay = _RelayW3()
             service = MEVExecutionService(
@@ -1227,7 +1225,7 @@ class TestFlashbotsViaBoundary(unittest.TestCase):
         return session, cfg
 
     def test_simulation_required_before_submission(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             acct = _tmp_secret_store(tmp)
             relay = _RelayW3()
             session, cfg = self._prepare_session(tmp, acct, relay)
@@ -1239,7 +1237,7 @@ class TestFlashbotsViaBoundary(unittest.TestCase):
             self.assertEqual(relay.send_calls, [])
 
     def test_exact_payload_bound_to_session(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             acct = _tmp_secret_store(tmp)
             relay = _RelayW3()
             session, cfg = self._prepare_session(tmp, acct, relay)
@@ -1260,7 +1258,7 @@ class TestFlashbotsViaBoundary(unittest.TestCase):
             self.assertEqual(decoded["chain_id"], SEPOLIA)
 
     def test_relay_exception_cannot_leak_payload(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             acct = _tmp_secret_store(tmp)
             payload_like = "0x" + "f8" * 120  # long hex blob
             relay = _RelayW3(sim_error=RuntimeError(
@@ -1335,7 +1333,7 @@ class TestR1EnvironmentAuthority(unittest.TestCase):
         present and custody-clean) — exactly what a caller trying to route
         around the central policy would construct."""
         acct = _tmp_secret_store(tmp)
-        cfg = TestnetExecutionConfig(
+        cfg = IsolatedTestnetConfig(
             rpc_url="https://sepolia.example",
             keystore_path=os.path.join(tmp, "keystore.json"),
             passphrase_path=os.path.join(tmp, "pass"),
@@ -1360,7 +1358,7 @@ class TestR1EnvironmentAuthority(unittest.TestCase):
         """R1 §3.1: a hand-built config (even fully provisioned) cannot
         authorize execution when the REAL process environment has not
         enabled DSS_TESTNET_EXEC."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._manual_config(tmp)
             boundary = ExecutionAuthorizationBoundary(
                 policy=TestnetExecutionPolicy(cfg)
@@ -1418,7 +1416,7 @@ class TestR1EnvironmentAuthority(unittest.TestCase):
         """Any policy object re-derives the decision from the authoritative
         sources inside the gate — an injected policy cannot flip execution
         on."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._manual_config(tmp)
             boundary = ExecutionAuthorizationBoundary(
                 policy=TestnetExecutionPolicy(cfg)
@@ -1433,7 +1431,7 @@ class TestR1EnvironmentAuthority(unittest.TestCase):
     def test_direct_gate_orchestration_calls_cannot_bypass_policy(self):
         """R1 §3.4: direct calls to the gate orchestrations with a hand-built
         configuration hit the SAME central authorization policy."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._manual_config(tmp)
             gate_w3 = _GateW3()
             relay = _RelayW3()
@@ -1495,7 +1493,7 @@ class TestR1EnvironmentAuthority(unittest.TestCase):
         """R1 §3.8: on ANY refusal the wallet is never decrypted and nothing
         is broadcast — proven with a real (throwaway) keystore configured
         and a broadcast-recording stub RPC."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, acct = self._manual_config(tmp)
             gate_w3 = _GateW3()
             with _opted_out(), patch(
@@ -1549,9 +1547,9 @@ class TestR1AllowlistIsolation(unittest.TestCase):
             (56, "BNB Chain"), (HOLESKY, "Holesky"), (137, "Polygon"),
         ):
             with self.subTest(chain=chain, name=name):
-                with tempfile.TemporaryDirectory() as tmp:
+                with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
                     acct = _tmp_secret_store(tmp)
-                    cfg = TestnetExecutionConfig(
+                    cfg = IsolatedTestnetConfig(
                         rpc_url="https://attacker.example",
                         keystore_path=os.path.join(tmp, "keystore.json"),
                         passphrase_path=os.path.join(tmp, "pass"),
@@ -1569,17 +1567,24 @@ class TestR1AllowlistIsolation(unittest.TestCase):
                         TestnetExecutionConfig(allowlist={chain: name})
 
     def test_frozen_config_cannot_gain_an_allowlist(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg, _ = self._manual_config_r1(tmp)
+        # The pin is on the PRODUCTION config class: it is frozen and has
+        # no allowlist field (R1), and no code reads one from a config.
+        cfg = TestnetExecutionConfig(rpc_url="https://sepolia.example")
+        with self.assertRaises((AttributeError, TypeError)):
+            cfg.allowlist = {8453: "Base"}
+        import dataclasses as _dc
+        with self.assertRaises(TypeError):
+            _dc.replace(cfg, allowlist={8453: "Base"})
+        # The test-only isolated config is equally closed: no instance
+        # state can be attached to it at all.
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
+            test_cfg, _ = self._manual_config_r1(tmp)
             with self.assertRaises((AttributeError, TypeError)):
-                cfg.allowlist = {8453: "Base"}
-            import dataclasses as _dc
-            with self.assertRaises(TypeError):
-                _dc.replace(cfg, allowlist={8453: "Base"})
+                test_cfg.allowlist = {8453: "Base"}
 
     def _manual_config_r1(self, tmp):
         acct = _tmp_secret_store(tmp)
-        return TestnetExecutionConfig(
+        return IsolatedTestnetConfig(
             rpc_url="https://sepolia.example",
             keystore_path=os.path.join(tmp, "keystore.json"),
             passphrase_path=os.path.join(tmp, "pass"),
@@ -1624,7 +1629,7 @@ class TestR1TargetInjection(unittest.TestCase):
         sanctioned direct-RPC handle is refused — twice over: the parameter
         no longer exists (TypeError), and the policy refuses the unapproved
         recipient against the EMPTY production map."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             auth = boundary.authorize_execution("arb_execution", chain_id=SEPOLIA)
             attacker_contract = to_checksum_address("0x" + "dd" * 20)
@@ -1650,7 +1655,7 @@ class TestR1TargetInjection(unittest.TestCase):
 
     def test_runtime_caller_cannot_authorize_arbitrary_bundle_target(self):
         """The Flashbots preparation handle refuses the override too."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             auth = boundary.authorize_execution("bundle-test", chain_id=SEPOLIA)
             attacker_contract = to_checksum_address("0x" + "df" * 20)
@@ -1675,7 +1680,7 @@ class TestR1TargetInjection(unittest.TestCase):
         """R1 §3.6: MEVExecutionService.submit cannot authorize an unapproved
         target through an override — the parameter does not exist, and the
         gate still validates against the empty production map."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             boundary, cfg, acct = _authorized_boundary(tmp)
             service = MEVExecutionService(
                 _ExecutorW3(chain_id=SEPOLIA), simulator=None,

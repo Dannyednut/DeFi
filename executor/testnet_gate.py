@@ -51,6 +51,41 @@ DSS-WO-ENG-015 R1 — authorization inputs are ISOLATED from callers:
     patching module maps in tests). Test injection is never an
     operational authorization mechanism: no production-facing interface
     accepts an opt-in flag, an allowlist or a target map.
+
+DSS-WO-ENG-015 R2 — SECURITY POLICY IS NOT CALLER-CONFIGURABLE:
+
+  * The security policy is the code-controlled module singleton
+    ``SECURITY_POLICY`` (``TestnetSecurityPolicy``, an instance with NO
+    state): allowed chain IDs, the explicit opt-in requirement, the
+    transaction value and gas limits, the per-transaction and aggregate
+    fee ceilings, the approved contract targets, the wallet custody
+    locations, the audit destination and the reviewed relay destination.
+    Every enforcement point reads it — through the reviewed module
+    constants — directly, never through a caller-supplied object.
+  * ``TestnetExecutionConfig`` is OPERATIONAL-ONLY: it selects the RPC
+    endpoint and the expected (allowlisted) chain and nothing else. It
+    carries no limits, no custody paths, no audit path and no relay URL,
+    so a manually constructed configuration can never weaken a security
+    control. The production path accepts no caller-supplied policy
+    configuration at all.
+  * The hard expenditure caps (MAX_TESTNET_TX_VALUE_WEI,
+    MAX_TESTNET_GAS_UNITS, MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
+    MAX_TESTNET_MAX_PRIORITY_FEE_WEI, MAX_TESTNET_TX_FEE_WEI) are
+    immutable reviewed code constants: no configuration object, no
+    environment variable and no function argument can raise them, and
+    the policy-validation primitives accept no override parameters.
+    BOTH orchestrations — direct RPC and Flashbots — enforce the SAME
+    constants, including the aggregate bundle fee ceiling.
+  * Wallet custody always uses the designated DSS secret-store
+    locations, execution audit records always go to the designated
+    audit destination, and Flashbots sessions always use the reviewed
+    Sepolia relay. A caller can substitute none of them. Offline tests
+    redirect these constants with ``unittest.mock.patch.object`` as a
+    controlled mock — a test technique, never an operational interface.
+  * An audit-write failure never rewrites a verdict: the original
+    refusal is still raised (fail closed) and the audit failure is
+    logged; refusals, failures, uncertain outcomes and successes all
+    remain accounted for at the designated destination.
   * The RPC-reported chain ID is verified immediately before signing AND
     again immediately before submission (both transports).
   * Missing wallet credentials, RPC configuration or required config is
@@ -165,6 +200,10 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
+from log import get_logger
+
+log = get_logger("executor.testnet_gate")
+
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from eth_account.signers.local import LocalAccount
 
@@ -230,6 +269,8 @@ KNOWN_TARGETS: dict[int, dict[str, str]] = {}
 
 # Where the per-transaction audit log is written (logs/*.jsonl is
 # gitignored — the log stays in the agent runtime, never in Git).
+# DSS-WO-ENG-015 R2: this is the designated audit destination; no caller
+# can redirect it through a configuration object or an API parameter.
 DEFAULT_TX_LOG_PATH = os.path.join("logs", "testnet_tx_log.jsonl")
 
 AGENT_SECRET_STORE = "/home/z/my-project/.secrets"
@@ -247,6 +288,125 @@ SECRET_MODE_MASK = 0o077
 # 2025-12-16). Changing the relay is a reviewed code change, never an
 # environment setting.
 FLASHBOTS_SEPOLIA_RELAY = "https://relay-sepolia.flashbots.net"
+
+
+# ── The code-controlled security policy (DSS-WO-ENG-015 R2) ───────────
+
+class TestnetSecurityPolicy:
+    """The CODE-CONTROLLED testnet security policy (DSS-WO-ENG-015 R2).
+
+    Every security-relevant decision of this boundary lives here — in the
+    reviewed module constants the properties read — and NEVER in
+    caller-supplied state:
+
+      * allowed chain IDs            → ALLOWED_TESTNET_CHAINS
+      * execution opt-in requirement → the REAL process environment via
+                                       gate_opted_in() (DSS_TESTNET_EXEC=1)
+      * transaction value/gas caps   → MAX_TESTNET_TX_VALUE_WEI,
+                                       MAX_TESTNET_GAS_UNITS
+      * per-transaction and aggregate fee ceilings →
+                                       MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
+                                       MAX_TESTNET_MAX_PRIORITY_FEE_WEI,
+                                       MAX_TESTNET_TX_FEE_WEI
+      * approved contract targets    → KNOWN_TARGETS (deliberately empty)
+      * wallet custody locations     → DEFAULT_KEYSTORE_PATH,
+                                       DEFAULT_PASSPHRASE_PATH,
+                                       DEFAULT_ADDRESS_PATH
+      * audit destination            → DEFAULT_TX_LOG_PATH
+      * reviewed relay destination   → FLASHBOTS_SEPOLIA_RELAY
+
+    Instances hold NO state (``__slots__ = ()``): every property reads the
+    reviewed module constant at ACCESS time, so a per-instance override is
+    impossible and the controlled-mock test technique (patching the module
+    constants) keeps working. There is deliberately no constructor
+    argument, no ``from_env`` and no API anywhere that accepts a policy
+    object from a caller: raising a cap, moving the custody location,
+    redirecting the audit log or the relay is a reviewed CODE change only.
+
+    HONEST BOUNDARY: as everywhere in this module, arbitrary hostile code
+    running in the same interpreter can still monkeypatch module globals;
+    no in-process isolation is claimed (see the module docstring).
+    """
+
+    __slots__ = ()
+
+    # Not a pytest test class despite the Test prefix.
+    __test__ = False
+
+    # ── allowed chains / opt-in requirement ──────────────────────────
+
+    @property
+    def allowed_chains(self) -> dict:
+        """The code-controlled testnet allowlist (Sepolia only)."""
+        return effective_allowlist()
+
+    @property
+    def requires_explicit_opt_in(self) -> bool:
+        """The gate authorizes only with DSS_TESTNET_EXEC=1 in the REAL
+        process environment; the authoritative read is ``gate_opted_in()``
+        at every authorization — never a configuration field."""
+        return True
+
+    # ── hard expenditure caps (immutable reviewed constants) ─────────
+
+    @property
+    def max_value_wei(self) -> int:
+        return MAX_TESTNET_TX_VALUE_WEI
+
+    @property
+    def max_gas_units(self) -> int:
+        return MAX_TESTNET_GAS_UNITS
+
+    @property
+    def max_fee_per_gas_wei(self) -> int:
+        return MAX_TESTNET_MAX_FEE_PER_GAS_WEI
+
+    @property
+    def max_priority_fee_wei(self) -> int:
+        return MAX_TESTNET_MAX_PRIORITY_FEE_WEI
+
+    @property
+    def max_total_fee_wei(self) -> int:
+        return MAX_TESTNET_TX_FEE_WEI
+
+    # ── approved contract targets ───────────────────────────────────
+
+    @property
+    def known_targets(self) -> dict:
+        return KNOWN_TARGETS
+
+    # ── wallet custody locations (the designated DSS secret store) ──
+
+    @property
+    def keystore_path(self) -> str:
+        return DEFAULT_KEYSTORE_PATH
+
+    @property
+    def passphrase_path(self) -> str:
+        return DEFAULT_PASSPHRASE_PATH
+
+    @property
+    def address_path(self) -> str:
+        return DEFAULT_ADDRESS_PATH
+
+    # ── audit destination ───────────────────────────────────────────
+
+    @property
+    def tx_log_path(self) -> str:
+        return DEFAULT_TX_LOG_PATH
+
+    # ── reviewed relay destination ──────────────────────────────────
+
+    @property
+    def relay_url(self) -> str:
+        return FLASHBOTS_SEPOLIA_RELAY
+
+
+# The ONE security-policy instance every enforcement point reads. Because
+# the class has ``__slots__ = ()`` the instance carries no state and no
+# attribute can be assigned on it; replacing this module global is a
+# monkeypatch (test mock / hostile same-process territory), not an API.
+SECURITY_POLICY = TestnetSecurityPolicy()
 
 
 class TestnetSafetyError(RuntimeError):
@@ -282,35 +442,33 @@ def effective_allowlist() -> dict[int, str]:
 
 @dataclass(frozen=True)
 class TestnetExecutionConfig:
-    """Operational settings for ONE testnet execution session.
+    """OPERATIONAL settings for ONE testnet execution session.
 
     DSS-WO-ENG-015 R1: this object carries NO authorization state. There
     is no ``enabled`` flag (the explicit opt-in is read from the REAL
     process environment by ``gate_opted_in()`` at every authorization)
     and no ``allowlist`` (the production allowlist is the code-controlled
     ``ALLOWED_TESTNET_CHAINS`` map, read directly by every check). A
-    manually constructed config can therefore never authorize execution,
-    expand the allowlist or weaken policy — it selects only operational
-    endpoints (RPC URL, secret-store file locations, audit-log path,
-    relay URL) and is still fully subject to every gate check.
+    manually constructed config can therefore never authorize execution
+    or expand the allowlist.
 
-    All credential paths point into the DSS secret store; the raw key is
+    DSS-WO-ENG-015 R2: this object is OPERATIONAL-ONLY. It selects the
+    RPC endpoint and the expected (allowlisted) chain — genuinely
+    operational information — and NOTHING else. The security policy is
+    not configurable through it (or through anything else a caller
+    controls): the hard expenditure caps, the wallet custody locations,
+    the audit destination, the reviewed relay destination and the
+    approved targets all live in the code-controlled ``SECURITY_POLICY``
+    and are enforced from there at every checkpoint. No environment
+    variable and no constructor argument can change any of them.
+
+    All credential material stays in the DSS secret store; the raw key is
     only ever decrypted in memory by load_agent_wallet. The relay URL is
     NOT environment configurable — changing it is a reviewed code change.
     """
 
     rpc_url: Optional[str] = None
-    keystore_path: str = DEFAULT_KEYSTORE_PATH
-    passphrase_path: str = DEFAULT_PASSPHRASE_PATH
-    address_path: str = DEFAULT_ADDRESS_PATH
     expected_chain_id: int = 11155111
-    max_value_wei: int = MAX_TESTNET_TX_VALUE_WEI
-    max_gas_units: int = MAX_TESTNET_GAS_UNITS
-    max_fee_per_gas_wei: int = MAX_TESTNET_MAX_FEE_PER_GAS_WEI
-    max_priority_fee_wei: int = MAX_TESTNET_MAX_PRIORITY_FEE_WEI
-    max_total_fee_wei: int = MAX_TESTNET_TX_FEE_WEI
-    tx_log_path: str = DEFAULT_TX_LOG_PATH
-    relay_url: str = FLASHBOTS_SEPOLIA_RELAY
 
     # Not a pytest test class despite the Test prefix.
     __test__ = False
@@ -323,8 +481,9 @@ class TestnetExecutionConfig:
         construct deterministic configurations; it can never affect the
         authorization decision: the explicit opt-in is read from the REAL
         process environment by ``gate_opted_in()`` (never from ``env``),
-        and the allowlist is code-controlled. Production callers use
-        ``from_env()`` with no argument (the real ``os.environ``).
+        and the allowlist and the security policy are code-controlled
+        (DSS-WO-ENG-015 R1/R2). Production callers use ``from_env()``
+        with no argument (the real ``os.environ``).
         """
         e = env if env is not None else os.environ
         return cls(
@@ -345,7 +504,7 @@ class TestnetExecutionConfig:
             raise TestnetSafetyError(
                 f"chain {self.expected_chain_id} is not on the testnet allowlist"
             )
-        verify_secret_store(self)
+        verify_secret_store()
 
     def require_ready(self) -> None:
         """Fail closed unless the REAL process environment carries the
@@ -365,13 +524,21 @@ class TestnetExecutionConfig:
             )
         self.require_provisioned()
 
-    def load_agent_address(self) -> str:
-        """Read the (non-secret) recorded agent address and sanity-check it."""
-        with open(self.address_path) as f:
-            addr = f.read().strip()
-        if not addr.startswith("0x") or len(addr) != 42:
-            raise TestnetSafetyError("recorded agent address is malformed")
-        return addr
+
+def load_agent_address() -> str:
+    """Read the (non-secret) recorded agent address from the designated
+    custody location and sanity-check it.
+
+    DSS-WO-ENG-015 R2: the recorded-address path is code-controlled
+    policy (``SECURITY_POLICY.address_path``), never caller state — a
+    manually constructed configuration cannot substitute a different
+    recorded identity.
+    """
+    with open(SECURITY_POLICY.address_path) as f:
+        addr = f.read().strip()
+    if not addr.startswith("0x") or len(addr) != 42:
+        raise TestnetSafetyError("recorded agent address is malformed")
+    return addr
 
 
 # ── Chain identity gate ──────────────────────────────────────────────────────
@@ -439,27 +606,33 @@ def _check_secret_dir(path: str, label: str) -> None:
         )
 
 
-def verify_secret_store(config: TestnetExecutionConfig) -> None:
+def verify_secret_store() -> None:
     """Verify presence, type and permissions of every secret-store file
     before any live operation (DSS-WO-ENG-004 §2 req 7, §7).
+
+    DSS-WO-ENG-015 R2: the verified locations are the designated DSS
+    custody paths from the code-controlled ``SECURITY_POLICY`` — there is
+    no parameter through which a caller could point the checks (or the
+    subsequent wallet decryption) at a substitute keystore, passphrase or
+    recorded address.
 
     Fail closed on: missing files, non-regular files, symlinks, group/world
     access on keystore/passphrase, group/world access on their directory,
     or a malformed recorded address. Never reads secret contents.
     """
     for label, path in (
-        ("keystore", config.keystore_path),
-        ("passphrase", config.passphrase_path),
+        ("keystore", SECURITY_POLICY.keystore_path),
+        ("passphrase", SECURITY_POLICY.passphrase_path),
     ):
         _check_restricted_file(path, label)
         _check_secret_dir(os.path.dirname(path) or ".", label)
-    addr = config.address_path
+    addr = SECURITY_POLICY.address_path
     if os.path.islink(addr) or not os.path.isfile(addr):
         raise TestnetSafetyError(
             f"agent recorded-address file missing, a symlink or not a regular "
             f"file: {addr}"
         )
-    config.load_agent_address()
+    load_agent_address()
 
 
 def decode_passphrase_file(path: str) -> bytes:
@@ -481,8 +654,13 @@ def decode_passphrase_file(path: str) -> bytes:
         ) from exc
 
 
-def load_agent_wallet(config: TestnetExecutionConfig) -> "LocalAccount":
+def load_agent_wallet() -> "LocalAccount":
     """THE single wallet-loading path for every testnet signing operation.
+
+    DSS-WO-ENG-015 R2: the keystore, passphrase and recorded-address
+    locations are ALWAYS the designated DSS secret-store paths from the
+    code-controlled ``SECURITY_POLICY`` — a caller cannot substitute a
+    different wallet by handing in a configuration.
 
     Sequence (fail closed):
       1. verify_secret_store (presence, types, symlinks, permissions);
@@ -499,9 +677,9 @@ def load_agent_wallet(config: TestnetExecutionConfig) -> "LocalAccount":
     """
     from eth_account import Account
 
-    verify_secret_store(config)
+    verify_secret_store()
 
-    with open(config.keystore_path) as f:
+    with open(SECURITY_POLICY.keystore_path) as f:
         keystore = json.load(f)
     if (
         not isinstance(keystore, dict)
@@ -512,14 +690,14 @@ def load_agent_wallet(config: TestnetExecutionConfig) -> "LocalAccount":
             "agent keystore is not a web3 secret-storage v3 JSON keystore"
         )
 
-    passphrase = decode_passphrase_file(config.passphrase_path)
+    passphrase = decode_passphrase_file(SECURITY_POLICY.passphrase_path)
     key_bytes = Account.decrypt(keystore, passphrase)
     try:
         account = Account.from_key(key_bytes)
     finally:
         del key_bytes, passphrase
 
-    recorded = config.load_agent_address()
+    recorded = load_agent_address()
     if account.address.lower() != recorded.lower():
         raise TestnetSafetyError(
             "agent wallet identity mismatch: keystore does not match the "
@@ -543,13 +721,7 @@ def _uint_field(value: object, name: str) -> int:
     return value
 
 
-def validate_fee_exposure(
-    tx: dict,
-    *,
-    max_fee_per_gas_wei: int = MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
-    max_priority_fee_wei: int = MAX_TESTNET_MAX_PRIORITY_FEE_WEI,
-    max_total_fee_wei: int = MAX_TESTNET_TX_FEE_WEI,
-) -> int:
+def validate_fee_exposure(tx: dict) -> int:
     """Fail closed on the monetary fee exposure of one transaction.
 
     A gas-unit cap is not a monetary cap. This validates the ACTUAL fee
@@ -563,8 +735,15 @@ def validate_fee_exposure(
       * Neither present, both present, negative/malformed/over-cap values:
         rejected.
 
-    Returns the worst-case expenditure in wei.
+    DSS-WO-ENG-015 R2: the fee ceilings are ALWAYS the immutable
+    code-controlled policy constants (read from ``SECURITY_POLICY``) —
+    this primitive accepts no override parameter, so no caller (and no
+    configuration object) can weaken them. Returns the worst-case
+    expenditure in wei.
     """
+    max_fee_per_gas_wei = SECURITY_POLICY.max_fee_per_gas_wei
+    max_priority_fee_wei = SECURITY_POLICY.max_priority_fee_wei
+    max_total_fee_wei = SECURITY_POLICY.max_total_fee_wei
     gas = _uint_field(tx.get("gas"), "gas")
     if gas <= 0:
         raise TestnetSafetyError(
@@ -621,35 +800,28 @@ def validate_fee_exposure(
     return expenditure
 
 
-def validate_bundle_fee_exposure(
-    txs: Sequence[dict],
-    *,
-    max_fee_per_gas_wei: int = MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
-    max_priority_fee_wei: int = MAX_TESTNET_MAX_PRIORITY_FEE_WEI,
-    max_total_fee_wei: int = MAX_TESTNET_TX_FEE_WEI,
-) -> int:
+def validate_bundle_fee_exposure(txs: Sequence[dict]) -> int:
     """Aggregate BUNDLE-level fee-exposure check (DSS-WO-ENG-005 §5).
 
     Per-transaction caps alone are not enough: a bundle of two
     transactions, each individually within its own cap, can still carry
     a combined worst-case expenditure above the approved budget. The sum
     of every transaction's worst-case expenditure (gasLimit × fee price)
-    must stay within max_total_fee_wei. Values are never clipped and
+    must stay within MAX_TESTNET_TX_FEE_WEI. Values are never clipped and
     every transaction's fee inputs are re-validated strictly (missing,
     negative, malformed, contradictory or over-cap inputs are rejected).
     One rejected transaction rejects the whole bundle.
 
-    Returns the aggregate worst-case expenditure in wei.
+    DSS-WO-ENG-015 R2: the ceilings are ALWAYS the immutable code-
+    controlled policy constants (read from ``SECURITY_POLICY``) — no
+    override parameter exists. Returns the aggregate worst-case
+    expenditure in wei.
     """
+    max_total_fee_wei = SECURITY_POLICY.max_total_fee_wei
     total = 0
     for i, tx in enumerate(txs):
         try:
-            total += validate_fee_exposure(
-                tx,
-                max_fee_per_gas_wei=max_fee_per_gas_wei,
-                max_priority_fee_wei=max_priority_fee_wei,
-                max_total_fee_wei=max_total_fee_wei,
-            )
+            total += validate_fee_exposure(tx)
         except TestnetSafetyError as exc:
             raise TestnetSafetyError(f"bundle tx[{i}] rejected: {exc}") from exc
     if total > max_total_fee_wei:
@@ -669,11 +841,6 @@ def validate_transaction(
     *,
     sender: str,
     chain_id: int,
-    max_value_wei: int = MAX_TESTNET_TX_VALUE_WEI,
-    max_gas_units: int = MAX_TESTNET_GAS_UNITS,
-    max_fee_per_gas_wei: int = MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
-    max_priority_fee_wei: int = MAX_TESTNET_MAX_PRIORITY_FEE_WEI,
-    max_total_fee_wei: int = MAX_TESTNET_TX_FEE_WEI,
 ) -> dict:
     """Enforce the transaction policy. Returns the tx unchanged if safe.
 
@@ -700,7 +867,14 @@ def validate_transaction(
     contract target can only be approved by an explicit, separately
     reviewed code change. Offline tests patch the module map as a
     controlled mock.
+
+    DSS-WO-ENG-015 R2: the value/gas/fee caps are ALWAYS the immutable
+    code-controlled policy constants (read from ``SECURITY_POLICY``).
+    This primitive accepts no limit-override parameter, so neither a
+    caller nor a manually constructed configuration can weaken any cap.
     """
+    max_value_wei = SECURITY_POLICY.max_value_wei
+    max_gas_units = SECURITY_POLICY.max_gas_units
     targets = KNOWN_TARGETS
 
     # DSS-WO-ENG-007 Finding B (Option A — fail closed): access lists are
@@ -759,12 +933,7 @@ def validate_transaction(
             f"(1, {max_gas_units}]"
         )
 
-    validate_fee_exposure(
-        tx,
-        max_fee_per_gas_wei=max_fee_per_gas_wei,
-        max_priority_fee_wei=max_priority_fee_wei,
-        max_total_fee_wei=max_total_fee_wei,
-    )
+    validate_fee_exposure(tx)
 
     data = tx.get("data") or b""
     if isinstance(data, str):
@@ -791,21 +960,17 @@ def validate_bundle(
     *,
     sender: str,
     chain_id: int,
-    max_value_wei: int = MAX_TESTNET_TX_VALUE_WEI,
-    max_gas_units: int = MAX_TESTNET_GAS_UNITS,
-    max_fee_per_gas_wei: int = MAX_TESTNET_MAX_FEE_PER_GAS_WEI,
-    max_priority_fee_wei: int = MAX_TESTNET_MAX_PRIORITY_FEE_WEI,
-    max_total_fee_wei: int = MAX_TESTNET_TX_FEE_WEI,
 ) -> list[dict]:
     """Apply the same transaction policy to every transaction of a
     Flashbots bundle. One rejected transaction rejects the whole bundle.
 
     The AGGREGATE fee exposure across all bundle transactions is
-    additionally capped at max_total_fee_wei (DSS-WO-ENG-005 §5) — an
-    over-limit bundle is rejected as a whole, before any wallet is
+    additionally capped at MAX_TESTNET_TX_FEE_WEI (DSS-WO-ENG-005 §5) —
+    an over-limit bundle is rejected as a whole, before any wallet is
     decrypted or anything signed. Like validate_transaction, this
     ALWAYS uses the code-controlled ``KNOWN_TARGETS`` map
-    (DSS-WO-ENG-015 R1).
+    (DSS-WO-ENG-015 R1) and the immutable code-controlled limits
+    (DSS-WO-ENG-015 R2) — no override parameter exists.
     """
     validated: list[dict] = []
     for i, tx in enumerate(unsigned_txs):
@@ -815,21 +980,11 @@ def validate_bundle(
                     dict(tx),
                     sender=sender,
                     chain_id=chain_id,
-                    max_value_wei=max_value_wei,
-                    max_gas_units=max_gas_units,
-                    max_fee_per_gas_wei=max_fee_per_gas_wei,
-                    max_priority_fee_wei=max_priority_fee_wei,
-                    max_total_fee_wei=max_total_fee_wei,
                 )
             )
         except TestnetSafetyError as exc:
             raise TestnetSafetyError(f"bundle tx[{i}] rejected: {exc}") from exc
-    validate_bundle_fee_exposure(
-        validated,
-        max_fee_per_gas_wei=max_fee_per_gas_wei,
-        max_priority_fee_wei=max_priority_fee_wei,
-        max_total_fee_wei=max_total_fee_wei,
-    )
+    validate_bundle_fee_exposure(validated)
     return validated
 
 
@@ -1079,7 +1234,10 @@ def _registered_secrets(config: object) -> tuple:
 
     for url in (
         getattr(config, "rpc_url", None),
-        getattr(config, "relay_url", None),
+        # DSS-WO-ENG-015 R2: the relay destination is code-controlled
+        # policy (never a configuration field), and its credential-bearing
+        # material is registered exactly the same way.
+        SECURITY_POLICY.relay_url,
     ):
         if not isinstance(url, str) or not url:
             continue
@@ -2073,10 +2231,11 @@ class FlashbotsBundleSession:
         """Fee-exposure recheck (DSS-WO-ENG-006 §5): before EVERY relay
         interaction, re-derive the per-transaction and AGGREGATE
         worst-case fee exposure from the frozen signed intents and hold
-        them against the configured caps AND the recorded total. Fail
-        closed — never clip, never re-price."""
+        them against the code-controlled caps AND the recorded total. Fail
+        closed — never clip, never re-price. DSS-WO-ENG-015 R2: the caps
+        are read from ``SECURITY_POLICY`` (immutable constants), never
+        from a configuration object."""
         st = self._prepared._state
-        cfg = self._config
         total = 0
         for i, intent in enumerate(st.intents):
             price = (
@@ -2088,7 +2247,7 @@ class FlashbotsBundleSession:
                 raise TestnetSafetyError(
                     f"prepared bundle tx[{i}] carries no fee price — refusing"
                 )
-            if price > cfg.max_fee_per_gas_wei:
+            if price > SECURITY_POLICY.max_fee_per_gas_wei:
                 raise TestnetSafetyError(
                     f"prepared bundle tx[{i}] fee price exceeds the testnet "
                     "cap — refusing before relay interaction"
@@ -2096,18 +2255,19 @@ class FlashbotsBundleSession:
             if (
                 intent.fee_kind == "eip1559"
                 and intent.max_priority_fee_per_gas is not None
-                and intent.max_priority_fee_per_gas > cfg.max_priority_fee_wei
+                and intent.max_priority_fee_per_gas
+                > SECURITY_POLICY.max_priority_fee_wei
             ):
                 raise TestnetSafetyError(
                     f"prepared bundle tx[{i}] priority fee exceeds the "
                     "testnet cap — refusing before relay interaction"
                 )
             total += intent.gas * price
-        if total > cfg.max_total_fee_wei:
+        if total > SECURITY_POLICY.max_total_fee_wei:
             raise TestnetSafetyError(
                 f"aggregate bundle fee exposure {total} wei exceeds the "
-                f"testnet cap {cfg.max_total_fee_wei} wei — refusing before "
-                "relay interaction"
+                f"testnet cap {SECURITY_POLICY.max_total_fee_wei} wei — "
+                "refusing before relay interaction"
             )
         if total != st.total_fee_exposure_wei:
             raise TestnetSafetyError(
@@ -2152,11 +2312,13 @@ class FlashbotsBundleSession:
         be sanitized by the caller. The bundle hash is relay-supplied, so
         it is also held against the long-hex rule (DSS-WO-ENG-007 Finding
         A): a hostile relay cannot use a hash field to smuggle the signed
-        payload into the audit log. Legitimate 32-byte hashes pass."""
+        payload into the audit log. Legitimate 32-byte hashes pass.
+        The destination is ALWAYS the designated audit log from the
+        code-controlled policy (DSS-WO-ENG-015 R2)."""
         if isinstance(tx_hash, str) and _LONG_HEX_RE.search(tx_hash):
             tx_hash = "0x<redacted-hex>"
         return record_testnet_tx(
-            self._config.tx_log_path,
+            SECURITY_POLICY.tx_log_path,
             purpose=self._prepared.purpose,
             chain_id=self._prepared.chain_id,
             target=self._prepared.sender,
@@ -2558,6 +2720,11 @@ def _audit_orchestration_refusal(
     exception object unchanged, so the caller raises the exact same refusal
     (same type, same message) — auditing never rewrites a policy verdict.
 
+    The record ALWAYS goes to the designated audit destination from the
+    code-controlled policy (DSS-WO-ENG-015 R2); an audit-write failure
+    never masks or rewrites the refusal — the original exception is still
+    returned and raised, and the write failure is logged.
+
     Audits only when the gate is ENABLED (per the authoritative real
     process environment read, DSS-WO-ENG-015 R1): an attempt under a
     disabled gate has no execution context (nothing can decrypt a wallet,
@@ -2568,7 +2735,7 @@ def _audit_orchestration_refusal(
         return exc
     try:
         record_testnet_tx(
-            cfg.tx_log_path,
+            SECURITY_POLICY.tx_log_path,
             purpose=purpose,
             chain_id=chain_id,
             target=target,
@@ -2580,9 +2747,16 @@ def _audit_orchestration_refusal(
             error=_sanitize_error(str(exc), *_registered_secrets(cfg)),
             max_fee_exposure_wei=None,
         )
-    except Exception:
-        # Auditing must never mask, replace or rewrite the refusal.
-        pass
+    except Exception as audit_exc:
+        # Auditing must never mask, replace or rewrite the refusal — and
+        # it must never silently swallow the accounting failure either:
+        # the refusal is still returned (and raised by the caller) while
+        # the lost audit record is logged.
+        log.error(
+            "failed to write refusal audit record for %s: %s",
+            purpose,
+            type(audit_exc).__name__,
+        )
     return exc
 
 
@@ -2631,6 +2805,12 @@ def sign_and_submit_testnet_tx(
     with a manually constructed configuration cannot bypass the central
     authorization policy. There is no ``known_targets`` override: the
     reviewed-target map is always the code-controlled ``KNOWN_TARGETS``.
+
+    DSS-WO-ENG-015 R2: the ``config`` argument is OPERATIONAL-ONLY (RPC
+    endpoint and expected chain). The hard expenditure caps, the wallet
+    custody locations, the audit destination and every other security
+    control are enforced from the code-controlled ``SECURITY_POLICY`` —
+    no caller-supplied object can weaken any of them.
     """
     cfg = config or TestnetExecutionConfig.from_env()
     try:
@@ -2692,7 +2872,7 @@ def sign_and_submit_testnet_tx(
     chain_id = reported
     tx = dict(tx)
     tx["chainId"] = chain_id
-    sender = cfg.load_agent_address()
+    sender = load_agent_address()
     # 3a. RPC-backed transaction-default fill (nonce, gas, fee and block
     # queries — DSS-WO-ENG-009 Finding A). Policy validation below stays
     # OUTSIDE the containment: it is a gate decision, never a transport
@@ -2708,17 +2888,8 @@ def sign_and_submit_testnet_tx(
     try:
         validate_transaction(
             tx, sender=sender, chain_id=chain_id,
-            max_value_wei=cfg.max_value_wei, max_gas_units=cfg.max_gas_units,
-            max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
-            max_priority_fee_wei=cfg.max_priority_fee_wei,
-            max_total_fee_wei=cfg.max_total_fee_wei,
-        )  # 3b — targets are ALWAYS the code-controlled KNOWN_TARGETS (R1)
-        fee_exposure = validate_fee_exposure(
-            tx,
-            max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
-            max_priority_fee_wei=cfg.max_priority_fee_wei,
-            max_total_fee_wei=cfg.max_total_fee_wei,
-        )
+        )  # 3b — code-controlled targets (R1), code-controlled caps (R2)
+        fee_exposure = validate_fee_exposure(tx)
     except TestnetSafetyError as exc:
         raise _audit_orchestration_refusal(
             cfg, purpose, exc,
@@ -2733,7 +2904,7 @@ def sign_and_submit_testnet_tx(
     # (TestnetSafetyError) keep their exact type and message.
     custody_failure: Optional[TestnetSafetyError] = None
     try:
-        account = load_agent_wallet(cfg)
+        account = load_agent_wallet()
     except Exception as exc:
         custody_failure = _clean_raise_candidate(
             exc, "agent wallet custody failed", stage="wallet decryption",
@@ -2823,7 +2994,7 @@ def sign_and_submit_testnet_tx(
             *forbidden_material, stage="direct-RPC submission",
         )
         record_testnet_tx(
-            cfg.tx_log_path,
+            SECURITY_POLICY.tx_log_path,
             purpose=purpose,
             chain_id=chain_id,
             target=str(tx.get("to", "")).lower(),
@@ -2860,7 +3031,7 @@ def sign_and_submit_testnet_tx(
         error = _sanitize_error(receipt_failure, *forbidden_material)
 
     record = record_testnet_tx(
-        cfg.tx_log_path,
+        SECURITY_POLICY.tx_log_path,
         purpose=purpose,
         chain_id=chain_id,
         target=str(tx.get("to", "")).lower(),
@@ -2935,6 +3106,14 @@ def prepare_flashbots_bundle(
     with a manually constructed configuration cannot bypass the central
     authorization policy. There is no ``known_targets`` override: the
     reviewed-target map is always the code-controlled ``KNOWN_TARGETS``.
+
+    DSS-WO-ENG-015 R2: the ``config`` argument is OPERATIONAL-ONLY (RPC
+    endpoint and expected chain). The hard expenditure caps (including
+    the aggregate bundle fee ceiling), the wallet custody locations, the
+    audit destination and the reviewed relay destination are enforced
+    from the code-controlled ``SECURITY_POLICY`` — no caller-supplied
+    object can weaken any of them or redirect the session to another
+    relay.
 
     PREFLIGHT CONTAINMENT (DSS-WO-ENG-009 Finding B): EVERY external
     RPC/relay operation of the preparation path — provider construction,
@@ -3012,7 +3191,7 @@ def prepare_flashbots_bundle(
     if not txs:
         refusal = TestnetSafetyError("empty bundle refused")
         raise _audit_orchestration_refusal(cfg, purpose, refusal, chain_id=reported)
-    sender = cfg.load_agent_address()
+    sender = load_agent_address()
     for tx in txs:
         tx["chainId"] = reported
     # 3a. RPC-backed transaction-default fill (DSS-WO-ENG-009 Finding B);
@@ -3028,17 +3207,9 @@ def prepare_flashbots_bundle(
     try:
         validated = validate_bundle(
             txs, sender=sender, chain_id=reported,
-            max_value_wei=cfg.max_value_wei, max_gas_units=cfg.max_gas_units,
-            max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
-            max_priority_fee_wei=cfg.max_priority_fee_wei,
-            max_total_fee_wei=cfg.max_total_fee_wei,
-        )  # 3b — AGGREGATE bundle fee cap; code-controlled targets (R1)
-        total_fee_exposure = validate_bundle_fee_exposure(
-            validated,
-            max_fee_per_gas_wei=cfg.max_fee_per_gas_wei,
-            max_priority_fee_wei=cfg.max_priority_fee_wei,
-            max_total_fee_wei=cfg.max_total_fee_wei,
-        )
+        )  # 3b — AGGREGATE bundle fee cap; code-controlled targets (R1) and
+        #     code-controlled caps (R2)
+        total_fee_exposure = validate_bundle_fee_exposure(validated)
     except TestnetSafetyError as exc:
         raise _audit_orchestration_refusal(cfg, purpose, exc, chain_id=reported)
 
@@ -3050,7 +3221,7 @@ def prepare_flashbots_bundle(
     # message.
     custody_failure: Optional[TestnetSafetyError] = None
     try:
-        account = load_agent_wallet(cfg)  # 4
+        account = load_agent_wallet()  # 4 — designated custody only (R2)
     except Exception as exc:
         custody_failure = _clean_raise_candidate(
             exc, "agent wallet custody failed", stage="wallet decryption",
@@ -3103,7 +3274,7 @@ def prepare_flashbots_bundle(
         h for raw in signed for h in (bytes(raw).hex(), "0x" + bytes(raw).hex())
     )
     rpc_failure, relay_w3 = _guarded(
-        lambda: relay_factory(cfg.rpc_url, account, cfg.relay_url),
+        lambda: relay_factory(cfg.rpc_url, account, SECURITY_POLICY.relay_url),
         classification="bundle preparation failed",
         forbidden=forbidden_material,
         stage="relay transport construction",

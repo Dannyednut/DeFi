@@ -6,9 +6,8 @@ from mev.policy import ChainMEVPolicy
 from mev.simulator import BundleSimulator, SimulationBackend
 from config import execution_enabled
 from .errors import ExecutionRefused
-from .signer import sign_transaction, get_sender
-from .relay import relay_transaction
-from .relay import RelayResult
+from .signer import sign_transaction
+from .relay import relay_transaction, RelayResult
 
 @dataclass(frozen=True)
 class MEVExecutionDecision:

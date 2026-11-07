@@ -47,6 +47,7 @@ import executor.testnet_gate as _gate
 from eth_account import Account
 
 from tests.gate_r2_fixtures import IsolatedTestnetConfig, throwaway_store
+from tests.gate_r3_fixtures import offline_transports
 
 from executor.authorization import (
     ExecutionAuthorizationBoundary,
@@ -431,11 +432,11 @@ class TestLimitsAreImmutable(unittest.TestCase):
             cfg = IsolatedTestnetConfig(rpc_url="https://sepolia.example")
             w3 = _GateW3()
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    _self_transfer_tx(acct.address, value=HUGE_WEI),
-                    purpose="R2 value cap", config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        _self_transfer_tx(acct.address, value=HUGE_WEI),
+                        purpose="R2 value cap", config=cfg,
+                    )
             self.assertIn("exceeds the testnet cap", str(ctx.exception))
             self.assertEqual(w3.raw_submissions, [])  # fail closed
 
@@ -522,11 +523,11 @@ class TestCustodyAuditRelayProtected(unittest.TestCase):
             # DESIGNATED (patched) audit log, not anywhere else:
             w3 = _GateW3()
             with self.assertRaises(TestnetSafetyError):
-                sign_and_submit_testnet_tx(
-                    _self_transfer_tx(acct.address, value=HUGE_WEI),
-                    purpose="R2 audit destination", config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        _self_transfer_tx(acct.address, value=HUGE_WEI),
+                        purpose="R2 audit destination", config=cfg,
+                    )
             records = _read_audit(designated)  # the designated (patched) path
             self.assertEqual([r["outcome"] for r in records], ["refused"])
             self.assertEqual(records[0]["purpose"], "R2 audit destination")
@@ -547,11 +548,11 @@ class TestCustodyAuditRelayProtected(unittest.TestCase):
             os.makedirs(_gate.SECURITY_POLICY.tx_log_path, exist_ok=True)
             w3 = _GateW3()
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    _self_transfer_tx(acct.address, value=HUGE_WEI),
-                    purpose="R2 audit failure", config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        _self_transfer_tx(acct.address, value=HUGE_WEI),
+                        purpose="R2 audit failure", config=cfg,
+                    )
             # The POLICY verdict is preserved verbatim:
             self.assertIn("exceeds the testnet cap", str(ctx.exception))
             self.assertEqual(w3.raw_submissions, [])
@@ -567,21 +568,28 @@ class TestCustodyAuditRelayProtected(unittest.TestCase):
             # (a) a config cannot carry a relay redirect:
             with self.assertRaises(TypeError):
                 TestnetExecutionConfig(relay_url="https://evil.example")
-            # (b) the gate passes EXACTLY the reviewed relay URL to the
-            # relay factory — captured to prove it:
-            captured = []
+            # (b) R3: the production orchestration constructs its relay
+            # transport ONLY through the gate's private builder — spied
+            # here (test-only seam) — and the reviewed relay URL is read
+            # from the code-controlled policy INSIDE that builder at
+            # construction time. No relay URL reaches any caller-visible
+            # parameter, so a caller cannot redirect the session:
+            builder_calls = []
 
-            def relay_factory(url, auth_account, relay_url):
-                captured.append(relay_url)
+            def _spy_builder(rpc_url, auth_account):
+                builder_calls.append((rpc_url, _gate.SECURITY_POLICY.relay_url))
                 return _RelayStub()
 
-            session = prepare_flashbots_bundle(
-                [_self_transfer_tx(acct.address)],
-                purpose="R2 relay pin", config=cfg,
-                web3_factory=lambda url: _PrepareW3(),
-                relay_factory=relay_factory,
+            with offline_transports(rpc=_PrepareW3()), patch.object(
+                    _gate, "_build_relay_transport", _spy_builder):
+                session = prepare_flashbots_bundle(
+                    [_self_transfer_tx(acct.address)],
+                    purpose="R2 relay pin", config=cfg,
+                )
+            self.assertEqual(
+                builder_calls,
+                [("https://sepolia.example", FLASHBOTS_SEPOLIA_RELAY)],
             )
-            self.assertEqual(captured, [FLASHBOTS_SEPOLIA_RELAY])
             self.assertEqual(session._config.relay_url, FLASHBOTS_SEPOLIA_RELAY)
 
 
@@ -626,20 +634,19 @@ class TestBypassResistance(unittest.TestCase):
             relay = _RelayStub()
             # direct-RPC orchestration: over-cap value refused
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    _self_transfer_tx(acct.address, value=HUGE_WEI),
-                    purpose="R2 direct call", config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        _self_transfer_tx(acct.address, value=HUGE_WEI),
+                        purpose="R2 direct call", config=cfg,
+                    )
             self.assertIn("exceeds the testnet cap", str(ctx.exception))
             # Flashbots orchestration: over-cap value refused identically
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    [_self_transfer_tx(acct.address, value=HUGE_WEI)],
-                    purpose="R2 direct bundle call", config=cfg,
-                    web3_factory=lambda url: _PrepareW3(),
-                    relay_factory=lambda url, auth, relay_url: relay,
-                )
+                with offline_transports(rpc=_PrepareW3(), relay=relay):
+                    prepare_flashbots_bundle(
+                        [_self_transfer_tx(acct.address, value=HUGE_WEI)],
+                        purpose="R2 direct bundle call", config=cfg,
+                    )
             self.assertIn("exceeds the testnet cap", str(ctx.exception))
             relay.assert_not_called()
             self.assertEqual(w3.raw_submissions, [])
@@ -661,10 +668,10 @@ class TestBypassResistance(unittest.TestCase):
             self.assertEqual(auth.policy_name, "hostile")
             w3 = _GateW3()
             with self.assertRaises(TestnetSafetyError) as ctx:
-                auth.sign_and_submit(
-                    _self_transfer_tx(acct.address, value=HUGE_WEI),
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    auth.sign_and_submit(
+                        _self_transfer_tx(acct.address, value=HUGE_WEI),
+                    )
             self.assertIn("exceeds the testnet cap", str(ctx.exception))
             self.assertEqual(w3.raw_submissions, [])
             # And with the REAL opt-in removed, the hostile policy can
@@ -675,10 +682,10 @@ class TestBypassResistance(unittest.TestCase):
                 rogue_handle = boundary.authorize_execution("hostile attempt")
                 w3b = _GateW3()
                 with self.assertRaises(TestnetSafetyError) as ctx2:
-                    rogue_handle.sign_and_submit(
-                        _self_transfer_tx(acct.address),
-                        web3_factory=lambda url: w3b,
-                    )
+                    with offline_transports(rpc=w3b):
+                        rogue_handle.sign_and_submit(
+                            _self_transfer_tx(acct.address),
+                        )
                 self.assertIn("DISABLED", str(ctx2.exception))
                 self.assertEqual(w3b.raw_submissions, [])
 
@@ -697,10 +704,10 @@ class TestBypassResistance(unittest.TestCase):
             w3 = _GateW3()
             with _opted_out():
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    rogue.sign_and_submit(
-                        _self_transfer_tx(acct.address),
-                        web3_factory=lambda url: w3,
-                    )
+                    with offline_transports(rpc=w3):
+                        rogue.sign_and_submit(
+                            _self_transfer_tx(acct.address),
+                        )
             self.assertIn("DISABLED", str(ctx.exception))
             self.assertEqual(w3.raw_submissions, [])
 
@@ -721,20 +728,18 @@ class TestBypassResistance(unittest.TestCase):
                     direct_err = None
                     bundle_err = None
                     with self.assertRaises(TestnetSafetyError) as ctx:
-                        sign_and_submit_testnet_tx(
-                            _self_transfer_tx(acct.address, **over),
-                            purpose="R2 parity", config=cfg,
-                            web3_factory=lambda url: _GateW3(),
-                        )
+                        with offline_transports(rpc=_GateW3()):
+                            sign_and_submit_testnet_tx(
+                                _self_transfer_tx(acct.address, **over),
+                                purpose="R2 parity", config=cfg,
+                            )
                     direct_err = str(ctx.exception)
                     with self.assertRaises(TestnetSafetyError) as ctx:
-                        prepare_flashbots_bundle(
-                            [_self_transfer_tx(acct.address, **over)],
-                            purpose="R2 parity", config=cfg,
-                            web3_factory=lambda url: _PrepareW3(),
-                            relay_factory=lambda url, auth, relay_url:
-                                _RelayStub(),
-                        )
+                        with offline_transports(rpc=_PrepareW3(), relay=_RelayStub()):
+                            prepare_flashbots_bundle(
+                                [_self_transfer_tx(acct.address, **over)],
+                                purpose="R2 parity", config=cfg,
+                            )
                     bundle_err = str(ctx.exception)
                     # the SAME constant fired on both transports — the
                     # bundle path wraps the identical refusal with its
@@ -767,12 +772,12 @@ class TestFailClosedAndDisabledDefault(unittest.TestCase):
                 ):
                     with _opted_out():
                         with self.assertRaises(TestnetSafetyError) as ctx:
-                            sign_and_submit_testnet_tx(
-                                _self_transfer_tx(acct.address),
-                                purpose="R2 fail-closed disabled",
-                                config=cfg,
-                                web3_factory=lambda url: w3,
-                            )
+                            with offline_transports(rpc=w3):
+                                sign_and_submit_testnet_tx(
+                                    _self_transfer_tx(acct.address),
+                                    purpose="R2 fail-closed disabled",
+                                    config=cfg,
+                                )
                 self.assertIn("DISABLED", str(ctx.exception))
                 self.assertEqual(w3.raw_submissions, [])
             # (b) over-cap value with the gate on: refusal BEFORE custody
@@ -784,22 +789,21 @@ class TestFailClosedAndDisabledDefault(unittest.TestCase):
                     side_effect=booby,
                 ):
                     with self.assertRaises(TestnetSafetyError) as ctx:
-                        sign_and_submit_testnet_tx(
-                            _self_transfer_tx(acct.address, value=HUGE_WEI),
-                            purpose="R2 fail-closed over-cap",
-                            config=IsolatedTestnetConfig(
-                                rpc_url="https://sepolia.example"),
-                            web3_factory=lambda url: w3,
-                        )
+                        with offline_transports(rpc=w3):
+                            sign_and_submit_testnet_tx(
+                                _self_transfer_tx(acct.address, value=HUGE_WEI),
+                                purpose="R2 fail-closed over-cap",
+                                config=IsolatedTestnetConfig(
+                                    rpc_url="https://sepolia.example"),
+                            )
                     with self.assertRaises(TestnetSafetyError):
-                        prepare_flashbots_bundle(
-                            [_self_transfer_tx(acct.address, value=HUGE_WEI)],
-                            purpose="R2 fail-closed over-cap bundle",
-                            config=IsolatedTestnetConfig(
-                                rpc_url="https://sepolia.example"),
-                            web3_factory=lambda url: _PrepareW3(),
-                            relay_factory=lambda url, auth, relay_url: relay,
-                        )
+                        with offline_transports(rpc=_PrepareW3(), relay=relay):
+                            prepare_flashbots_bundle(
+                                [_self_transfer_tx(acct.address, value=HUGE_WEI)],
+                                purpose="R2 fail-closed over-cap bundle",
+                                config=IsolatedTestnetConfig(
+                                    rpc_url="https://sepolia.example"),
+                            )
                 self.assertIn("exceeds the testnet cap", str(ctx.exception))
                 self.assertEqual(w3.raw_submissions, [])
                 relay.assert_not_called()
@@ -841,14 +845,16 @@ class TestStructuralInvariants(unittest.TestCase):
             prepare_flashbots_bundle as prep,
             sign_and_submit_testnet_tx as sign,
         )
+        # DSS-WO-ENG-015 R3: NO transport-factory parameter survives on
+        # any production-facing interface — the transports are built
+        # internally by the gate's private builders.
         self.assertEqual(
             list(inspect.signature(sign).parameters),
-            ["tx", "purpose", "config", "web3_factory", "receipt_timeout"],
+            ["tx", "purpose", "config", "receipt_timeout"],
         )
         self.assertEqual(
             list(inspect.signature(prep).parameters),
-            ["unsigned_txs", "purpose", "config", "web3_factory",
-             "relay_factory"],
+            ["unsigned_txs", "purpose", "config"],
         )
         self.assertEqual(
             list(TestnetExecutionConfig.__dataclass_fields__),

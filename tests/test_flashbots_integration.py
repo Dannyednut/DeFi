@@ -130,6 +130,7 @@ def setUpModule():
 import executor.testnet_gate as _gate
 
 from tests.gate_r2_fixtures import IsolatedTestnetConfig, throwaway_store
+from tests.gate_r3_fixtures import frozen_map, offline_transports
 
 from executor.testnet_gate import (
     FLASHBOTS_SEPOLIA_RELAY,
@@ -368,13 +369,12 @@ class TestPreparePathOffline(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with _opted_out(), self.assertRaises(TestnetSafetyError) as ctx:
-                    prepare_flashbots_bundle(
-                        [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
-                        purpose="must never prepare",
-                        config=disabled,
-                        web3_factory=lambda url: self._mock_w3(),
-                        relay_factory=lambda url, auth, relay_url: relay,
-                    )
+                    with offline_transports(rpc=self._mock_w3(), relay=relay):
+                        prepare_flashbots_bundle(
+                            [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
+                            purpose="must never prepare",
+                            config=disabled,
+                        )
             self.assertIn("DISABLED", str(ctx.exception))
             relay.assert_not_called()
 
@@ -391,13 +391,12 @@ class TestPreparePathOffline(unittest.TestCase):
             # The session constructor re-verifies the transport chain
             # binding, so the mock relay must report the expected chain.
             relay.eth.chain_id = SEPOLIA_CHAIN_ID
-            result = prepare_flashbots_bundle(
-                [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
-                purpose="offline prepare check",
-                config=cfg,
-                web3_factory=lambda url: w3,
-                relay_factory=lambda url, auth, relay_url: relay,
-            )
+            with offline_transports(rpc=w3, relay=relay):
+                result = prepare_flashbots_bundle(
+                    [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
+                    purpose="offline prepare check",
+                    config=cfg,
+                )
             self.assertIsInstance(result, FlashbotsBundleSession)
             with self.assertRaises(TypeError):
                 a, b = result  # not an unpackable (session, signed, target)
@@ -413,13 +412,12 @@ class TestPreparePathOffline(unittest.TestCase):
             stranger = "0x" + "bb" * 20
             relay = MagicMock()
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    [{"to": stranger, "value": 1}],
-                    purpose="must never prepare",
-                    config=cfg,
-                    web3_factory=lambda url: self._mock_w3(),
-                    relay_factory=lambda url, auth, relay_url: relay,
-                )
+                with offline_transports(rpc=self._mock_w3(), relay=relay):
+                    prepare_flashbots_bundle(
+                        [{"to": stranger, "value": 1}],
+                        purpose="must never prepare",
+                        config=cfg,
+                    )
             self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
             relay.assert_not_called()
 
@@ -435,16 +433,21 @@ class TestPreparePathOffline(unittest.TestCase):
             relay = MagicMock()
             # R1: no allowlist override exists — the module map is
             # controlled-mocked so Holesky counts as allowlisted-but-
-            # unexpected; this is a test technique, not an interface.
-            with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {17000: "Holesky"}), \
+            # unexpected; this is a test technique, not an interface. R3:
+            # the immutable module map is replaced WHOLESALE (frozen mock)
+            # — in-place mutation of the policy mapping is refused.
+            with patch.object(
+                    _gate, "ALLOWED_TESTNET_CHAINS",
+                    frozen_map({**_gate.ALLOWED_TESTNET_CHAINS,
+                                17000: "Holesky"}),
+            ), \
                     self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    [{"to": acct.address, "value": 0}],
-                    purpose="must never prepare",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: relay,
-                )
+                with offline_transports(rpc=w3, relay=relay):
+                    prepare_flashbots_bundle(
+                        [{"to": acct.address, "value": 0}],
+                        purpose="must never prepare",
+                        config=cfg,
+                    )
             self.assertIn("RPC chain mismatch", str(ctx.exception))
             relay.assert_not_called()
 
@@ -455,13 +458,12 @@ class TestPreparePathOffline(unittest.TestCase):
             w3.eth.get_block.return_value = {"baseFeePerGas": 400 * 10**9}
             relay = MagicMock()
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    [{"to": acct.address, "value": 0}],
-                    purpose="must never prepare",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: relay,
-                )
+                with offline_transports(rpc=w3, relay=relay):
+                    prepare_flashbots_bundle(
+                        [{"to": acct.address, "value": 0}],
+                        purpose="must never prepare",
+                        config=cfg,
+                    )
             self.assertIn("exceeds the testnet cap", str(ctx.exception))
             relay.assert_not_called()
 
@@ -492,13 +494,12 @@ class TestPayloadContainment(unittest.TestCase):
     def _prepare(self, tmp):
         cfg, acct = _offline_cfg(tmp)
         relay = _LocalRelayStub()
-        session = prepare_flashbots_bundle(
-            [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
-            purpose="containment check",
-            config=cfg,
-            web3_factory=lambda url: _mock_w3(),
-            relay_factory=lambda url, auth, relay_url: relay,
-        )
+        with offline_transports(rpc=_mock_w3(), relay=relay):
+            session = prepare_flashbots_bundle(
+                [{"to": acct.address, "value": SELF_TRANSFER_VALUE_WEI}],
+                purpose="containment check",
+                config=cfg,
+            )
         return session, cfg, acct, relay
 
     @staticmethod

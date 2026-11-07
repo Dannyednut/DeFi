@@ -52,6 +52,34 @@ DSS-WO-ENG-015 R1 — authorization inputs are ISOLATED from callers:
     operational authorization mechanism: no production-facing interface
     accepts an opt-in flag, an allowlist or a target map.
 
+DSS-WO-ENG-015 R3 — IMMUTABLE AUTHORIZATION MAPS AND SEALED TRANSPORTS:
+
+  * The code-controlled authorization maps are GENUINELY read-only:
+    ``ALLOWED_TESTNET_CHAINS`` and ``KNOWN_TARGETS`` (including the
+    nested chain-to-target maps, should targets ever be approved) are
+    deep-frozen ``types.MappingProxyType`` views. Mutating any exposed
+    policy mapping — the module constant, ``SECURITY_POLICY.allowed_chains``,
+    ``SECURITY_POLICY.known_targets`` or the ``effective_allowlist()``
+    result — raises ``TypeError``; there is no runtime route from a
+    returned mapping to the live policy. Sepolia remains the only
+    authorized testnet and ``KNOWN_TARGETS`` remains empty; approving a
+    chain or a target is still a reviewed CODE change only.
+  * The production signing/submission interfaces accept NO transport
+    injection: ``web3_factory`` and ``relay_factory`` are removed from
+    ``sign_and_submit_testnet_tx``, ``prepare_flashbots_bundle`` and
+    both ``AuthorizedExecution`` methods. The direct-RPC orchestration
+    constructs its Web3 transport internally from the configured
+    operational RPC URL; the Flashbots transport is constructed
+    internally against the code-controlled ``FLASHBOTS_SEPOLIA_RELAY``.
+    A caller can no longer substitute a provider that lies about the
+    chain ID or a relay client that ignores the reviewed relay URL —
+    there is no parameter through which any transport could enter.
+  * Offline determinism is preserved through the PRIVATE internal
+    construction helpers (``_build_rpc_transport`` /
+    ``_build_relay_transport``) patched by test fixtures — a test
+    technique on private module attributes, never an ordinary runtime
+    execution argument and never a public dependency-injection surface.
+
 DSS-WO-ENG-015 R2 — SECURITY POLICY IS NOT CALLER-CONFIGURABLE:
 
   * The security policy is the code-controlled module singleton
@@ -198,7 +226,8 @@ import stat
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 
 from log import get_logger
 
@@ -211,6 +240,26 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
 
 MAINNET_CHAIN_ID = 1
 
+
+def _frozen_policy_mapping(mapping: Mapping) -> MappingProxyType:
+    """Deeply read-only view of a code-controlled policy mapping
+    (DSS-WO-ENG-015 R3).
+
+    ``types.MappingProxyType`` refuses item assignment and item deletion,
+    so a mapping wrapped here cannot be mutated through any reference a
+    caller can obtain. The freeze is RECURSIVE: a nested dict value is
+    itself wrapped, so the chain-to-target maps inside ``KNOWN_TARGETS``
+    are as immutable as the outer map — protecting only the outer
+    dictionary would leave the nested target entries mutable. Plain
+    (non-dict) values such as chain-name strings are kept as-is.
+    """
+    frozen = {
+        key: _frozen_policy_mapping(value) if isinstance(value, dict) else value
+        for key, value in mapping.items()
+    }
+    return MappingProxyType(frozen)
+
+
 # Explicit testnet allowlist. Sepolia only for now. Adding a chain requires
 # a documented network-specific review (status, RPC, contract deployments)
 # recorded in docs/testnet-policy.md BEFORE it is listed here.
@@ -218,12 +267,17 @@ MAINNET_CHAIN_ID = 1
 # DSS-WO-ENG-015 R1: this map is the ONLY allowlist. It can never be
 # altered from the environment, from a caller-supplied configuration
 # object or through any function argument — every authorization check
-# reads it directly. Offline tests that need a second allowlisted chain
-# patch this module attribute as a controlled mock; that is a test
-# technique, not an operational interface.
-ALLOWED_TESTNET_CHAINS: dict[int, str] = {
+# reads it directly.
+#
+# DSS-WO-ENG-015 R3: the map is GENUINELY IMMUTABLE (a deep-frozen
+# ``MappingProxyType``): item assignment/deletion on it — or on any
+# mapping derived from it through the policy API — is refused. Offline
+# tests that need a second allowlisted chain replace this module
+# attribute wholesale with ``unittest.mock.patch.object`` as a controlled
+# mock; that is a test technique, not an operational interface.
+ALLOWED_TESTNET_CHAINS: Mapping[int, str] = _frozen_policy_mapping({
     11155111: "Ethereum Sepolia",
-}
+})
 
 # Hard expenditure caps for a single testnet transaction.
 MAX_TESTNET_TX_VALUE_WEI = 10**15          # 0.001 native units
@@ -265,7 +319,13 @@ APPROVAL_SELECTORS = {bytes.fromhex("095ea7b3"), bytes.fromhex("39509351")}
 # until the Coordinator approves specific deployments, the only permitted
 # recipient is the agent wallet itself (self-transfers for relay/nonce
 # verification). Entries: chain_id -> {address_lower: purpose}
-KNOWN_TARGETS: dict[int, dict[str, str]] = {}
+#
+# DSS-WO-ENG-015 R3: like the allowlist, this map — and every NESTED
+# chain-to-target map it will ever contain — is a deep-frozen
+# ``MappingProxyType``: mutation through any exposed reference is
+# refused. Approving a target remains an explicit, separately reviewed
+# code change.
+KNOWN_TARGETS: Mapping[int, Mapping[str, str]] = _frozen_policy_mapping({})
 
 # Where the per-transaction audit log is written (logs/*.jsonl is
 # gitignored — the log stays in the agent runtime, never in Git).
@@ -336,8 +396,12 @@ class TestnetSecurityPolicy:
     # ── allowed chains / opt-in requirement ──────────────────────────
 
     @property
-    def allowed_chains(self) -> dict:
-        """The code-controlled testnet allowlist (Sepolia only)."""
+    def allowed_chains(self) -> Mapping:
+        """The code-controlled testnet allowlist (Sepolia only).
+
+        DSS-WO-ENG-015 R3: the returned mapping is a READ-ONLY view of
+        the policy — mutating it is refused and cannot affect the live
+        allowlist."""
         return effective_allowlist()
 
     @property
@@ -372,7 +436,12 @@ class TestnetSecurityPolicy:
     # ── approved contract targets ───────────────────────────────────
 
     @property
-    def known_targets(self) -> dict:
+    def known_targets(self) -> Mapping:
+        """The code-controlled approved targets (deliberately empty).
+
+        DSS-WO-ENG-015 R3: the returned mapping — and every nested
+        chain-to-target map it will ever contain — is a READ-ONLY view;
+        mutating it is refused and cannot approve a target."""
         return KNOWN_TARGETS
 
     # ── wallet custody locations (the designated DSS secret store) ──
@@ -429,12 +498,17 @@ def gate_opted_in() -> bool:
     return os.environ.get("DSS_TESTNET_EXEC", "") == "1"
 
 
-def effective_allowlist() -> dict[int, str]:
+def effective_allowlist() -> Mapping[int, str]:
     """Return the allowlist in force: the code-controlled production map.
 
     DSS-WO-ENG-015 R1: there is no parameter and no override — every
     caller gets ``ALLOWED_TESTNET_CHAINS``. The environment can never
-    change this, and no API accepts an alternative map."""
+    change this, and no API accepts an alternative map.
+
+    DSS-WO-ENG-015 R3: the returned mapping is GENUINELY READ-ONLY (a
+    deep-frozen ``MappingProxyType``): mutating the returned object is
+    refused and there is no route from it to a mutable backing
+    dictionary, so no caller can widen the live allowlist through it."""
     return ALLOWED_TESTNET_CHAINS
 
 
@@ -872,10 +946,16 @@ def validate_transaction(
     code-controlled policy constants (read from ``SECURITY_POLICY``).
     This primitive accepts no limit-override parameter, so neither a
     caller nor a manually constructed configuration can weaken any cap.
+
+    DSS-WO-ENG-015 R3: the reviewed-target map is read through the
+    policy's IMMUTABLE representation (``SECURITY_POLICY.known_targets``
+    — a deep-frozen ``MappingProxyType``), not through a mutable
+    dictionary: no caller can mutate a returned map into authorizing a
+    recipient.
     """
     max_value_wei = SECURITY_POLICY.max_value_wei
     max_gas_units = SECURITY_POLICY.max_gas_units
-    targets = KNOWN_TARGETS
+    targets = SECURITY_POLICY.known_targets
 
     # DSS-WO-ENG-007 Finding B (Option A — fail closed): access lists are
     # OUT OF POLICY at this execution boundary. The gate signs only plain
@@ -2700,6 +2780,54 @@ def _raw_signed_bytes(signed) -> bytes:
 
 # ── Signing / submission orchestration (direct RPC transport) ────────────────
 
+def _build_rpc_transport(url: str):
+    """Build the production direct-RPC Web3 transport (DSS-WO-ENG-015 R3).
+
+    PRIVATE internal construction seam. The only production caller is
+    ``sign_and_submit_testnet_tx``, which passes EXACTLY the configured
+    operational RPC URL — no caller can reach this builder, substitute a
+    provider or choose another endpoint through any public interface:
+    the production signing API accepts no transport argument at all.
+
+    Offline tests patch this module attribute
+    (``unittest.mock.patch.object``) with a controlled mock transport.
+    That is a test technique on a PRIVATE name — never an ordinary
+    runtime execution argument and never a public dependency-injection
+    surface.
+    """
+    from web3 import Web3, HTTPProvider
+    return Web3(HTTPProvider(url))
+
+
+def _build_relay_transport(rpc_url: str, auth_account):
+    """Build the production Flashbots relay transport (DSS-WO-ENG-015 R3).
+
+    PRIVATE internal construction seam. The only production caller is
+    ``prepare_flashbots_bundle``; the relay destination is read here, at
+    construction time, from the code-controlled policy — the reviewed
+    Sepolia relay (``SECURITY_POLICY.relay_url``). No relay URL flows
+    through any caller-visible parameter, so a caller cannot redirect
+    the signed bundle to another transport: the production API accepts
+    no relay/transport argument at all.
+
+    The Web3 provider points at the configured operational RPC URL (the
+    session's chain-identity reads are verified against it) while the
+    flashbots middleware routes the bundle methods to the reviewed
+    relay — identical transport semantics to the previously reviewed
+    default factory.
+
+    Offline tests patch this module attribute with a controlled mock
+    relay transport. That is a test technique on a PRIVATE name — never
+    an ordinary runtime execution argument and never a public
+    dependency-injection surface.
+    """
+    from web3 import Web3, HTTPProvider
+    from flashbots import flashbot
+    relay_w3 = Web3(HTTPProvider(rpc_url))
+    flashbot(relay_w3, auth_account, SECURITY_POLICY.relay_url)
+    return relay_w3
+
+
 def _audit_orchestration_refusal(
     cfg: TestnetExecutionConfig,
     purpose: str,
@@ -2765,7 +2893,6 @@ def sign_and_submit_testnet_tx(
     *,
     purpose: str,
     config: Optional[TestnetExecutionConfig] = None,
-    web3_factory: Optional[Callable[[str], object]] = None,
     receipt_timeout: int = 120,
 ) -> dict:
     """The ONLY sanctioned path from intention to a live direct-RPC testnet
@@ -2811,6 +2938,13 @@ def sign_and_submit_testnet_tx(
     custody locations, the audit destination and every other security
     control are enforced from the code-controlled ``SECURITY_POLICY`` —
     no caller-supplied object can weaken any of them.
+
+    DSS-WO-ENG-015 R3: the Web3 transport is constructed INTERNALLY from
+    the configured operational RPC URL (``_build_rpc_transport``). There
+    is NO ``web3_factory`` (or any other transport/provider/submission)
+    parameter: a caller cannot substitute a provider that lies about the
+    chain ID or intercept the signed transaction — the transport enters
+    the orchestration only through the gate-controlled private builder.
     """
     cfg = config or TestnetExecutionConfig.from_env()
     try:
@@ -2818,20 +2952,17 @@ def sign_and_submit_testnet_tx(
     except TestnetSafetyError as exc:
         raise _audit_orchestration_refusal(cfg, purpose, exc)
 
-    if web3_factory is None:
-        def web3_factory(url: str):
-            from web3 import Web3, HTTPProvider
-            return Web3(HTTPProvider(url))
-
     # Credential material registered from THIS configuration (DSS-WO-008
     # Finding A): the RPC URL and its credential-bearing components.
     # The signed payload does not exist yet at preflight time; it joins
     # the forbidden material before submission.
     forbidden_config = _registered_secrets(cfg)
 
-    # 2a. Provider construction (DSS-WO-ENG-009 Finding A).
+    # 2a. Provider construction (DSS-WO-ENG-009 Finding A): the transport
+    # is built INTERNALLY from the configured operational RPC URL — there
+    # is no caller-supplied factory (DSS-WO-ENG-015 R3).
     rpc_failure, w3 = _guarded(
-        lambda: web3_factory(cfg.rpc_url),
+        lambda: _build_rpc_transport(cfg.rpc_url),
         classification="testnet RPC preflight failed",
         forbidden=forbidden_config,
         stage="RPC provider initialization",
@@ -3053,8 +3184,6 @@ def prepare_flashbots_bundle(
     *,
     purpose: str,
     config: Optional[TestnetExecutionConfig] = None,
-    web3_factory: Optional[Callable[[str], object]] = None,
-    relay_factory: Optional[Callable[[str, object, str], object]] = None,
 ) -> "FlashbotsBundleSession":
     """The ONLY sanctioned preparation path for Flashbots bundle operations.
 
@@ -3089,12 +3218,13 @@ def prepare_flashbots_bundle(
          it to the recorded agent address;
       5. re-verify the chain ID, sign every transaction;
       6. build the relay transport (Flashbots middleware attached by the
-         factory; the agent wallet is the relay auth signer) and MINT the
-         PreparedFlashbotsBundle capability — binding wallet identity,
-         chain ID, the frozen normalized transaction-intent records, the
-         exact signed payload, the target block and their fingerprint —
-         then build the session on it. No other code path can mint the
-         capability or create a session.
+         gate's internal builder; the agent wallet is the relay auth
+         signer) and MINT the PreparedFlashbotsBundle capability —
+         binding wallet identity, chain ID, the frozen normalized
+         transaction-intent records, the exact signed payload, the
+         target block and their fingerprint — then build the session on
+         it. No other code path can mint the capability or create a
+         session.
 
     The Flashbots relay never becomes an independent authorization path:
     the session only transports the exact payload that already passed
@@ -3115,21 +3245,34 @@ def prepare_flashbots_bundle(
     object can weaken any of them or redirect the session to another
     relay.
 
+    DSS-WO-ENG-015 R3: the RPC transport and the relay transport are
+    constructed INTERNALLY — the RPC transport from the configured
+    operational RPC URL (``_build_rpc_transport``) and the relay
+    transport against the code-controlled Sepolia relay
+    (``_build_relay_transport`` reads ``SECURITY_POLICY.relay_url``).
+    There are NO ``web3_factory``/``relay_factory`` (or any other
+    transport/provider/relay-client) parameters: a caller cannot
+    substitute a provider that lies about the chain ID or a relay
+    client that ignores the reviewed relay URL — passing a relay URL
+    into an arbitrary callback never established that the callback used
+    it, so no transport callback is accepted at all.
+
     PREFLIGHT CONTAINMENT (DSS-WO-ENG-009 Finding B): EVERY external
     RPC/relay operation of the preparation path — provider construction,
     the connectivity check, the initial and pre-sign chain-ID reads, the
     RPC-backed transaction-default fill, the block-number read for the
     target block, relay transport construction and session-construction
     verification — runs under foreign-exception containment. A failing
-    relay factory or provider call cannot expose credentials contained in
-    either the configured RPC URL or the relay URL: the caller receives
-    only the classification, the exception class name and the fixed safe
-    stage. Gate refusals (disabled gate, unreachable RPC, chain-policy
-    and transaction-policy rejections) keep their exact type and message
-    — a policy refusal is never converted into a foreign transport
-    failure. On success this path still returns the controlled
-    FlashbotsBundleSession ONLY; no signed raw transaction bytes,
-    capability internals or mutable authorization state are exposed.
+    relay transport construction or provider call cannot expose
+    credentials contained in either the configured RPC URL or the relay
+    URL: the caller receives only the classification, the exception
+    class name and the fixed safe stage. Gate refusals (disabled gate,
+    unreachable RPC, chain-policy and transaction-policy rejections)
+    keep their exact type and message — a policy refusal is never
+    converted into a foreign transport failure. On success this path
+    still returns the controlled FlashbotsBundleSession ONLY; no signed
+    raw transaction bytes, capability internals or mutable authorization
+    state are exposed.
     """
     cfg = config or TestnetExecutionConfig.from_env()
     try:
@@ -3137,20 +3280,17 @@ def prepare_flashbots_bundle(
     except TestnetSafetyError as exc:
         raise _audit_orchestration_refusal(cfg, purpose, exc)
 
-    if web3_factory is None:
-        def web3_factory(url: str):
-            from web3 import Web3, HTTPProvider
-            return Web3(HTTPProvider(url))
-
     # Credential material registered from THIS configuration (DSS-WO-008
     # Finding A): the RPC URL and the relay URL plus their
     # credential-bearing components. A relay/provider failure at ANY
     # preparation stage must not be able to expose either URL's secrets.
     forbidden_config = _registered_secrets(cfg)
 
-    # 2a. Provider construction (DSS-WO-ENG-009 Finding B).
+    # 2a. Provider construction (DSS-WO-ENG-009 Finding B): the transport
+    # is built INTERNALLY from the configured operational RPC URL — there
+    # is no caller-supplied factory (DSS-WO-ENG-015 R3).
     rpc_failure, w3 = _guarded(
-        lambda: web3_factory(cfg.rpc_url),
+        lambda: _build_rpc_transport(cfg.rpc_url),
         classification="bundle preparation failed",
         forbidden=forbidden_config,
         stage="RPC provider initialization",
@@ -3257,24 +3397,18 @@ def prepare_flashbots_bundle(
     if signing_failure is not None:
         raise _audit_orchestration_refusal(cfg, purpose, signing_failure)
 
-    if relay_factory is None:
-        def relay_factory(url: str, auth_account, relay_url: str):
-            from web3 import Web3, HTTPProvider
-            from flashbots import flashbot
-            relay_w3 = Web3(HTTPProvider(url))
-            flashbot(relay_w3, auth_account, relay_url)
-            return relay_w3
-
     # 6a. Relay transport construction (DSS-WO-ENG-009 Finding B): a
-    # failing relay factory or provider call must not expose credentials
-    # from either the configured RPC URL or the relay URL. The signed
-    # payload hexes exist by now and join the forbidden material as
-    # defense in depth.
+    # failing relay transport construction or provider call must not
+    # expose credentials from either the configured RPC URL or the relay
+    # URL. The transport is built INTERNALLY against the code-controlled
+    # Sepolia relay — there is no caller-supplied relay factory
+    # (DSS-WO-ENG-015 R3). The signed payload hexes exist by now and
+    # join the forbidden material as defense in depth.
     forbidden_material = forbidden_config + tuple(
         h for raw in signed for h in (bytes(raw).hex(), "0x" + bytes(raw).hex())
     )
     rpc_failure, relay_w3 = _guarded(
-        lambda: relay_factory(cfg.rpc_url, account, SECURITY_POLICY.relay_url),
+        lambda: _build_relay_transport(cfg.rpc_url, account),
         classification="bundle preparation failed",
         forbidden=forbidden_material,
         stage="relay transport construction",

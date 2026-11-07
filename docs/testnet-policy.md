@@ -664,3 +664,91 @@ Structural invariants pin the orchestration signatures, the
 operational-only config fields, the `SECURITY_POLICY` destinations in
 the orchestration sources, and — repo-wide — that the ONLY broadcast
 markers in non-test code live in `executor/testnet_gate.py`.
+
+### 8.3 Immutable authorization maps and sealed runtime transports (DSS-WO-ENG-015 R3)
+
+The R2 review confirmed the limits, custody, audit destination and relay
+are no longer configurable through `TestnetExecutionConfig`. R3 closes the
+two remaining weaknesses the Coordinator identified: the authorization maps
+were mutable dictionaries exposed through public policy properties, and the
+production signing/submission interfaces accepted caller-supplied transport
+factories.
+
+**The authorization maps are genuinely read-only.**
+`ALLOWED_TESTNET_CHAINS` and `KNOWN_TARGETS` are deep-frozen
+`types.MappingProxyType` views built by `_frozen_policy_mapping()` — the
+freeze is RECURSIVE, so the nested chain-to-target maps (should targets
+ever be approved) are as immutable as the outer dictionaries. There is no
+runtime route from any exposed representation to a mutable backing
+dictionary:
+
+| Exposed representation | Guarantee |
+| --- | --- |
+| `ALLOWED_TESTNET_CHAINS` (module constant) | item assignment/deletion refused (`TypeError`); no mutating API (`clear`/`pop`/`popitem`/`setdefault`/`update` absent) |
+| `KNOWN_TARGETS` (module constant) | identical, including every nested target map |
+| `effective_allowlist()` | returns the immutable map itself — mutating the result cannot change the allowlist |
+| `SECURITY_POLICY.allowed_chains` / `.known_targets` | same immutable objects |
+| `validate_transaction()` | reads `SECURITY_POLICY.known_targets` (the immutable representation), not a mutable dict |
+
+Sepolia remains the only authorized testnet and `KNOWN_TARGETS` remains
+empty; adding a chain or a target is still an explicit, separately reviewed
+code change. The established offline-test technique (replacing the module
+attribute wholesale with `unittest.mock.patch.object`, via
+`tests.gate_r3_fixtures.frozen_map`) is unchanged — it is a test technique,
+never an operational interface.
+
+**No transport injection.** `web3_factory` and `relay_factory` are removed
+from ALL production-facing execution interfaces:
+`sign_and_submit_testnet_tx(tx, *, purpose, config=None, receipt_timeout=120)`,
+`prepare_flashbots_bundle(unsigned_txs, *, purpose, config=None)`,
+`AuthorizedExecution.sign_and_submit(tx, *, receipt_timeout=120)` and
+`AuthorizedExecution.prepare_flashbots_bundle(unsigned_txs)`. A caller can
+no longer substitute a provider that falsely reports the expected Sepolia
+chain ID, intercept signed transactions, or redirect a signed Flashbots
+bundle through an injected transport — passing a relay URL into an
+arbitrary callback never established that the callback used it, so no
+transport callback is accepted at all.
+
+**Transports are constructed inside the gate**, by two PRIVATE module
+helpers that no public API exposes:
+
+- `_build_rpc_transport(url)` — the direct-RPC orchestration passes
+  exactly the configured operational RPC URL;
+- `_build_relay_transport(rpc_url, auth_account)` — the Flashbots
+  orchestration passes the operational RPC URL (the provider the
+  session's chain-identity reads are verified against) and the relay
+  destination is read INSIDE the builder, at construction time, from the
+  code-controlled `SECURITY_POLICY.relay_url` (the reviewed
+  `FLASHBOTS_SEPOLIA_RELAY`). No relay URL flows through any
+  caller-visible parameter.
+
+Exception containment, chain-ID verification before signing and before
+submission, credential sanitization and the relay session capability
+checks are unchanged.
+
+**Offline determinism preserved.** Tests patch the private builders with
+`tests.gate_r3_fixtures.offline_transports(rpc=..., relay=...)` —
+`unittest.mock.patch.object` scopes on private module attributes, never
+ordinary runtime execution arguments and never a public
+dependency-injection surface. The production path is not weakened to make
+mocked tests easier.
+
+**Regression coverage (R3 §4–§5).**
+`tests/test_r3_map_and_transport_isolation.py` pins: mutating the module
+allowlist/targets directly is refused; mutating `SECURITY_POLICY.allowed_chains`
+/ `.known_targets` is refused; mutating the `effective_allowlist()` result
+cannot change the allowlist; no chain or recipient can be authorized
+through any exposed policy mapping; nested target maps are immutable; the
+controlled-mock replacement technique still works without weakening
+runtime policy; the production signatures accept no factory arguments;
+offline tests still run the full orchestrations against controlled mock
+transports; a chain-ID-lying provider and a rogue relay transport cannot
+enter; the production Flashbots transport is always constructed against the
+code-controlled Sepolia relay; chain re-verification before signing and
+submission holds; and no raw signed transaction or credential material
+escapes through transport exceptions or the audit log. Structural
+invariants pin the read-only mapping types, the absence of any runtime
+mutation route, the absence of factory identifiers in production code
+(token-level scan), the internal transport construction sources, the sole
+relay destination, and that the execution router and mempool/backrun paths
+still run exclusively through the unified authorization boundary.

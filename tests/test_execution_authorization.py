@@ -80,6 +80,7 @@ from executor.testnet_gate import (
     _decode_signed_tx,
 )
 from tests.gate_r2_fixtures import IsolatedTestnetConfig, throwaway_store
+from tests.gate_r3_fixtures import offline_transports
 from executor.relay import RelayResult
 from executor.mev_execution import MEVExecutionService
 
@@ -1071,21 +1072,23 @@ class AuthSubmitProbe:
         self.gate_w3 = gate_w3
         self.calls = []
 
-    def __call__(self, tx, *, purpose, config=None, web3_factory=None,
-                 receipt_timeout=120):
+    def __call__(self, tx, *, purpose, config=None, receipt_timeout=120):
         from executor.testnet_gate import sign_and_submit_testnet_tx
         self.calls.append(dict(tx))
-        return sign_and_submit_testnet_tx(
-            tx, purpose=purpose, config=config,
-            web3_factory=lambda url: self.gate_w3,
-            receipt_timeout=receipt_timeout,
-        )
+        with offline_transports(rpc=self.gate_w3):
+            return sign_and_submit_testnet_tx(
+                tx, purpose=purpose, config=config,
+                receipt_timeout=receipt_timeout,
+            )
 
 
 def _real_sign_and_submit(tx, *, gate_w3, **kwargs):
+    """Run the REAL gate orchestration with an offline stub transport
+    (R3: injected by patching the gate's PRIVATE transport builder —
+    a test-only seam, not a production argument)."""
     from executor.testnet_gate import sign_and_submit_testnet_tx
-    kwargs["web3_factory"] = lambda url: gate_w3
-    return sign_and_submit_testnet_tx(tx, **kwargs)
+    with offline_transports(rpc=gate_w3):
+        return sign_and_submit_testnet_tx(tx, **kwargs)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1217,11 +1220,10 @@ class TestFlashbotsViaBoundary(unittest.TestCase):
         )
         auth = boundary.authorize_execution("bundle-test", chain_id=SEPOLIA)
         prepare_w3 = _PrepareStub()
-        session = auth.prepare_flashbots_bundle(
-            [_self_transfer_tx(acct.address)],
-            web3_factory=lambda url: prepare_w3,
-            relay_factory=lambda url, auth_account, relay_url: relay,
-        )
+        with offline_transports(rpc=prepare_w3, relay=relay):
+            session = auth.prepare_flashbots_bundle(
+                [_self_transfer_tx(acct.address)],
+            )
         return session, cfg
 
     def test_simulation_required_before_submission(self):
@@ -1438,33 +1440,32 @@ class TestR1EnvironmentAuthority(unittest.TestCase):
             with _opted_out():
                 with self.assertRaises(TestnetSafetyError) as ctx:
                     from executor.testnet_gate import sign_and_submit_testnet_tx
-                    sign_and_submit_testnet_tx(
-                        _self_transfer_tx(acct.address),
-                        purpose="direct gate call must not bypass",
-                        config=cfg,
-                        web3_factory=lambda url: gate_w3,
-                    )
+                    with offline_transports(rpc=gate_w3):
+                        sign_and_submit_testnet_tx(
+                            _self_transfer_tx(acct.address),
+                            purpose="direct gate call must not bypass",
+                            config=cfg,
+                        )
                 self.assertIn("DISABLED", str(ctx.exception))
                 with self.assertRaises(TestnetSafetyError) as ctx2:
                     from executor.testnet_gate import prepare_flashbots_bundle
-                    prepare_flashbots_bundle(
-                        [_self_transfer_tx(acct.address)],
-                        purpose="direct gate bundle must not bypass",
-                        config=cfg,
-                        web3_factory=lambda url: _PrepareStub(),
-                        relay_factory=lambda url, a, r: relay,
-                    )
+                    with offline_transports(rpc=_PrepareStub(), relay=relay):
+                        prepare_flashbots_bundle(
+                            [_self_transfer_tx(acct.address)],
+                            purpose="direct gate bundle must not bypass",
+                            config=cfg,
+                        )
                 self.assertIn("DISABLED", str(ctx2.exception))
             # EXECUTE_ONCHAIN=true cannot flip the gate either
             with patch.dict(os.environ, {"EXECUTE_ONCHAIN": "true"}), _opted_out():
                 with self.assertRaises(TestnetSafetyError):
                     from executor.testnet_gate import sign_and_submit_testnet_tx                         as _s
-                    _s(
-                        _self_transfer_tx(acct.address),
-                        purpose="execute_onchain must not help",
-                        config=cfg,
-                        web3_factory=lambda url: gate_w3,
-                    )
+                    with offline_transports(rpc=gate_w3):
+                        _s(
+                            _self_transfer_tx(acct.address),
+                            purpose="execute_onchain must not help",
+                            config=cfg,
+                        )
             # nothing was signed or broadcast on any refusal
             self.assertEqual(gate_w3.raw_submissions, [])
             self.assertEqual(relay.simulate_calls, [])
@@ -1502,12 +1503,12 @@ class TestR1EnvironmentAuthority(unittest.TestCase):
             ):
                 from executor.testnet_gate import sign_and_submit_testnet_tx
                 with self.assertRaises(TestnetSafetyError):
-                    sign_and_submit_testnet_tx(
-                        _self_transfer_tx(acct.address),
-                        purpose="refusal must not decrypt or sign",
-                        config=cfg,
-                        web3_factory=lambda url: gate_w3,
-                    )
+                    with offline_transports(rpc=gate_w3):
+                        sign_and_submit_testnet_tx(
+                            _self_transfer_tx(acct.address),
+                            purpose="refusal must not decrypt or sign",
+                            config=cfg,
+                        )
             self.assertEqual(gate_w3.raw_submissions, [])
             # also: an authorization refused at the boundary never reaches
             # the gate's wallet path
@@ -1721,14 +1722,13 @@ class TestR1TargetInjection(unittest.TestCase):
 
 
 def _real_prepare(unsigned_txs, *, relay, **kwargs):
-    """Run the REAL gate bundle preparation with offline stub transports."""
+    """Run the REAL gate bundle preparation with offline stub transports
+    (R3: injected by patching the gate's PRIVATE transport builders —
+    a test-only seam, not a production argument)."""
     from executor.testnet_gate import prepare_flashbots_bundle
-    if kwargs.get("web3_factory") is None:
-        kwargs["web3_factory"] = lambda url: _PrepareStub()
-    if kwargs.get("relay_factory") is None:
-        kwargs["relay_factory"] = lambda url, auth_account, relay_url: relay
-    return prepare_flashbots_bundle(
-        [dict(t) for t in unsigned_txs], **kwargs)
+    with offline_transports(rpc=_PrepareStub(), relay=relay):
+        return prepare_flashbots_bundle(
+            [dict(t) for t in unsigned_txs], **kwargs)
 
 
 class TestProductionInvariants(unittest.TestCase):

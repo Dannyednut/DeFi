@@ -76,6 +76,17 @@ weakened gate settings: every authorize() call re-derives the decision
 from the real environment and the gate re-enforces every security control
 from ``SECURITY_POLICY`` regardless of which policy object selected it.
 
+DSS-WO-ENG-015 R3 — NO TRANSPORT INJECTION: the authorized handle's
+signing and Flashbots methods accept NO ``web3_factory``/``relay_factory``
+(or any other transport/provider/relay-client) argument. Both routes run
+inside the gate, which constructs its transports internally: the direct-
+RPC transport from the configured operational RPC URL and the Flashbots
+transport against the code-controlled Sepolia relay. A caller cannot
+substitute a provider that lies about the chain ID or a relay client that
+ignores the reviewed relay URL — no parameter exists through which any
+transport could enter. Offline tests patch the gate's PRIVATE transport
+builders; that is a test technique, never an operational interface.
+
 HONEST BOUNDARY (inherited from executor/testnet_gate.py): this is an
 application-level boundary for the agent's own code paths. Arbitrary hostile
 code executing inside the same interpreter can defeat Python-level
@@ -90,7 +101,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from .testnet_gate import (
     SECURITY_POLICY,
@@ -329,7 +340,6 @@ class AuthorizedExecution:
         tx: dict,
         *,
         receipt_timeout: int = 120,
-        web3_factory: Optional[Callable[[str], Any]] = None,
     ) -> dict:
         """THE only direct-RPC signing-and-submission route.
 
@@ -340,21 +350,22 @@ class AuthorizedExecution:
         custody binding, submission, receipt and audit. Returns the gate's
         audit record; raises ``TestnetSafetyError`` on any refusal or
         failure. Signed raw bytes never leave the gate.
+
+        DSS-WO-ENG-015 R3: there is NO ``web3_factory`` (or any other
+        transport/provider) parameter — the gate builds its transport
+        internally from the configured operational RPC URL, so a caller
+        cannot substitute a provider that lies about the chain ID.
         """
         return sign_and_submit_testnet_tx(
             tx,
             purpose=self.purpose,
             config=self.config,
-            web3_factory=web3_factory,
             receipt_timeout=receipt_timeout,
         )
 
     def prepare_flashbots_bundle(
         self,
         unsigned_txs: Sequence[dict],
-        *,
-        web3_factory: Optional[Callable[[str], Any]] = None,
-        relay_factory: Optional[Callable[[str, Any, str], Any]] = None,
     ) -> Any:
         """THE only Flashbots bundle preparation route.
 
@@ -364,13 +375,16 @@ class AuthorizedExecution:
         no target override, DSS-WO-ENG-015 R1), wallet custody binding and
         signing. Returns ONLY the controlled ``FlashbotsBundleSession`` —
         signed raw bytes never leave the gate.
+
+        DSS-WO-ENG-015 R3: there are NO ``web3_factory``/``relay_factory``
+        (or any other transport/relay-client) parameters — the gate builds
+        its transports internally, and the Flashbots transport is always
+        constructed against the code-controlled Sepolia relay.
         """
         return prepare_flashbots_bundle(
             [dict(t) for t in unsigned_txs],
             purpose=self.purpose,
             config=self.config,
-            web3_factory=web3_factory,
-            relay_factory=relay_factory,
         )
 
 

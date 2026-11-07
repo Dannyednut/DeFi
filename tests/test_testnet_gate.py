@@ -123,6 +123,7 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 
 from tests.gate_r2_fixtures import IsolatedTestnetConfig, throwaway_store
+from tests.gate_r3_fixtures import frozen_map, offline_transports
 
 from executor.testnet_gate import (
     ALLOWED_TESTNET_CHAINS,
@@ -297,7 +298,10 @@ class TestChainIdGate(unittest.TestCase):
         """Mainnet can never be smuggled in — not even by patching the
         module map (a controlled mock, DSS-WO-ENG-015 R1: no API accepts
         an alternative allowlist)."""
-        with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {1: "smuggled mainnet"}):
+        with patch.object(
+                _gate, "ALLOWED_TESTNET_CHAINS",
+                frozen_map({**_gate.ALLOWED_TESTNET_CHAINS, 1: "smuggled mainnet"}),
+        ):
             with self.assertRaises(TestnetSafetyError) as ctx:
                 check_chain_id(1)
         self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
@@ -321,13 +325,19 @@ class TestChainIdGate(unittest.TestCase):
         an allowlisted RPC chain that is not the expected one hits the real
         mismatch branch (R1: map patching is a test technique, never an
         operational interface)."""
-        with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}):
+        with patch.object(
+                _gate, "ALLOWED_TESTNET_CHAINS",
+                frozen_map({**_gate.ALLOWED_TESTNET_CHAINS, HOLESKY: "Holesky"}),
+        ):
             with self.assertRaises(TestnetSafetyError) as ctx:
                 check_chain_id(HOLESKY, expected=SEPOLIA)
         self.assertIn("RPC chain mismatch", str(ctx.exception))
 
     def test_allowlisted_expected_chain_accepted(self):
-        with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}):
+        with patch.object(
+                _gate, "ALLOWED_TESTNET_CHAINS",
+                frozen_map({**_gate.ALLOWED_TESTNET_CHAINS, HOLESKY: "Holesky"}),
+        ):
             self.assertEqual(check_chain_id(HOLESKY, expected=HOLESKY), HOLESKY)
 
     def test_allowlist_contains_sepolia_only(self):
@@ -873,11 +883,10 @@ def _prepared_bundle(tmp, relay, *, n_txs=1,
         }
         for _ in range(n_txs)
     ]
-    session = prepare_flashbots_bundle(
-        txs, purpose=purpose, config=cfg,
-        web3_factory=lambda url: w3,
-        relay_factory=lambda url, auth, relay_url: relay,
-    )
+    with offline_transports(rpc=w3, relay=relay):
+        session = prepare_flashbots_bundle(
+            txs, purpose=purpose, config=cfg,
+        )
     target = session._prepared.target_block
     return session, cfg, target, acct
 
@@ -938,11 +947,11 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             # the refusal comes from the authoritative REAL environment
             # read (_opted_out removes the opt-in from os.environ).
             with _opted_out(), self.assertRaises(TestnetSafetyError) as direct_err:
-                sign_and_submit_testnet_tx(
-                    {"to": acct.address, "value": 0, "gas": 21000, "data": b""},
-                    purpose="gate parity", config=disabled,
-                    web3_factory=lambda url: MagicMock(),
-                )
+                with offline_transports(rpc=MagicMock()):
+                    sign_and_submit_testnet_tx(
+                        {"to": acct.address, "value": 0, "gas": 21000, "data": b""},
+                        purpose="gate parity", config=disabled,
+                    )
             self.assertIn("DISABLED", str(direct_err.exception))
             relay = _RelayStub()
             with patch(
@@ -950,12 +959,11 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with _opted_out(), self.assertRaises(TestnetSafetyError) as fb_err:
-                    prepare_flashbots_bundle(
-                        [{"to": acct.address, "value": 0}],
-                        purpose="gate parity", config=disabled,
-                        web3_factory=lambda url: _PrepareW3(),
-                        relay_factory=lambda url, auth, relay_url: relay,
-                    )
+                    with offline_transports(rpc=_PrepareW3(), relay=relay):
+                        prepare_flashbots_bundle(
+                            [{"to": acct.address, "value": 0}],
+                            purpose="gate parity", config=disabled,
+                        )
             self.assertIn("DISABLED", str(fb_err.exception))
             relay.assert_not_called()
 
@@ -986,18 +994,17 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
             w3.eth.wait_for_transaction_receipt.return_value = {
                 "status": 1, "gasUsed": 21000,
             }
-            sign_and_submit_testnet_tx(
-                {"to": acct.address, "value": 0, "gas": 21000, "data": b""},
-                purpose="gate parity", config=enabled,
-                web3_factory=lambda url: w3,
-            )
+            with offline_transports(rpc=w3):
+                sign_and_submit_testnet_tx(
+                    {"to": acct.address, "value": 0, "gas": 21000, "data": b""},
+                    purpose="gate parity", config=enabled,
+                )
             from eth_account import Account as _A
-            fb_session = prepare_flashbots_bundle(
-                [{"to": acct.address, "value": 0}],
-                purpose="gate parity", config=enabled,
-                web3_factory=lambda url: _PrepareW3(),
-                relay_factory=lambda url, auth, relay_url: _RelayStub(),
-            )
+            with offline_transports(rpc=_PrepareW3(), relay=_RelayStub()):
+                fb_session = prepare_flashbots_bundle(
+                    [{"to": acct.address, "value": 0}],
+                    purpose="gate parity", config=enabled,
+                )
             self.assertEqual(
                 _A.recover_transaction(sent[0]).lower(), acct.address.lower()
             )
@@ -1251,7 +1258,11 @@ class TestFlashbotsCapabilitySession(unittest.TestCase):
         simulation, then Holesky at submission — the binding refuses."""
         with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             relay = _RelayStub(chain_values=(SEPOLIA, SEPOLIA, HOLESKY))
-            with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}):
+            with patch.object(
+                    _gate, "ALLOWED_TESTNET_CHAINS",
+                    frozen_map({**_gate.ALLOWED_TESTNET_CHAINS,
+                                HOLESKY: "Holesky"}),
+            ):
                 session, cfg, _, _ = self._prepare(tmp, relay)
                 session.simulate()
                 with self.assertRaises(TestnetSafetyError) as ctx:
@@ -1525,12 +1536,11 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    prepare_flashbots_bundle(
-                        over, purpose="over-limit bundle",
-                        config=cfg,
-                        web3_factory=lambda url: _PrepareW3(),
-                        relay_factory=lambda url, auth, relay_url: relay,
-                    )
+                    with offline_transports(rpc=_PrepareW3(), relay=relay):
+                        prepare_flashbots_bundle(
+                            over, purpose="over-limit bundle",
+                            config=cfg,
+                        )
             self.assertIn("aggregate bundle fee exposure", str(ctx.exception))
             relay.assert_not_called()
 
@@ -1572,13 +1582,12 @@ class TestAggregateBundleFeeCap(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    prepare_flashbots_bundle(
-                        [{"to": stranger, "value": 1}],
-                        purpose="unvalidated recipient",
-                        config=cfg,
-                        web3_factory=lambda url: _PrepareW3(),
-                        relay_factory=lambda url, auth, relay_url: relay,
-                    )
+                    with offline_transports(rpc=_PrepareW3(), relay=relay):
+                        prepare_flashbots_bundle(
+                            [{"to": stranger, "value": 1}],
+                            purpose="unvalidated recipient",
+                            config=cfg,
+                        )
             self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
             relay.assert_not_called()
 
@@ -2210,14 +2219,14 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, throwaway_store(tmp):
             cfg, sender = self._provisioned(tmp)
             w3 = self._mock_w3()
-            record = sign_and_submit_testnet_tx(
-                # The runner never invents recipients: the intent itself must
-                # name the agent wallet for a self-transfer.
-                {"to": sender, "value": 0, "gas": 21000, "data": b""},
-                purpose="self 0-value relay check",
-                config=cfg,
-                web3_factory=lambda url: w3,
-            )
+            with offline_transports(rpc=w3):
+                record = sign_and_submit_testnet_tx(
+                    # The runner never invents recipients: the intent itself must
+                    # name the agent wallet for a self-transfer.
+                    {"to": sender, "value": 0, "gas": 21000, "data": b""},
+                    purpose="self 0-value relay check",
+                    config=cfg,
+                )
             self.assertEqual(record["outcome"], "mined")
             self.assertEqual(record["chain_id"], 11155111)
             self.assertEqual(record["actual_gas_used"], 21000)
@@ -2235,12 +2244,12 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
             )
             w3 = MagicMock()
             with _opted_out(), self.assertRaises(TestnetSafetyError):
-                sign_and_submit_testnet_tx(
-                    {"to": None, "value": 0, "gas": 21000, "data": b""},
-                    purpose="should never run",
-                    config=disabled,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": None, "value": 0, "gas": 21000, "data": b""},
+                        purpose="should never run",
+                        config=disabled,
+                    )
             w3.eth.assert_not_called() if hasattr(w3, "eth") else None
             self.assertFalse(w3.method_calls)
 
@@ -2250,12 +2259,12 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
             w3 = self._mock_w3()
             w3.eth.chain_id = 1  # RPC reports MAINNET
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": None, "value": 0, "gas": 21000, "data": b""},
-                    purpose="should never sign",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": None, "value": 0, "gas": 21000, "data": b""},
+                        purpose="should never sign",
+                        config=cfg,
+                    )
             self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
             # No signing occurred: the send was never reached.
             self.assertFalse(w3.eth.send_raw_transaction.called)
@@ -2278,14 +2287,18 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
             )
             w3 = self._mock_w3()
             w3.eth.chain_id = HOLESKY           # allowlisted (mocked), unexpected
-            with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}), \
+            with patch.object(
+                    _gate, "ALLOWED_TESTNET_CHAINS",
+                    frozen_map({**_gate.ALLOWED_TESTNET_CHAINS,
+                                HOLESKY: "Holesky"}),
+            ), \
                     self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": None, "value": 0, "gas": 21000, "data": b""},
-                    purpose="should never sign",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": None, "value": 0, "gas": 21000, "data": b""},
+                        purpose="should never sign",
+                        config=cfg,
+                    )
             self.assertIn("RPC chain mismatch", str(ctx.exception))
             self.assertFalse(w3.eth.send_raw_transaction.called)
 
@@ -2347,14 +2360,18 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
                 expected_chain_id=SEPOLIA,
             )
             w3 = self._flipping_w3([SEPOLIA, SEPOLIA, HOLESKY])
-            with patch.dict(_gate.ALLOWED_TESTNET_CHAINS, {HOLESKY: "Holesky"}), \
+            with patch.object(
+                    _gate, "ALLOWED_TESTNET_CHAINS",
+                    frozen_map({**_gate.ALLOWED_TESTNET_CHAINS,
+                                HOLESKY: "Holesky"}),
+            ), \
                     self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": sender, "value": 0, "gas": 21000, "data": b""},
-                    purpose="chain flip must never send",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": sender, "value": 0, "gas": 21000, "data": b""},
+                        purpose="chain flip must never send",
+                        config=cfg,
+                    )
             self.assertIn("RPC chain mismatch", str(ctx.exception))
             self.assertEqual(w3.submitted, 0)  # never sent
 
@@ -2364,12 +2381,12 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
             w3 = self._mock_w3()
             stranger = "0x" + "bb" * 20
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": stranger, "value": 10**15, "gas": 21000, "data": b""},
-                    purpose="arbitrary transfer must never sign",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": stranger, "value": 10**15, "gas": 21000, "data": b""},
+                        purpose="arbitrary transfer must never sign",
+                        config=cfg,
+                    )
             self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
             self.assertFalse(w3.eth.send_raw_transaction.called)
 
@@ -2381,12 +2398,12 @@ class TestSignAndSubmitOrchestration(unittest.TestCase):
             w3 = self._mock_w3()
             w3.eth.get_block.return_value = {"baseFeePerGas": 400 * 10**9}
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": sender, "value": 0, "gas": 21000, "data": b""},
-                    purpose="over-cap fee must never sign",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": sender, "value": 0, "gas": 21000, "data": b""},
+                        purpose="over-cap fee must never sign",
+                        config=cfg,
+                    )
             self.assertIn("exceeds the testnet cap", str(ctx.exception))
             self.assertFalse(w3.eth.send_raw_transaction.called)
 
@@ -2791,12 +2808,11 @@ class TestAccessListPolicyENG007(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    prepare_flashbots_bundle(
-                        txs, purpose="access list must never sign",
-                        config=cfg,
-                        web3_factory=lambda url: _PrepareW3(),
-                        relay_factory=lambda url, auth, relay_url: relay,
-                    )
+                    with offline_transports(rpc=_PrepareW3(), relay=relay):
+                        prepare_flashbots_bundle(
+                            txs, purpose="access list must never sign",
+                            config=cfg,
+                        )
             self.assertIn("access lists are not supported", str(ctx.exception))
             relay.assert_not_called()
 
@@ -3092,12 +3108,12 @@ class TestCredentialContainmentENG008(unittest.TestCase):
             w3.eth.send_raw_transaction.side_effect = RuntimeError(
                 f"cannot reach {CRED_RPC_URL} (connection refused)")
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    {"to": sender, "value": 0, "gas": 21000, "data": b""},
-                    purpose="credential containment (direct RPC)",
-                    config=cfg,
-                    web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        {"to": sender, "value": 0, "gas": 21000, "data": b""},
+                        purpose="credential containment (direct RPC)",
+                        config=cfg,
+                    )
             exc = ctx.exception
             _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL)
             self.assertIn("testnet submission uncertain", str(exc))
@@ -3464,10 +3480,13 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 raise foreign
 
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 factory failure",
-                    config=cfg, web3_factory=_boom,
-                )
+                # R3: the failing construction is injected by patching the
+                # gate's PRIVATE transport builder (test-only seam).
+                with patch.object(_gate, "_build_rpc_transport", _boom):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 factory failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
@@ -3487,10 +3506,11 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 f"connect() to {CRED_RPC_URL} timed out: unauthorized")
             w3 = _FailingW3(connect_exc=foreign)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 connectivity failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 connectivity failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
@@ -3508,10 +3528,11 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 f"provider {CRED_RPC_URL} reset the connection (401)")
             w3 = _FailingW3(chain_values=[foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 chain read failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 chain read failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
@@ -3530,10 +3551,11 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 "unauthorized")
             w3 = _FailingW3(nonce_exc=foreign)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 defaults failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 defaults failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
@@ -3553,10 +3575,11 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 f"{CRED_RPC_URL} dropped the connection before signing")
             w3 = _FailingW3(chain_values=[SEPOLIA, foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 pre-sign failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 pre-sign failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
@@ -3575,10 +3598,11 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
                 f"{CRED_RPC_URL} refused the pre-submission check: 401")
             w3 = _FailingW3(chain_values=[SEPOLIA, SEPOLIA, foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 pre-submit failure",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 pre-submit failure",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign,
                 classification="testnet RPC preflight failed",
@@ -3603,30 +3627,33 @@ class TestDirectRpcPreflightContainmentENG009(unittest.TestCase):
             w3 = _FailingW3()
             w3.is_connected = lambda: False
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 unreachable refusal",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 unreachable refusal",
+                        config=cfg,
+                    )
             self.assertEqual(str(ctx.exception),
                              "testnet RPC is not reachable")
 
             # initial chain read reports mainnet: the chain-policy refusal
             w3 = _FailingW3(chain_values=[MAINNET_CHAIN_ID])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 mainnet refusal",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 mainnet refusal",
+                        config=cfg,
+                    )
             self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
             self.assertNotIn("during", str(ctx.exception))
 
             # pre-sign recheck reports mainnet: same gate verdict
             w3 = _FailingW3(chain_values=[SEPOLIA, MAINNET_CHAIN_ID])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                sign_and_submit_testnet_tx(
-                    self._tx(sender), purpose="ENG-009 pre-sign mainnet",
-                    config=cfg, web3_factory=lambda url: w3,
-                )
+                with offline_transports(rpc=w3):
+                    sign_and_submit_testnet_tx(
+                        self._tx(sender), purpose="ENG-009 pre-sign mainnet",
+                        config=cfg,
+                    )
             self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
             self.assertNotIn("during", str(ctx.exception))
             self.assertEqual(w3.submitted, 0)
@@ -3684,15 +3711,19 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
             def _boom(url):
                 raise foreign
 
-            def _relay(url, auth, relay_url):
-                relay_calls.append(url)
+            def _relay(rpc_url, auth_account):
+                relay_calls.append(rpc_url)
                 return _RelayStub()
 
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare factory",
-                    config=cfg, web3_factory=_boom, relay_factory=_relay,
-                )
+                # R3: the failing constructions are injected by patching
+                # the gate's PRIVATE transport builders (test-only seam).
+                with patch.object(_gate, "_build_rpc_transport", _boom), \
+                        patch.object(_gate, "_build_relay_transport", _relay):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare factory",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign, stage="RPC provider initialization")
             self.assertEqual(relay_calls, [])  # relay transport never built
@@ -3708,11 +3739,11 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 f"connect() to {CRED_RPC_URL} timed out: unauthorized")
             w3 = _FailingW3(connect_exc=foreign)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare connectivity",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare connectivity",
+                        config=cfg,
+                    )
             self._assert_contained(ctx, foreign, stage="RPC connectivity check")
 
     def test_chain_id_read_failure_contained(self):
@@ -3722,11 +3753,11 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 f"provider {CRED_RPC_URL} reset the connection (401)")
             w3 = _FailingW3(chain_values=[foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare chain read",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare chain read",
+                        config=cfg,
+                    )
             self._assert_contained(ctx, foreign, stage="RPC chain-ID read")
 
     def test_transaction_defaults_failure_contained_before_custody(self):
@@ -3740,12 +3771,12 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 side_effect=AssertionError("wallet must never be decrypted"),
             ):
                 with self.assertRaises(TestnetSafetyError) as ctx:
-                    prepare_flashbots_bundle(
-                        self._txs(sender),
-                        purpose="ENG-009 prepare defaults failure",
-                        config=cfg, web3_factory=lambda url: w3,
-                        relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                    )
+                    with offline_transports(rpc=w3, relay=_RelayStub()):
+                        prepare_flashbots_bundle(
+                            self._txs(sender),
+                            purpose="ENG-009 prepare defaults failure",
+                            config=cfg,
+                        )
             self._assert_contained(
                 ctx, foreign, stage="RPC transaction-default read")
 
@@ -3756,11 +3787,11 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 f"{CRED_RPC_URL} dropped before bundle signing")
             w3 = _FailingW3(chain_values=[SEPOLIA, foreign])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare pre-sign",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare pre-sign",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign, stage="pre-sign chain verification")
 
@@ -3771,20 +3802,22 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 f"head query to {CRED_RPC_URL} returned 401")
             w3 = _FailingW3(head_exc=foreign)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare block read",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare block read",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign, stage="RPC block-number read")
 
-    def test_relay_factory_failure_contained(self):
-        """A failing relay factory must not expose credentials from EITHER
-        the configured RPC URL or the relay URL. The relay destination is
-        code-controlled policy: the test redirects the reviewed relay
-        constant (controlled mock) to a credential-bearing fake relay to
-        prove its material is contained."""
+    def test_relay_transport_construction_failure_contained(self):
+        """A failing relay transport construction must not expose
+        credentials from EITHER the configured RPC URL or the relay URL.
+        The relay destination is code-controlled policy: the test
+        redirects the reviewed relay constant (controlled mock) to a
+        credential-bearing fake relay to prove its material is contained.
+        R3: the failing construction is injected by patching the gate's
+        PRIVATE relay builder (test-only seam)."""
         with tempfile.TemporaryDirectory() as tmp, throwaway_store(
                 tmp, relay_url=CRED_RELAY_URL):
             info = _tmp_keystore(tmp)
@@ -3801,15 +3834,16 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 f"relay {CRED_RELAY_URL} rejected auth key "
                 f"{FAKE_RELAY_KEY} for {CRED_RPC_URL}: unauthorized")
 
-            def _boom(url, auth, relay_url):
+            def _boom(rpc_url, auth_account):
                 raise foreign
 
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 relay factory",
-                    config=cfg, web3_factory=lambda url: _FailingW3(),
-                    relay_factory=_boom,
-                )
+                with offline_transports(rpc=_FailingW3()), \
+                        patch.object(_gate, "_build_relay_transport", _boom):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 relay factory",
+                        config=cfg,
+                    )
             exc = ctx.exception
             self.assertIsNot(exc, foreign)
             _assert_exception_clean(self, exc, CRED_SECRET_MATERIAL_ALL)
@@ -3831,12 +3865,12 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
                 f"relay provider {CRED_RPC_URL} closed mid-verification")
             relay = _RelayStub(chain_values=[foreign], head=99)
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender),
-                    purpose="ENG-009 session verification",
-                    config=cfg, web3_factory=lambda url: _FailingW3(),
-                    relay_factory=lambda url, auth, relay_url: relay,
-                )
+                with offline_transports(rpc=_FailingW3(), relay=relay):
+                    prepare_flashbots_bundle(
+                        self._txs(sender),
+                        purpose="ENG-009 session verification",
+                        config=cfg,
+                    )
             self._assert_contained(
                 ctx, foreign, stage="session construction verification")
             # DSS-WO-ENG-015 §4: the attempt is audited as refused.
@@ -3852,11 +3886,11 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
             cfg, sender = self._cfg(tmp)
             w3 = _FailingW3(chain_values=[MAINNET_CHAIN_ID])
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    self._txs(sender), purpose="ENG-009 prepare mainnet",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        self._txs(sender), purpose="ENG-009 prepare mainnet",
+                        config=cfg,
+                    )
             self.assertIn("refuses Ethereum mainnet", str(ctx.exception))
             self.assertNotIn("during", str(ctx.exception))
 
@@ -3865,14 +3899,14 @@ class TestFlashbotsPreparationContainmentENG009(unittest.TestCase):
             w3 = _FailingW3()
             stranger = "0x" + "cc" * 20
             with self.assertRaises(TestnetSafetyError) as ctx:
-                prepare_flashbots_bundle(
-                    [{"to": stranger, "value": 10**15, "gas": 21000,
-                      "maxFeePerGas": 2 * 10**9,
-                      "maxPriorityFeePerGas": 10**9, "data": b""}],
-                    purpose="ENG-009 prepare policy refusal",
-                    config=cfg, web3_factory=lambda url: w3,
-                    relay_factory=lambda url, auth, relay_url: _RelayStub(),
-                )
+                with offline_transports(rpc=w3, relay=_RelayStub()):
+                    prepare_flashbots_bundle(
+                        [{"to": stranger, "value": 10**15, "gas": 21000,
+                          "maxFeePerGas": 2 * 10**9,
+                          "maxPriorityFeePerGas": 10**9, "data": b""}],
+                        purpose="ENG-009 prepare policy refusal",
+                        config=cfg,
+                    )
             self.assertIn("no arbitrary EOA transfers", str(ctx.exception))
             self.assertNotIn("during", str(ctx.exception))
 

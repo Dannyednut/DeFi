@@ -47,7 +47,11 @@ Flow for each Opportunity:
   9. Log result + audit record
 
 Thread safety: ArbExecutor is designed for single-threaded use within
-process_block(). Nonce is fetched fresh per execution via "pending" tag.
+process_block(). The ExecutionRouter runs exactly ONE execution worker
+(async_workers is clamped to 1), so signing/submission is deliberately
+SERIAL and each transaction's nonce is fetched fresh from the RPC
+("pending" tag) at build time — no concurrent nonce race exists and no
+nonce-reservation layer is needed (DSS-WO-ENG-017 §3B).
 """
 from __future__ import annotations
 
@@ -156,6 +160,65 @@ class ArbExecutor:
             log.warning("ArbExecutor: no arb_exec_address configured — execution disabled")
 
     # ── enforcement helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _validated_profit_wei(opp: Opportunity) -> int | None:
+        """Resolve the canonical token-denominated profit floor.
+
+        Missing-versus-invalid semantics mirror
+        ``optimizer.opportunity_economics.enrich`` exactly: a dict lookup
+        with a default only falls back when the key is ABSENT, so an
+        explicitly present zero, negative or non-numeric value is INVALID
+        evidence and fails closed — it is never silently replaced by
+        another value that would weaken validation (DSS-WO-ENG-017 §2).
+
+        Precedence (all tokenIn-denominated base units):
+          1. ``validated_profit_floor_wei`` — the canonical validator's
+             quote-retention floor (present → must be a positive integer);
+          2. ``quote_profit_wei`` — the permitted positive validated quote
+             fallback, used only when the floor key is genuinely absent;
+          3. ``simulation_profit_wei`` — the detector's own token-
+             denominated simulation profit, the enrichment chain's last
+             evidence tier.
+
+        Returns ``None`` when execution must not proceed (missing or
+        invalid evidence → fail closed).
+        """
+        meta = opp.metadata or {}
+        if "validated_profit_floor_wei" in meta:
+            raw = meta["validated_profit_floor_wei"]
+        elif "quote_profit_wei" in meta:
+            raw = meta["quote_profit_wei"]
+        else:
+            raw = opp.simulation_profit_wei or 0
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _contract_min_profit(meta_min_profit: object, validated_floor_wei: int) -> int:
+        """Resolve the contract-level ``ArbData.minProfit``.
+
+        The canonical validated floor is ALWAYS the authoritative minimum.
+        The one retained stricter value is the detector's metadata
+        ``min_profit``: CycleDetector writes its estimated gas cost there
+        in tokenIn base units ONLY when tokenIn is the chain's wrapped
+        native (otherwise 0), so its origin and token denomination are
+        verified (DSS-WO-ENG-017 §2.7). A malformed value is ignored
+        rather than trusted; a smaller value never lowers the floor.
+        """
+        try:
+            stricter = int(meta_min_profit) if meta_min_profit is not None else 0
+        except (TypeError, ValueError):
+            log.debug(
+                "ignoring non-integer metadata min_profit=%r — the "
+                "validated floor stays the contract minimum",
+                meta_min_profit,
+            )
+            stricter = 0
+        return max(stricter, int(validated_floor_wei))
 
     @staticmethod
     def _refused_result(error: str) -> ExecutionResult:
@@ -317,44 +380,51 @@ class ArbExecutor:
             log.debug("Skipping: missing token_in or pools")
             return None
 
+        # ── Authoritative validated profit floor (DSS-WO-ENG-017 §2) ──────────
+        # ONE consistent policy for ordinary and mempool candidates alike:
+        # the canonical validation evidence is the only source of the
+        # contract-level minimum, and missing or invalid evidence fails
+        # closed here — before any transaction is built, signed or
+        # submitted. minProfit is compared by Exec.sol against the cycle
+        # profit denominated in the BORROWED tokenIn's base units
+        # (contracts/Exec.sol `NoProfit` checks); the values below are
+        # token-denominated and must never be replaced by native-currency
+        # gas figures.
+        validated_floor_wei = self._validated_profit_wei(opp)
+        if validated_floor_wei is None:
+            log.debug(
+                "Skipping: no positive validated profit floor "
+                "(validated_profit_floor_wei/quote_profit_wei absent or "
+                "invalid — failing closed)"
+            )
+            return [None] * 4 if for_batch else None
+
         if from_mempool:
             # ── Step 2: Lender selection ──────────────────────────────────────────
             amount_in = 0
             lender = select_lender(self.w3, self.chain_id, token_in, amount_in, for_mempool=True)
 
             # Authoritative validated profit for a promoted mempool candidate
-            # (DSS-WO-ENG-016 §3A). PendingOpportunity.to_opportunity()
-            # emits NO executor economics — the value only exists once the
-            # canonical pipeline promoted the candidate
-            # (OpportunityEngine.process_candidates → validate_many →
-            # enrich): the validated profit floor (the contract-quote
-            # retention floor), with the validated quote itself as the only
-            # fallback — the SAME precedence the canonical economics
-            # enrichment (optimizer.opportunity_economics.enrich) uses.
-            # There is no invented fallback and no silent zero: a candidate
-            # without a positive validated profit fails closed here.
-            validated_profit_wei = int(
-                meta.get("validated_profit_floor_wei")
-                or meta.get("quote_profit_wei")
-                or 0
-            )
-            if validated_profit_wei <= 0:
-                log.debug(
-                    "Skipping mempool candidate: no validated profit "
-                    "(validated_profit_floor_wei/quote_profit_wei absent "
-                    "or non-positive)"
-                )
-                return [None] * 4 if for_batch else None
-            profit_wei = validated_profit_wei
+            # (DSS-WO-ENG-016 §3A, unit policy DSS-WO-ENG-017 §2).
+            # PendingOpportunity.to_opportunity() emits NO executor
+            # economics — the value only exists once the canonical pipeline
+            # promoted the candidate (OpportunityEngine.process_candidates →
+            # validate_many → enrich): the validated profit floor (the
+            # contract-quote retention floor), resolved with the SAME
+            # missing-vs-invalid precedence as the canonical economics
+            # enrichment (optimizer.opportunity_economics.enrich) by
+            # _validated_profit_wei above. There is no invented fallback and
+            # no silent zero: a candidate without a positive validated
+            # profit fails closed before anything is built.
+            profit_wei = validated_floor_wei
 
             # The validated profit floor is also the contract-level guard
             # (ArbData.minProfit): ArbExec.swap() reverts unless the actual
             # profit reaches it, so a promoted candidate can execute with
             # the validator's controlled quote-drift allowance but never
-            # unprofitably. (A later successful Flashbots simulation
-            # refreshes minProfit from the fresher simulation economics,
-            # exactly as it does on the ordinary path.)
-            min_profit = max(int(min_profit or 0), profit_wei)
+            # unprofitably. A later successful Flashbots simulation never
+            # overwrites or weakens this floor (DSS-WO-ENG-017 §2).
+            min_profit = self._contract_min_profit(min_profit, profit_wei)
 
             arb_data = build_arb_data(
                 ad_tuple=ad_tuple,
@@ -399,13 +469,20 @@ class ArbExecutor:
             lender = select_lender(self.w3, self.chain_id, token_in, amount_in)
             log.debug(f"Lender: {lender.lender_name} mode={lender.mode}")
 
-            # ── Step 3: Profit gate ───────────────────────────────────────────────
+            # ── Step 3: Profit gate ─────────────────────────────────────────────────
             if not is_profitable_after_gas(
                 profit_wei, token_in, gas_cost_usd,
                 min_profit_usd=max(MIN_PROFIT_USD, MIN_EXECUTION_PROFIT_USD),
             ):
                 log.debug(f"Skipping: profit below gas threshold (gas=${gas_cost_usd:.3f})")
                 return None
+
+            # ── Step 3b: validated-floor contract guard (DSS-WO-ENG-017 §2) ──────
+            # Ordinary opportunities get the SAME validated-floor protection
+            # as mempool backruns: the canonical validated floor (resolved
+            # once above, before either branch) is the authoritative
+            # contract-level minimum for the ordinary path too.
+            min_profit = self._contract_min_profit(min_profit, validated_floor_wei)
 
             # ── Step 4: Build ArbData ─────────────────────────────────────────────
             # for external flash loans (mode 0), borrowPool is ignored by contract
@@ -440,7 +517,22 @@ class ArbExecutor:
 
             log.debug(f"Simulation success | gas_used={sim_result.get('gas_used')} gas_fee_wei={sim_result.get('gas_fee_wei')}")
 
-            arb_data["minProfit"] = int(sim_result.get("gas_fee_wei", 0) * 1.2)  # increase minProfit to account for simulation uncertainty
+            # DSS-WO-ENG-017 §2: a successful Flashbots simulation must NOT
+            # overwrite or weaken the validated profitability floor.
+            #   * sim_result["gas_fee_wei"] (Flashbots gasFees) is NATIVE-
+            #     currency wei — ArbData.minProfit is compared by Exec.sol
+            #     against profit denominated in the BORROWED tokenIn's base
+            #     units. The two denominations are unrelated, so a gas fee
+            #     must never be assigned to minProfit (it could weaken the
+            #     guard below the floor or harden it into a guaranteed
+            #     revert above the simulated profit).
+            #   * The simulation runs the REAL contract with minProfit =
+            #     validated floor, so success itself proves the simulated
+            #     profit reaches the floor (Exec.sol reverts otherwise).
+            #   * Simulation gas economics stay in the off-chain
+            #     economics/profitability assessment
+            #     (is_profitable_after_gas / execution_economics); only the
+            #     gas LIMIT estimate is refined from the measured gas_used.
             gas_units = sim_result.get("gas_used", gas_units)
 
         if for_batch:

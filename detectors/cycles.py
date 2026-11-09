@@ -339,6 +339,15 @@ class CycleDetector(BaseDetector):
                     "profit_wei":         token_profit_raw,
                     "profit_unit":        profit_unit,
                     "gas_units":          DEFAULT_GAS_UNITS * gas_multiplier,
+                    # ESTIMATED GAS COST, denominated in tokenIn base units
+                    # ONLY because it is forced to 0 unless the root (borrowed)
+                    # token IS the chain's wrapped native — native wei and
+                    # tokenIn wei are then the same unit. For any other root
+                    # token this stays 0: a native-currency gas figure must
+                    # never be assigned to a token-denominated
+                    # ArbData.minProfit (DSS-WO-ENG-017 §2). Gas economics
+                    # otherwise live off-chain (is_profitable_after_gas /
+                    # execution_economics).
                     "min_profit":         gas_wei,
                     "root_token":         root_token,
                     "arb_data":           ad_tuple,            # ← NEW: sorted ArbData for executor

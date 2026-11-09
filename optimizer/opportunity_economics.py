@@ -21,11 +21,22 @@ def enrich(opp: Opportunity, *, cfg: EconomicsConfig | None = None,
            native_price_usd: float = NATIVE_PRICE_USD) -> Opportunity:
     cfg = cfg or EconomicsConfig()
     meta = dict(opp.metadata or {})
-    gas_units = int(meta.get("validated_gas_units", meta.get("gas_units", cfg.default_gas_units)))
-    gas_price_wei = int(meta.get("gas_price_wei", max(0, int(cfg.default_gas_price_gwei * 1e9))))
-    gross_token = int(meta.get("validated_profit_floor_wei", meta.get("quote_profit_wei", opp.simulation_profit_wei or 0)))
+    # Missing-vs-invalid (DSS-WO-ENG-017 §2): dict.get(key, default) only
+    # falls back when the key is ABSENT, so an explicitly present zero or
+    # negative floor/quote stays the resolved value and the non-positive
+    # guard below fails closed (no economics attached → the opportunity
+    # never becomes execution-ready). A NON-NUMERIC value is invalid, not
+    # absent: it must not crash the whole pipeline, so it is treated the
+    # same way — no economics, fail closed.
+    try:
+        gross_token = int(meta.get("validated_profit_floor_wei", meta.get("quote_profit_wei", opp.simulation_profit_wei or 0)))
+    except (TypeError, ValueError):
+        return opp
     if gross_token <= 0:
         return opp
+
+    gas_units = int(meta.get("validated_gas_units", meta.get("gas_units", cfg.default_gas_units)))
+    gas_price_wei = int(meta.get("gas_price_wei", max(0, int(cfg.default_gas_price_gwei * 1e9))))
 
     profit_token = meta.get("root_token") or (opp.tokens[0] if opp.tokens else "")
     p_decimals = int(token_decimals(profit_token)) if profit_token else 18

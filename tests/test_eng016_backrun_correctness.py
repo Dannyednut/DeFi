@@ -17,8 +17,11 @@ for mempool/backrun execution.
   - a candidate without a positive validated profit fails closed
     (no invented fallback, no silent zero, nothing built/signed/
     submitted);
-  - a successful Flashbots simulation refreshes minProfit from the
-    fresher simulation economics exactly as on the ordinary path;
+  - a successful Flashbots simulation does NOT overwrite or weaken the
+    validated floor (DSS-WO-ENG-017 §2 — the simulation's gas_fee_wei
+    is native-currency wei while minProfit is tokenIn-denominated, and
+    a successful simulation of the real contract already proves the
+    simulated profit reaches the floor);
   - the batch-preparation shape of the skip stays unpack-safe.
 
 §3B Preflight skip and audit handling
@@ -182,10 +185,14 @@ class TestMempoolExecutionPreparation(_EnabledExecutorTestMixin, unittest.TestCa
         self.sign.assert_called_once()
         self.relay.assert_called_once()
 
-    def test_validated_quote_used_when_floor_absent(self):
-        """The validated quote is the only fallback — same precedence as
-        the canonical economics enrichment."""
-        opp = _mempool_opp({"validated_profit_floor_wei": 0})
+    def test_validated_quote_used_when_floor_genuinely_absent(self):
+        """The validated quote is the only fallback — and only when the
+        floor key is GENUINELY ABSENT (same missing-vs-invalid precedence
+        as the canonical economics enrichment; DSS-WO-ENG-017 §2)."""
+        meta = _mempool_opp().metadata
+        del meta["validated_profit_floor_wei"]  # key absent, not zero
+        opp = _mempool_opp()
+        opp.metadata = dict(meta)
         result = self.executor.submit(opp)
         self.assertIsNotNone(result)
         self.assertEqual(result.profit_wei, VALIDATED_QUOTE_WEI)
@@ -243,17 +250,18 @@ class TestMempoolExecutionPreparation(_EnabledExecutorTestMixin, unittest.TestCa
         prepared = self.executor._execute(opp, for_batch=True)
         self.assertEqual(prepared, [None] * 4)
 
-    def test_successful_simulation_refreshes_min_profit(self):
+    def test_successful_simulation_never_changes_min_profit(self):
         """With the Flashbots path armed, a successful pre-submission
-        simulation refreshes minProfit from the fresher simulation
-        economics (gas fee + 20% headroom) — exactly as on the ordinary
-        path — while the validated profit stays authoritative for the
-        result."""
+        simulation does NOT overwrite or weaken the contract guard:
+        minProfit stays the canonical validated floor (DSS-WO-ENG-017 §2
+        — the simulation's gas_fee_wei is native-currency wei, not
+        tokenIn-denominated, so it must never be assigned to minProfit),
+        while the measured gas_used still refines the gas-limit estimate."""
         self.executor.use_flashbots = True
         sim = {
             "success": True,
             "gas_used": 240_000,
-            "gas_fee_wei": 500_000_000_000_000,  # 0.0005 ETH
+            "gas_fee_wei": 500_000_000_000_000,  # 0.0005 native wei
             "target_block": 101,
             "target_raw_tx": None,
         }
@@ -263,9 +271,12 @@ class TestMempoolExecutionPreparation(_EnabledExecutorTestMixin, unittest.TestCa
         self.assertIsNotNone(result)
         self.assertTrue(result.success)
         sim_mock.assert_called_once()
-        # Simulation refreshes the contract guard: gas_fee_wei * 1.2.
+        # The contract guard is UNCHANGED: still the validated floor —
+        # never gas_fee_wei * 1.2, never any other simulation figure.
         arb_data = self.build_tx.call_args.kwargs["arb_data"]
-        self.assertEqual(arb_data["minProfit"], int(500_000_000_000_000 * 1.2))
+        self.assertEqual(arb_data["minProfit"], VALIDATED_FLOOR_WEI)
+        # The gas-limit estimate IS refined from the measured gas_used.
+        self.assertEqual(self.build_tx.call_args.kwargs["gas_units"], 240_000)
         # The validated floor remains the reported profit value.
         self.assertEqual(result.profit_wei, VALIDATED_FLOOR_WEI)
 

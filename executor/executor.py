@@ -32,6 +32,12 @@ Flow for each Opportunity:
   2. Extract arb_data and optimal_amount_in from metadata
      - 2-pool: arb_data comes from getProfit() via simulate_cycle()
      - 3+ pool: build arb_data from raw opp fields + golden section amount
+     - mempool: amountIn=0 (the contract computes its optimal borrow);
+       profit_wei is the canonical validated profit stamped by the
+       pipeline (validated_profit_floor_wei → quote_profit_wei — the
+       same precedence as the canonical economics enrichment) and it is
+       also the contract-level minProfit guard; a candidate without a
+       positive validated profit fails closed (DSS-WO-ENG-016 §3A)
   3. Refine optimal amount off-chain (may improve on on-chain estimate)
   4. Select lender (Aave → Balancer → pool flash swap)
   5. Profit gate: verify net profit > gas cost + min threshold
@@ -160,21 +166,31 @@ class ArbExecutor:
             amount_in=0, profit_wei=0, gas_cost_usd=0.0, error=error,
         )
 
-    def _audit(self, purpose: str, result: ExecutionResult, target: str | None = None) -> None:
+    def _audit(self, purpose: str, result: ExecutionResult | None, target: str | None = None) -> None:
         """Append one attempt/outcome record to the execution audit log.
 
         Attempts in an ENABLED execution context are always accounted for —
-        successful, refused, failed and uncertain alike. Refusals that
-        happen because the master switch is DISABLED keep the historical
-        disabled-run behaviour: nothing is written, nothing executes, and
-        the refusal is still visible in the returned result and the log
-        stream.
+        successful, refused, failed and uncertain alike — and so are
+        ordinary preflight skips, recorded as the distinct outcome
+        "skipped": the opportunity was rejected before any execution
+        attempt, so nothing was built, signed or submitted (DSS-WO-ENG-016
+        §3B — this must never raise, and it never masks the actual
+        execution outcome). Refusals that happen because the master switch
+        is DISABLED keep the historical disabled-run behaviour: nothing is
+        written, nothing executes, and the refusal is still visible in the
+        returned result and the log stream.
         """
         if not execution_enabled():
             return
-        outcome = "refused" if result.method == "refused" else (
-            "success" if result.success else "failed"
-        )
+        if result is None:
+            # Preflight skip: rejected/skipped before any execution
+            # attempt. Distinct from "refused" (an attempt the policy
+            # blocked) and "failed" (an attempt that errored).
+            outcome = "skipped"
+        elif result.method == "refused":
+            outcome = "refused"
+        else:
+            outcome = "success" if result.success else "failed"
         try:
             execution_audit.record_execution(
                 purpose=purpose,
@@ -183,9 +199,9 @@ class ArbExecutor:
                 function=None,
                 estimated_gas=None,
                 actual_gas_used=None,
-                tx_hash=result.tx_hash or None,
+                tx_hash=(result.tx_hash or None) if result is not None else None,
                 outcome=outcome,
-                error=result.error or None,
+                error=(result.error or None) if result is not None else None,
                 max_fee_exposure_wei=None,
             )
         except Exception as exc:  # auditing must never mask the outcome
@@ -200,7 +216,23 @@ class ArbExecutor:
         """
         Attempt to execute an arbitrage opportunity.
 
-        Returns ExecutionResult on attempt, None if skipped (pre-flight fail).
+        Outcome taxonomy (DSS-WO-ENG-016 §3B — four distinct categories,
+        never conflated):
+          * None                      — the opportunity was rejected or
+                                        skipped BEFORE any execution attempt
+                                        (preflight: no route, no viable
+                                        amount/profit, failed simulation);
+                                        nothing was built, signed or
+                                        submitted;
+          * ExecutionResult(method="refused") — an attempt the policy
+                                        REFUSED (master switch, builder
+                                        policy, signer or relay gate);
+          * ExecutionResult(success=False)    — an attempt that FAILED
+                                        (build/sign/submit error, or an
+                                        on-chain revert);
+          * ExecutionResult(success=True)     — a successful or still
+                                        uncertain submission outcome.
+
         The master execution switch is checked at this boundary; the signer
         and the relay check it again independently at theirs.
         """
@@ -290,6 +322,40 @@ class ArbExecutor:
             amount_in = 0
             lender = select_lender(self.w3, self.chain_id, token_in, amount_in, for_mempool=True)
 
+            # Authoritative validated profit for a promoted mempool candidate
+            # (DSS-WO-ENG-016 §3A). PendingOpportunity.to_opportunity()
+            # emits NO executor economics — the value only exists once the
+            # canonical pipeline promoted the candidate
+            # (OpportunityEngine.process_candidates → validate_many →
+            # enrich): the validated profit floor (the contract-quote
+            # retention floor), with the validated quote itself as the only
+            # fallback — the SAME precedence the canonical economics
+            # enrichment (optimizer.opportunity_economics.enrich) uses.
+            # There is no invented fallback and no silent zero: a candidate
+            # without a positive validated profit fails closed here.
+            validated_profit_wei = int(
+                meta.get("validated_profit_floor_wei")
+                or meta.get("quote_profit_wei")
+                or 0
+            )
+            if validated_profit_wei <= 0:
+                log.debug(
+                    "Skipping mempool candidate: no validated profit "
+                    "(validated_profit_floor_wei/quote_profit_wei absent "
+                    "or non-positive)"
+                )
+                return [None] * 4 if for_batch else None
+            profit_wei = validated_profit_wei
+
+            # The validated profit floor is also the contract-level guard
+            # (ArbData.minProfit): ArbExec.swap() reverts unless the actual
+            # profit reaches it, so a promoted candidate can execute with
+            # the validator's controlled quote-drift allowance but never
+            # unprofitably. (A later successful Flashbots simulation
+            # refreshes minProfit from the fresher simulation economics,
+            # exactly as it does on the ordinary path.)
+            min_profit = max(int(min_profit or 0), profit_wei)
+
             arb_data = build_arb_data(
                 ad_tuple=ad_tuple,
                 opp_tokens=list(tokens),
@@ -300,7 +366,7 @@ class ArbExecutor:
                 mode=lender.mode,
                 min_profit=min_profit,
             )
-            log.info(f"Executing mempool arb | lender={lender.lender_name} mode={lender.mode} token_in={token_in} hops={hop_count}")
+            log.info(f"Executing mempool arb | lender={lender.lender_name} mode={lender.mode} token_in={token_in} hops={hop_count} profit_wei={profit_wei}")
         else:
             # ── Step 1: Determine optimal amount ─────────────────────────────────
             on_chain_amount = int(ad_tuple[0]) if ad_tuple else 0

@@ -109,7 +109,7 @@ Baseline scope then: 23 failed / 86 passed / 1 error; CI scope: 22 failed / 86 p
 ### Excluded / gated tests (current state after ENG-003 + PR #2 gate work)
 | Test | Status |
 | --- | --- |
-| tests/test_flashbots_integration.py | **Rewritten in ENG-003 (Workstream B, PR #1)** and NO LONGER excluded: the old module-level `PRIVATE_KEY`/signing/broadcast-at-import script is gone. The file now collects safely, never touches keys or network at import, and both live phases skip visibly without `DSS_TESTNET_FLASHBOTS_LIVE=1` + `DSS_TESTNET_RPC_URL` + the agent keystore. Submission additionally requires `DSS_TESTNET_EXEC=1`. Since ENG-004 (PR #2) the test is routed through the unified execution gate (`executor/testnet_gate.py`) — the single wallet/authorization path; the relay is a transport only. Chain-ID gate (mainnet always refused, unknown chains fail closed) is unit-tested offline. CI can never sign, broadcast or submit through it. |
+| tests/test_flashbots_integration.py | **Rewritten in ENG-003 (Workstream B, PR #1)** and NO LONGER excluded: the old module-level `PRIVATE_KEY`/signing/broadcast-at-import script is gone. The file now collects safely, never touches keys or network at import, and both live phases skip visibly without `DSS_TESTNET_FLASHBOTS_LIVE=1`. Since DSS-WO-ENG-015 R4 the test is routed through the retained Builder → Signer → Relay path gated by the EXECUTE_ONCHAIN master switch (the retired `executor/testnet_gate.py` / `DSS_TESTNET_EXEC` no longer exist). Chain-ID gate (mainnet always refused, unknown chains fail closed) is unit-tested offline. CI can never sign, broadcast or submit through it. |
 | tests/test_multicall3_yieldout.py::test_run_multicall3_batch_yieldOut | Still excluded from CI: requires a local artifact from a live run (`logs/pending_opportunities.jsonl`) before it even dials `https://0xrpc.io/eth`; fails on a clean clone with "No cycles to test." Classified network/environment-dependent; candidate for the same gated rewrite later. |
 | tests/test_optimizer.py (live diagnostic portion) | The offline tests always run; the preserved manual live diagnostic skips visibly unless `DSS_LIVE_OPTIMIZER_DIAG=1`. |
 
@@ -175,3 +175,48 @@ testnet signing operation; the Flashbots relay is a transport only:
   PR #1 and are gone after merging `main`; the integrated branch passes
   the corrected baseline. All PR #2 additions (ENG-004 through ENG-011)
   pass.
+
+## 10. DSS-WO-ENG-016 — canonical runtime path reconciliation (PR #3)
+
+One coherent, correctly validated execution path for ordinary and
+mempool-backrun opportunities; the unused alternative orchestration is
+retired with call-site evidence (repository-wide import/call audit):
+
+- **Retired — `executor/mev_execution.py`** (MEVExecutionService): zero
+  production callers (only a structural signature test referenced it).
+  It was an alternative orchestration layer that signed a
+  caller-supplied unsigned transaction dict directly, bypassing the
+  builder's transaction policy. Promotion, validation, simulation and
+  routing already happen in the canonical path
+  (OpportunityEngine → ExecutionRouter → ArbExecutor → Builder → Signer
+  → Relay).
+- **Retired — `mev/models.py`, `mev/simulator.py`, `mev/inclusion.py`:**
+  after the orchestration retirement these had no production consumers
+  (tests + package re-exports only). The canonical simulation paths are
+  `validation/opportunity.py` (eth_call/estimateGas), the adversarial
+  simulator and `executor/relay.simulate_bundle`. The orphaned
+  inclusion-bid arithmetic (`BidConfig`/`BidResult`/`BidOptimizer` in
+  `optimizer/execution_economics.py`) was removed with its only
+  consumer.
+- **Retained — `mev/policy.py`:** production consumer is
+  `executor/relay.py` (ChainMEVPolicy gates private bundle submission).
+- **Retired — `mempool/engine.py`:** the pipeline instantiated
+  MempoolOpportunityEngine but never called any method; classification
+  and execution gating happen in the canonical path. The unused
+  `PendingObservation` import went with it.
+- **Retained (inactive, out of scope):** `mempool/reorg.py`
+  (TriggerTracker), `executor/relay_registry.py`, `executor/nonce_manager.py`
+  have no current production callers but are not part of the named
+  reconciliation scope; disposition deferred to a future work order.
+- **Corrected runtime defects (regression-covered in
+  `tests/test_eng016_backrun_correctness.py` and `tests/test_relay.py`):**
+  mempool execution profit handling (validated-profit fail-closed + the
+  contract-level minProfit guard), preflight-skip audit handling
+  (distinct `skipped` audit outcome, no AttributeError in enabled
+  contexts), and the Flashbots final chain-identity recheck immediately
+  before `send_bundle` (parity with the direct route).
+- **Lower-priority opportunities (§6):** non-streaming opportunities are
+  not queued and not batch-processed — they remain tracked only. The
+  misleading router comment claiming batch pickup was corrected; the
+  dormant `Exec.multiCall` batch path (independent per-call failure —
+  not atomic) was NOT re-enabled.

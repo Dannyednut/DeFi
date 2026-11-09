@@ -268,9 +268,17 @@ class ExecutionRouter:
                 log.warning("[ROUTER] Execution queue full, skipping streaming")
                 return False
         
-        # Lower priority = will be processed in batch at end of block
-        # Just mark as eligible for batch execution
-        return False  # Not queued, but may be picked up by batch processor
+        # Lower priority (non-streaming) opportunities are NOT queued and
+        # NOT batch-processed: nothing in the runtime picks them up for
+        # execution (main.process_block routes every ready opportunity
+        # through submit_opportunity and never calls the batch method;
+        # the legacy Exec multiCall batch path is deliberately dormant —
+        # its individual call-failure behaviour is not equivalent to
+        # atomic batch execution, DSS-WO-ENG-016 §6). They remain tracked
+        # only (lifecycle/logging via tracker.process_block). Returning
+        # False states that disposition honestly: the opportunity was not
+        # accepted for execution.
+        return False
     
     def submit_batch_opportunities(
         self, 
@@ -281,6 +289,14 @@ class ExecutionRouter:
         """
         Submit multiple opportunities for batch execution.
         Returns list of opportunities that were NOT executed (for tracking).
+
+        DSS-WO-ENG-016 §6: this method currently has NO production caller —
+        main.process_block routes every ready opportunity through
+        submit_opportunity() only. The Exec.multiCall batch path it drives
+        is deliberately dormant: multiCall applies calls independently, so
+        one failed call does not revert the others — that is not atomic
+        batch execution. Do not re-enable it as the disposition of
+        lower-priority opportunities without a deliberate safety review.
         """
         if not self.execute_onchain or not opps:
             return opps

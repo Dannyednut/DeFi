@@ -26,7 +26,7 @@ component is load-bearing alone.
 | `EXECUTE_ONCHAIN` is the SINGLE master execution switch; disabled by default | `config.execution_enabled()` — the authoritative read of the REAL process environment at operation time; there is no second switch and no parameter that can override it |
 | The decision is checked at the actual operation boundaries | router (`execute_onchain` property re-evaluated at every access), executor (`submit`/`submit_batch`), signer (before any signing), relay (before any broadcast) |
 | `CHAIN_ID` is the configured network identity | `config.CHAIN_ID`; the executor is constructed per configured chain |
-| Chain identity verified before signing AND immediately before broadcasting | `executor.signer.check_chain_identity` (twice: pre-sign and immediately pre-sign) and `executor.relay` (entry + immediate pre-broadcast recheck) |
+| Chain identity verified before signing AND immediately before broadcasting | `executor.signer.check_chain_identity` (twice: pre-sign and immediately pre-sign) and `executor.relay` (entry + immediate pre-broadcast recheck on BOTH routes — direct send and Flashbots bundle submission, DSS-WO-ENG-016 §3C) |
 | The unsigned transaction's `chainId` must equal the expected chain | signer refuses otherwise |
 | The signed payload must originate from the approved signing process | relay decodes the signed envelope (strict self-contained RLP decoder), checks the consensus chainId and recovers the signer — a payload not signed by the recorded agent identity is refused |
 | ONE wallet-loading path | `executor.signer.load_wallet` — v3 keystore + hex-encoded passphrase + recorded-address identity binding; no second signer, no fallback, no wallet generation |
@@ -38,7 +38,7 @@ component is load-bearing alone.
 | Unsupported chain / missing profile / missing fee policy / missing recipient → fail closed | no permissive default is ever invented |
 | A failed private submission never falls back to the public mempool | `executor.relay` private path is fail-closed; the chain-specific MEV policy (`mev.policy.ChainMEVPolicy`) gates atomic backruns |
 | No transaction access lists | builder refuses any supplied accessList; the signed-payload decoder independently refuses a non-empty EIP-1559 access list |
-| Every attempt audited — success, refusal, failure or uncertain | `logs/execution_audit.jsonl` (gitignored); error text sanitized; credentials and raw signed transaction bytes never recorded |
+| Every attempt audited — success, refusal, failure, uncertain or preflight skip | `logs/execution_audit.jsonl` (gitignored); error text sanitized; credentials and raw signed transaction bytes never recorded; ordinary preflight skips are recorded as the distinct outcome `skipped` in enabled contexts (DSS-WO-ENG-016 §3B) |
 | Shared RPC provider stays read/write | `utils/rpc_manager.py` is NOT restricted: the executor uses its supplied provider for legitimate operations; all signing/submission flows exclusively through signer + relay (structurally tested) |
 
 ## 2. Chain-aware fee-exposure policy

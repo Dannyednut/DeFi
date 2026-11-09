@@ -294,7 +294,17 @@ class MempoolPipeline:
         Split out of _process_tx so it can run as a background task (see the
         note on self._validation_tasks in __init__) instead of serializing
         the mempool consumer loop behind each candidate's RPC round-trips.
+
+        DSS-WO-ENG-017 §7: every significant candidate is recorded in the
+        recent-pending dashboard and the research log REGARDLESS of whether
+        its promotion/validation succeeds — the previously mis-indented
+        block only ran on exception, so the dashboard showed only FAILED
+        promotions and a promoted-and-queued candidate was invisible there.
+        A candidate that is NOT accepted for execution is visible as such:
+        the router's refusal is logged by the router and the candidate is
+        never reported as queued or executed when it was not.
         """
+        promoted: list = []
         try:
             tracker_opp = opp.to_opportunity(int(self._w3.eth.chain_id), current_block, graph=self._graph)
             # Mempool reserve math is discovery/shadow evidence only. The
@@ -302,8 +312,6 @@ class MempoolPipeline:
             if self._opportunity_engine is not None:
                 result = self._opportunity_engine.process_candidates([tracker_opp], current_block)
                 promoted = list(result.ready)
-            else:
-                promoted = []
             self._tracker.process_block(current_block, promoted, filled_pools={})
             if self._router and promoted:
                 for ready in promoted:
@@ -311,28 +319,28 @@ class MempoolPipeline:
         except Exception as e:
             log.error(f"Promotion/validation failed for {opp.opp_type} candidate: {e}", exc_info=True)
 
-            # Add to recent list
-            self._recent_pending.append(opp)
-            if len(self._recent_pending) > self._max_recent:
-                self._recent_pending.pop(0)
+        # Dashboard + research visibility for EVERY significant candidate.
+        self._recent_pending.append(opp)
+        if len(self._recent_pending) > self._max_recent:
+            self._recent_pending.pop(0)
 
-            if self._simulated_count % 50 == 0:
-                log.info(f"SIMULATOR HEARTBEAT | {self._simulated_count} txs simulated | {self._opps_found} opps found")
+        if self._simulated_count % 50 == 0:
+            log.info(f"SIMULATOR HEARTBEAT | {self._simulated_count} txs simulated | {self._opps_found} opps found")
 
+        if opp.estimated_profit_usd > 0:
+            profit_str = f"${opp.estimated_profit_usd:.4f}"
+        elif opp.profit_token_symbol:
+            profit_str = f"{opp.profit_in_token:.4g} {opp.profit_token_symbol}"
+        else:
+            profit_str = "N/A"
 
-            if opp.estimated_profit_usd > 0:
-                profit_str = f"${opp.estimated_profit_usd:.4f}"
-            elif opp.profit_token_symbol:
-                profit_str = f"{opp.profit_in_token:.4g} {opp.profit_token_symbol}"
-            else:
-                profit_str = "N/A"
-
-            log.research(
-                f"PENDING OPP | {opp.opp_type} | "
-                f"trigger={opp.trigger_tx_hash[:10]} | "
-                f"impact={opp.price_impact_pct:.3f}% | "
-                f"est_profit={profit_str}"
-            )
+        log.research(
+            f"PENDING OPP | {opp.opp_type} | "
+            f"trigger={opp.trigger_tx_hash[:10]} | "
+            f"impact={opp.price_impact_pct:.3f}% | "
+            f"est_profit={profit_str} | "
+            f"promoted={len(promoted)}"
+        )
 
     async def _stats_ticker(self) -> None:
         """Periodic heartbeat and Alpha Bot list refresh."""

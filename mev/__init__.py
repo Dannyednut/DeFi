@@ -11,6 +11,6 @@ canonical runtime path
     OpportunityEngine.process_candidates → ExecutionRouter →
     ArbExecutor → Builder → Signer → Relay
 """
-from .policy import ChainMEVPolicy, RelayTarget
+from .policy import ChainMEVPolicy
 
-__all__ = ["ChainMEVPolicy", "RelayTarget"]
+__all__ = ["ChainMEVPolicy"]

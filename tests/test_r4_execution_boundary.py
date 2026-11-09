@@ -544,6 +544,13 @@ RETIRED_SYMBOLS = (
     "TxFeeModel", "BidPolicy", "InclusionEstimate",
     "MempoolOpportunityEngine", "PendingObservation",
     "BackrunCandidate", "mev_execution",
+    # DSS-WO-ENG-017 §3/§4 — retired unintegrated utilities and dormant
+    # duplicates (evidence-backed dispositions in docs/DEPENDENCIES.md §11):
+    "NonceManager", "nonce_manager",
+    "RelayRegistry", "RelayEndpoint",
+    "TriggerTracker", "mempool/reorg",
+    "ProtocolOpportunityDetector",
+    "SharpeDetector",
 )
 
 
@@ -575,6 +582,20 @@ class TestStructuralInvariants(unittest.TestCase):
         # DSS-WO-ENG-016 §5: the unused mempool policy engine is retired.
         self.assertFalse((REPO_ROOT / "mempool" / "engine.py").exists(),
                          "mempool/engine.py must be removed")
+        # DSS-WO-ENG-017 §3B/§3C/§3D: unintegrated utilities with no runtime
+        # role (serial execution invariant, FLASHBOTS_RPCS + ChainMEVPolicy
+        # relay selection, outcome-resolver trigger handling).
+        self.assertFalse((REPO_ROOT / "executor" / "nonce_manager.py").exists(),
+                         "executor/nonce_manager.py must be removed")
+        self.assertFalse((REPO_ROOT / "executor" / "relay_registry.py").exists(),
+                         "executor/relay_registry.py must be removed")
+        self.assertFalse((REPO_ROOT / "mempool" / "reorg.py").exists(),
+                         "mempool/reorg.py must be removed")
+        # DSS-WO-ENG-017 §3G: consumer-less simulation shims are retired; the
+        # route-compilation framework stays research-only.
+        for retired in ("economics.py", "state_transition.py"):
+            self.assertFalse((REPO_ROOT / "simulation" / retired).exists(),
+                             f"simulation/{retired} must be removed")
 
     def test_no_retired_symbol_in_any_production_module(self):
         offenders = []

@@ -12,6 +12,14 @@ selected tips through it. If economics-driven tip selection is wanted
 later, it must be designed into the canonical executor path deliberately,
 not preserved as an orphaned alternative.)
 
+(DSS-WO-ENG-017 §4: the unused EconomicsInput dataclass and
+ExecutionEconomics.from_input() constructor were removed with them —
+no module ever constructed either. Callers construct ExecutionEconomics
+directly, which also avoids from_input()'s hidden assumption that
+gas_units × gas_price_wei share the unit of every other field: the
+canonical enrichment (optimizer/opportunity_economics.py) converts the
+native gas cost into the profit token's base units BEFORE construction.)
+
 All integer amounts are in the route's native token units unless explicitly
 stated otherwise. USD values are floats only at the presentation boundary.
 """
@@ -25,21 +33,6 @@ QuoteFn = Callable[[int], int]
 
 
 @dataclass(frozen=True)
-class EconomicsInput:
-    gross_profit_wei: int
-    gas_units: int = 0
-    gas_price_wei: int = 0
-    flashloan_fee_wei: int = 0
-    protocol_cost_wei: int = 0
-    builder_tip_wei: int = 0
-    execution_buffer_wei: int = 0
-
-    @property
-    def gas_cost_wei(self) -> int:
-        return max(0, int(self.gas_units)) * max(0, int(self.gas_price_wei))
-
-
-@dataclass(frozen=True)
 class ExecutionEconomics:
     gross_profit_wei: int
     gas_cost_wei: int
@@ -49,20 +42,6 @@ class ExecutionEconomics:
     execution_buffer_wei: int = 0
     inclusion_probability: float = 1.0
     failure_cost_wei: int = 0
-
-    @classmethod
-    def from_input(cls, x: EconomicsInput, inclusion_probability: float = 1.0,
-                   failure_cost_wei: int = 0) -> "ExecutionEconomics":
-        return cls(
-            gross_profit_wei=max(0, int(x.gross_profit_wei)),
-            gas_cost_wei=x.gas_cost_wei,
-            flashloan_fee_wei=max(0, int(x.flashloan_fee_wei)),
-            protocol_cost_wei=max(0, int(x.protocol_cost_wei)),
-            builder_tip_wei=max(0, int(x.builder_tip_wei)),
-            execution_buffer_wei=max(0, int(x.execution_buffer_wei)),
-            inclusion_probability=max(0.0, min(1.0, float(inclusion_probability))),
-            failure_cost_wei=max(0, int(failure_cost_wei)),
-        )
 
     @property
     def deterministic_net_wei(self) -> int:

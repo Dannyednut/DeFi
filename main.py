@@ -33,13 +33,12 @@ from cache import PoolCache
 from crawler import PoolCrawler
 from prices import PriceOracle
 from tvl import set_oracle, init_prices, set_graph_ref
-from detectors.cycles import CycleDetector, SharpeDetector
+from detectors.cycles import CycleDetector
 from detectors.specialized import NewPoolDetector, CrossProtocolDetector, StableImbalanceDetector, LiquidationScanner
 from detectors.advanced import SplitRouteDetector
 from mempool.pipeline import MempoolPipeline
 from execution_router import ExecutionRouter, OppSource, create_router
 from opportunity_engine import OpportunityEngine
-from mempool.decoder import SwapDecoder, build_router_map, get_router_addresses
 from block_information import BlockInformationCollector, ProtocolStateSynchronizer
 
 # ── Global shutdown signal ────────────────────────────────────────────────────
@@ -77,7 +76,6 @@ def build_detectors(w3, graph, logger, cache):
     """Build all detector instances."""
     return [
         CycleDetector(w3, graph, logger, cache, CHAIN_ID),
-        # SharpeDetector(w3, graph, logger, cache, CHAIN_ID),
         NewPoolDetector(w3, graph, logger, cache, CHAIN_ID),
         CrossProtocolDetector(w3, graph, logger, cache, CHAIN_ID),
         StableImbalanceDetector(w3, graph, logger, cache, CHAIN_ID),

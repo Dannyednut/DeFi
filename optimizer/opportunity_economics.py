@@ -55,18 +55,18 @@ def enrich(opp: Opportunity, *, cfg: EconomicsConfig | None = None,
     # ExecutionEconomics is the single canonical "net profit" calculation
     # used everywhere else in the codebase that makes this decision
     # (execution_router.py's economics gate, the batch executor). This used
-    # to be hand-rolled subtraction here instead — this module already
-    # imported EconomicsInput/ExecutionEconomics but never actually used
-    # either, leaving a dangling import and a second, independent copy of
-    # the same "gross - gas - loan - protocol - tip - buffer" arithmetic.
+    # to be hand-rolled subtraction here instead — a second, independent
+    # copy of the same "gross - gas - loan - protocol - tip - buffer"
+    # arithmetic (the dangling EconomicsInput import noted here was removed
+    # by DSS-WO-ENG-017 §4 together with the unused from_input constructor).
     #
     # ExecutionEconomics' fields are generically "native token units" per its
     # own docstring; here that unit is the profit token's base units (gas_token
     # above is gas cost already converted from native wei), not the chain's
-    # native currency — constructed directly rather than via
-    # EconomicsInput.from_input(), since that helper's gas_cost_wei property
-    # assumes gas_units*gas_price_wei are in the SAME unit as everything else,
-    # which isn't true once gas has been converted like this.
+    # native currency — constructed directly with the gas cost already in the
+    # profit token's unit, because a gas_units × gas_price_wei field pair
+    # would assume gas shares the unit of every other term, which is not
+    # true before that conversion.
     economics = ExecutionEconomics(
         gross_profit_wei=max(0, gross_token),
         gas_cost_wei=max(0, gas_token),

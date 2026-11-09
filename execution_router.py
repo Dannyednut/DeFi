@@ -69,6 +69,15 @@ class ExecutionRouter:
     boundary: direct calls to the executor, signer or relay are enforced
     independently at those boundaries.
 
+    SERIAL EXECUTION INVARIANT (DSS-WO-ENG-017 §3B): exactly ONE execution
+    worker ever calls ``executor.submit``. Signing/submission is
+    deliberately serial: the executor fetches a fresh "pending" nonce from
+    the RPC at transaction-build time, and with a single worker there is no
+    concurrent nonce race and no need for a nonce-reservation layer (the
+    unintegrated nonce-reservation utility was retired on that evidence).
+    ``async_workers`` is clamped to 1 — concurrent execution workers are
+    not supported and would double-spend the pending nonce.
+
     Usage:
         router = ExecutionRouter(tracker, executor)
         router.start()
@@ -101,6 +110,19 @@ class ExecutionRouter:
         self.streaming_threshold = min_profit_usd * streaming_multiplier
         self.max_executions = max_executions_per_block
         self.queue_size = queue_size
+
+        # DSS-WO-ENG-017 §3B — enforce the serial-execution invariant:
+        # signing/submission is deliberately single-worker (fresh "pending"
+        # nonce per tx, no concurrent race). Any configured concurrency is
+        # clamped to 1, loudly, rather than silently racing nonces.
+        if int(async_workers) != 1:
+            log.warning(
+                "[ROUTER] async_workers=%s requested; execution is "
+                "deliberately SERIAL (single worker, fresh pending nonce "
+                "per transaction) — clamping to 1 (DSS-WO-ENG-017 §3B)",
+                async_workers,
+            )
+            async_workers = 1
         
         # Execution state
         self._executed_count = 0
@@ -113,7 +135,8 @@ class ExecutionRouter:
         self._execution_queue: queue.PriorityQueue = queue.PriorityQueue(maxsize=queue_size)
         self._execution_results: queue.Queue[tuple[RoutedOpportunity, Any]] = queue.Queue()
         
-        # Worker threads
+        # Worker threads — always the clamped value (see the serial-execution
+        # invariant above); async_workers was already clamped to 1.
         self._async_workers = async_workers
         self._worker_threads: list[threading.Thread] = []
         self._result_thread: threading.Thread | None = None

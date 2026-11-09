@@ -537,6 +537,13 @@ RETIRED_SYMBOLS = (
     "KNOWN_TARGETS", "ALLOWED_TESTNET_CHAINS",
     "FLASHBOTS_SEPOLIA_RELAY", "TestnetExecutionConfig",
     "web3_factory", "relay_factory",
+    # DSS-WO-ENG-016 §4/§5 — retired alternative orchestration and
+    # unused policy layers (one canonical runtime path only):
+    "MEVExecutionService", "MEVExecutionDecision",
+    "BundleCandidate", "BundleSimulator", "BundleSimulation",
+    "TxFeeModel", "BidPolicy", "InclusionEstimate",
+    "MempoolOpportunityEngine", "PendingObservation",
+    "BackrunCandidate", "mev_execution",
 )
 
 
@@ -557,6 +564,17 @@ class TestStructuralInvariants(unittest.TestCase):
                          "executor/authorization.py must be removed")
         self.assertFalse((REPO_ROOT / "executor" / "testnet_gate.py").exists(),
                          "executor/testnet_gate.py must be removed")
+        # DSS-WO-ENG-016 §4: the unused alternative MEV orchestration and
+        # its orphaned support modules are retired.
+        self.assertFalse((REPO_ROOT / "executor" / "mev_execution.py").exists(),
+                         "executor/mev_execution.py must be removed")
+        for retired in ("models.py", "simulator.py", "inclusion.py"):
+            self.assertFalse((REPO_ROOT / "mev" / retired).exists(),
+                             f"mev/{retired} must be removed (policy.py stays: "
+                             "the relay consumes ChainMEVPolicy)")
+        # DSS-WO-ENG-016 §5: the unused mempool policy engine is retired.
+        self.assertFalse((REPO_ROOT / "mempool" / "engine.py").exists(),
+                         "mempool/engine.py must be removed")
 
     def test_no_retired_symbol_in_any_production_module(self):
         offenders = []
@@ -612,10 +630,8 @@ class TestStructuralInvariants(unittest.TestCase):
     def test_no_transport_factory_parameters(self):
         from executor.relay import relay_transaction, simulate_bundle
         from executor.signer import sign_transaction
-        from executor.mev_execution import MEVExecutionService
 
-        for func in (relay_transaction, simulate_bundle, sign_transaction,
-                     MEVExecutionService.submit):
+        for func in (relay_transaction, simulate_bundle, sign_transaction):
             params = inspect.signature(func).parameters
             for name in params:
                 self.assertNotIn("factory", name.lower(),

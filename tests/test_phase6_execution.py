@@ -1,8 +1,7 @@
 import pytest
 from executor.chain_execution import profile_for, MempoolModel, validate_transaction_dict
 from executor.relay_registry import RelayRegistry, RelayEndpoint
-from executor.nonce_manager import NonceManager
-from mev.inclusion import BidPolicy
+from executor.nonce_manager import NonceManager  # retained module: import coverage
 from mev.policy import ChainMEVPolicy
 
 
@@ -29,7 +28,6 @@ def test_relay_registry_never_invents_capability():
     assert registry.require_atomic_backrun(42161) == []
 
 
-def test_bid_policy_is_profit_bounded():
-    estimate = BidPolicy().choose_tip(1_000, 100, competing_tip_wei=500)
-    assert 0 <= estimate.max_tip_wei <= 900
-    assert estimate.expected_net_wei >= 0
+# DSS-WO-ENG-016 §4: the retired inclusion-bid policy wrapper's test was
+# removed with the module — nothing in the canonical runtime path selected
+# tips through it (the executor's builder tip is competition-tier based).

@@ -1,12 +1,5 @@
-from mev.models import BundleCandidate
 from mempool.reorg import TriggerTracker
 from mev.policy import ChainMEVPolicy
-
-
-def test_bundle_candidate_net_ceiling():
-    c = BundleCandidate(1, "0xtrig", "0xraw", 100, 10_000, 100, 10, 1, 100)
-    assert c.gas_ceiling_wei == 1000
-    assert c.net_ceiling_profit_wei == 8900
 
 
 def test_target_block_policy():
@@ -26,3 +19,9 @@ def test_replacement_by_sender_nonce():
     prev, _ = t.observe("0xb", "0xsender", 7)
     assert prev == "0xa"
     assert t._by_hash["0xa"].status == "replaced"
+
+
+# DSS-WO-ENG-016 §4: the retired alternative MEV bundle models/orchestration
+# tests were removed with their modules. ChainMEVPolicy (retained — the relay
+# consumes it at private-submission time) is covered by
+# test_target_block_policy above and tests/test_phase6_execution.py.

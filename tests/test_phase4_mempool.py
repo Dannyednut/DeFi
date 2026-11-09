@@ -1,5 +1,4 @@
 from mempool.dedup import TxDeduper
-from mempool.engine import MempoolOpportunityEngine, PendingObservation
 
 
 def test_distinct_same_shape_transactions_are_not_deduped():
@@ -9,11 +8,8 @@ def test_distinct_same_shape_transactions_are_not_deduped():
     assert d.add('0xaaa') is False
 
 
-def test_chain_validation():
-    e = MempoolOpportunityEngine(1)
-    e.validate_observation(PendingObservation(1, '0x1', '0x0', '0x0', 0, 0, 0, 0, 1, '0x'))
-
-
-def test_score_requires_exact_quote_for_high_confidence():
-    e = MempoolOpportunityEngine(1)
-    assert e.score(state_freshness_ms=200, decoded=True, exact_quote=True, route_supported=True, trigger_seen=True) == 1.0
+# DSS-WO-ENG-016 §5: the unused mempool policy engine tests were removed
+# together with the retired module — the pipeline never called any of its
+# methods. Chain-aware classification and execution gating are covered by
+# tests/test_phase6_execution.py (chain profiles / MEV policy) and the
+# canonical promotion path by tests/test_phase18_pipeline.py.

@@ -29,7 +29,6 @@ from mempool.watcher import MempoolWatcher
 from mempool.decoder import SwapDecoder, build_router_map, get_router_addresses
 from mempool.simulator import MempoolSimulator, PendingOpportunity
 from mempool.outcome import OutcomeResolver
-from mempool.engine import MempoolOpportunityEngine, PendingObservation
 
 # from utils.graph_client import GraphClient
 from registry import discover_from_swap
@@ -75,7 +74,11 @@ class MempoolPipeline:
         self._decoder   = SwapDecoder(router_map)
         self._simulator = MempoolSimulator(graph, native_price_usd=NATIVE_PRICE_USD)
         self._resolver  = OutcomeResolver(w3, graph, None)
-        self._mev_engine = MempoolOpportunityEngine(int(w3.eth.chain_id))
+        # DSS-WO-ENG-016 §5: the unused mempool policy engine that used to
+        # be instantiated here was retired — no method of it was ever
+        # called. Promotion, validation, routing and MEV/execution gating
+        # all happen in the canonical path
+        # (OpportunityEngine → ExecutionRouter → ArbExecutor → Relay).
         # Initialize with the current block to avoid dropping startup transactions
         try:
             self._latest_block = w3.eth.block_number

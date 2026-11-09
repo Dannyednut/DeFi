@@ -399,17 +399,30 @@ class _LifetimeStats:
 
 def _fingerprint(opp: Opportunity) -> str:
     """
-    Create a stable fingerprint for an opportunity.
-    Uses opp_type + sorted pool addresses + root token + sorted dex list.
+    Create the stable EXECUTABLE-ROUTE fingerprint for an opportunity
+    (DSS-WO-ENG-017 §5): chain + ordered token path + ordered pool path +
+    dex set — exactly OpportunityEngine._identity_key's components.
 
-    FIX: dexes are now included so that two opps on the same pools but
-    different strategy types (e.g. DEX_SPREAD vs TRIANGULAR) don't collide.
+    The fingerprint deliberately EXCLUDES the detector thesis (arb_kind)
+    and the semantic classification (opp_type): two otherwise identical
+    executable routes discovered by different detectors (e.g. a CycleDetector
+    two-pool cross-DEX cycle and a CrossProtocolDetector anchor-pair
+    fragmentation on the same pools) are the SAME transaction candidate and
+    must share one lifecycle record and one execution-queue slot, so a
+    duplicate can never enter execution twice through different detector
+    sources. Thesis/provenance distinction lives in the opportunity
+    metadata (arb_kind, detector, detector_provenance) and in the lifecycle
+    event records, which still capture the representative arb_kind/opp_type
+    at open/close time.
+
+    tokens[0] (the borrowed root token) and the ordered pool path are part
+    of the identity: the same pools traversed from a different root token
+    is a different borrow and a different transaction.
     """
-    opp_type  = opp.opp_type.value if hasattr(opp.opp_type, "value") else str(opp.opp_type)
-    pools_key = "|".join(sorted(p.lower() for p in opp.pools))
-    root_token = opp.tokens[0].lower() if opp.tokens else ""
-    dex_key   = "|".join(sorted(set(d.lower() for d in opp.dexes)))
-    arb_kind = getattr(opp.arb_kind, "value", str(getattr(opp, "arb_kind", "cycle")))
-    raw = f"{arb_kind}:{opp_type}:{pools_key}:{root_token}:{dex_key}"
+    chain_id = getattr(opp, "chain_id", 0)
+    tokens_key = "|".join(t.lower() for t in opp.tokens)
+    pools_key = "|".join(p.lower() for p in opp.pools)
+    dex_key = "|".join(sorted({d.lower() for d in opp.dexes}))
+    raw = f"{chain_id}:{tokens_key}:{pools_key}:{dex_key}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 

@@ -1,15 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from chain_context import ChainContext
 from execution_profile import profile_for
 
-@dataclass(frozen=True)
-class RelayTarget:
-    name: str
-    url: str
-    chain_ids: frozenset[int]
-    supports_bundle_simulation: bool = True
-    supports_backrun: bool = True
+# The unused relay-endpoint record dataclass that used to live here was
+# removed by DSS-WO-ENG-017 §3: it had no consumer — relay selection uses
+# the chain's FLASHBOTS_RPCS configuration plus this policy
+# (executor/relay.py), not a registry of endpoint objects.
 
 @dataclass(frozen=True)
 class ChainMEVPolicy:

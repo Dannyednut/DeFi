@@ -1,346 +1,385 @@
 """
 tests/test_relay.py
 ====================
-Unit tests for executor/relay.py — transaction relay functionality.
+Unit tests for executor/relay.py — the single transaction-submission layer
+(DSS-WO-ENG-015 R4).
 
-DSS-WO-ENG-003: rewritten for the current fail-closed relay interface.
+Behaviour pinned here (all fully offline — throwaway keys and mock
+transports; no real wallet, no network, no live signing of any real
+asset):
 
-The legacy interface these tests used to pin no longer exists and is
-deliberately NOT restored:
+  enforcement at the submission boundary
+  - EXECUTE_ONCHAIN disabled → ExecutionRefused, nothing is broadcast;
+  - RPC-reported chain mismatch → ExecutionRefused, nothing is broadcast;
+  - a payload signed by anything but the recorded agent identity →
+    ExecutionRefused (provenance);
+  - direct submission succeeds only when the switch is on, the chain
+    matches and the payload is the agent's;
+  - the chain is re-checked IMMEDIATELY before broadcast: a chain that
+    changes between the first read and the broadcast is refused;
+  - the chain is ALSO re-checked IMMEDIATELY before a private bundle
+    submission (DSS-WO-ENG-016 §3C): a chain that changes between the
+    initial verification and send_bundle() prevents the submission;
+  - private (Flashbots) submission NEVER falls back to the public
+    mempool on failure;
+  - private submission respects the chain-specific MEV policy;
+  - a stale target block is refused.
 
-  - ``_relay_flashbots(w3, raw_tx, chain_id, target_block=..., relay_signer=...)``
-    became ``_relay_flashbots(w3, raw_tx, target_block, target_tx=b"")``;
-    relay signing identity is provisioned once via the Flashbots middleware
-    (executor/executor.py), not per-call.
-  - ImportError/empty-result/exception public-mempool fallbacks were removed:
-    an atomic backrun that cannot be submitted privately must fail closed,
-    never leak to the public relay.
-  - Unknown chains no longer fall back to the mainnet Flashbots RPC: chain
-    eligibility is decided by ChainMEVPolicy (execution_profile.PROFILES
-    private_submission), and FLASHBOTS_RPCS is filtered against it.
+  read-only helpers
+  - wait_for_receipt returns the receipt dict on success and None on
+    timeout/failure.
 
-Behaviour pinned here:
-
-  - private submission is the only path when use_flashbots=True;
-  - every private-path failure is fail-closed (no public fallback);
-  - a stale target block is refused, never silently advanced;
-  - a bundle that misses its target block cancels and reports failure
-    (regression: this path used to fall through and return None);
-  - unsupported chains refuse private submission and use direct submission
-    only when explicitly requested (use_flashbots=False).
-
-All tests are fully offline: ``w3`` is a MagicMock; no credentials, no
-signing, no network activity.
+Offline signing uses a THROWAWAY key generated in tmp (never the agent
+wallet, never a funded key, never broadcast anywhere).
 """
+import inspect
+import json
+import os
+import stat
 import unittest
 from unittest.mock import MagicMock, patch
 from web3.exceptions import TransactionNotFound
 
-from executor.relay import (
-    _relay_flashbots,
-    _relay_direct,
-    relay_transaction,
-    RelayResult,
-    FLASHBOTS_CHAINS,
-)
+from eth_account import Account
+
+from executor.errors import ExecutionRefused
+from executor.relay import RelayResult, wait_for_receipt, relay_transaction
+
+SEPOLIA = 11155111
 
 
-RAW_TX = bytes.fromhex("f86c" + "00" * 44)  # Minimal valid-looking raw tx
-TARGET_TX = bytes.fromhex("f86d" + "11" * 44)
+# ── offline fixtures ─────────────────────────────────────────────────────────
+
+def _provision_throwaway_store(tmp_path, key: Account) -> None:
+    """Provision a compliant DSS secret store around a THROWAWAY key."""
+    store = tmp_path / "secrets"
+    store.mkdir(mode=0o700, exist_ok=True)
+    keystore = Account.encrypt(key.key, b"offline-test-passphrase")
+    p = store / "dss_wallet.keystore.json"
+    p.write_text(json.dumps(keystore))
+    os.chmod(p, 0o600)
+    p = store / "dss_wallet.pass"
+    p.write_text(b"offline-test-passphrase".hex())
+    os.chmod(p, 0o600)
+    p = store / "dss_wallet.address"
+    p.write_text(key.address)
+    os.chmod(p, 0o600)
 
 
-class TestRelayFlashbots(unittest.TestCase):
-    """Test cases for _relay_flashbots() — current positional interface.
+def _signed_raw(key: Account, chain_id: int = SEPOLIA, to=None, value: int = 0) -> bytes:
+    """Offline-sign one minimal transaction with a THROWAWAY key."""
+    from eth_utils import to_checksum_address
+    to = to_checksum_address(to or "0x" + "9a" * 20)
+    tx = {
+        "to": to,
+        "value": value,
+        "gas": 21_000,
+        "maxFeePerGas": 30 * 10**9,
+        "maxPriorityFeePerGas": 1 * 10**9,
+        "nonce": 0,
+        "chainId": chain_id,
+    }
+    signed = key.sign_transaction(tx)
+    raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+    return bytes(raw)
 
-    Signature: _relay_flashbots(w3, raw_tx, target_block, target_tx=b"").
-    The Flashbots middleware is assumed to be attached to ``w3`` upstream;
-    the function itself performs no package imports and no signer handling.
-    """
 
+class _FakeEth:
+    """Deterministic chain-ID sequence + recorded broadcasts."""
+
+    def __init__(self, chain_sequence, head: int = 100):
+        self._seq = list(chain_sequence)
+        self._i = 0
+        self.sent = []
+        self.block_number = head
+
+    @property
+    def chain_id(self):
+        value = self._seq[min(self._i, len(self._seq) - 1)]
+        self._i += 1
+        return value
+
+    def send_raw_transaction(self, raw):
+        self.sent.append(bytes(raw))
+        return b"\xab" * 32
+
+
+class _FakeW3:
+    def __init__(self, chain_sequence):
+        self.eth = _FakeEth(chain_sequence)
+
+
+# ── enforcement at the submission boundary ───────────────────────────────────
+
+class TestRelaySubmissionEnforcement(unittest.TestCase):
     def setUp(self):
-        self.mock_w3 = MagicMock()
-        self.mock_w3.eth.block_number = 12345678
-
-    def _successful_bundle_result(self):
-        mock_result = MagicMock()
-        mock_result.bundle_hash.return_value.hex.return_value = "0x" + "ef" * 32
-        self.mock_w3.flashbots.send_bundle.return_value = mock_result
-        return mock_result
-
-    def test_successful_submission(self):
-        """A single private tx is submitted as a one-entry bundle."""
-        self._successful_bundle_result()
-
-        result = _relay_flashbots(self.mock_w3, RAW_TX, target_block=12345679)
-
-        self.mock_w3.flashbots.send_bundle.assert_called_once_with(
-            [{"signed_transaction": RAW_TX}], target_block_number=12345679
+        self.tmp = __import__("pathlib").Path(
+            __import__("tempfile").mkdtemp(prefix="relay-test-")
         )
+        self.key = Account.create()
+        _provision_throwaway_store(self.tmp, self.key)
+        self._env = patch.dict(
+            os.environ,
+            {"EXECUTE_ONCHAIN": "true", "DSS_SECRET_STORE": str(self.tmp / "secrets")},
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def test_disabled_switch_refuses_without_broadcast(self):
+        with patch.dict(os.environ, {"EXECUTE_ONCHAIN": "false"}):
+            w3 = _FakeW3([SEPOLIA, SEPOLIA])
+            raw = _signed_raw(self.key)
+            with self.assertRaises(ExecutionRefused) as ctx:
+                relay_transaction(w3, raw, expected_chain_id=SEPOLIA)
+            self.assertIn("disabled", str(ctx.exception))
+            self.assertEqual(w3.eth.sent, [])
+
+    def test_chain_mismatch_refuses_before_provenance(self):
+        w3 = _FakeW3([1])  # reports chain 1, expected Sepolia
+        raw = _signed_raw(self.key)
+        with self.assertRaises(ExecutionRefused) as ctx:
+            relay_transaction(w3, raw, expected_chain_id=SEPOLIA)
+        self.assertIn("chain mismatch", str(ctx.exception))
+        self.assertEqual(w3.eth.sent, [])
+
+    def test_payload_from_another_signer_is_refused(self):
+        impostor = Account.create()
+        w3 = _FakeW3([SEPOLIA])
+        raw = _signed_raw(impostor)
+        with self.assertRaises(ExecutionRefused) as ctx:
+            relay_transaction(w3, raw, expected_chain_id=SEPOLIA)
+        self.assertIn("approved signing process", str(ctx.exception))
+        self.assertEqual(w3.eth.sent, [])
+
+    def test_payload_for_another_chain_is_refused(self):
+        w3 = _FakeW3([SEPOLIA])
+        raw = _signed_raw(self.key, chain_id=1)  # signed for mainnet
+        with self.assertRaises(ExecutionRefused) as ctx:
+            relay_transaction(w3, raw, expected_chain_id=SEPOLIA)
+        self.assertIn("built for chain", str(ctx.exception))
+        self.assertEqual(w3.eth.sent, [])
+
+    def test_direct_submission_success_path(self):
+        w3 = _FakeW3([SEPOLIA, SEPOLIA])
+        raw = _signed_raw(self.key)
+        result = relay_transaction(w3, raw, expected_chain_id=SEPOLIA)
         self.assertTrue(result.success)
-        self.assertEqual(result.method, "flashbots")
-        self.assertEqual(result.tx_hash, "0x" + "ef" * 32)
-        self.assertEqual(result.error, "")
+        self.assertEqual(result.method, "direct")
+        self.assertEqual(len(w3.eth.sent), 1)
+        self.assertEqual(w3.eth.sent[0], raw)
 
-    def test_bundle_includes_trigger_transaction_first(self):
-        """An atomic backrun bundles the trigger tx in front of the backrun."""
-        self._successful_bundle_result()
-
-        _relay_flashbots(
-            self.mock_w3, RAW_TX, target_block=12345679, target_tx=TARGET_TX
-        )
-
-        self.mock_w3.flashbots.send_bundle.assert_called_once_with(
-            [{"signed_transaction": TARGET_TX}, {"signed_transaction": RAW_TX}],
-            target_block_number=12345679,
-        )
-
-    def test_empty_result_fails_closed_without_public_fallback(self):
-        """A rejected private submission must NOT leak to the public mempool."""
-        self.mock_w3.flashbots.send_bundle.return_value = None
-
-        with patch("executor.relay._relay_direct") as mock_direct:
-            result = _relay_flashbots(self.mock_w3, RAW_TX, target_block=12345679)
-
+    def test_chain_change_before_broadcast_is_refused(self):
+        # read 1 = Sepolia (relay entry), read 2 = chain 1 (pre-broadcast
+        # recheck) → refused at the transport gate, nothing broadcast.
+        w3 = _FakeW3([SEPOLIA, 1])
+        raw = _signed_raw(self.key)
+        result = relay_transaction(w3, raw, expected_chain_id=SEPOLIA)
         self.assertFalse(result.success)
-        self.assertEqual(result.method, "flashbots")
-        self.assertIn("private bundle rejected", result.error)
-        mock_direct.assert_not_called()
+        self.assertEqual(result.method, "refused")
+        self.assertIn("chain mismatch", result.error)
+        self.assertEqual(w3.eth.sent, [])
 
-    def test_exception_fails_closed_without_public_fallback(self):
-        """A relay exception must fail closed, never fall back publicly."""
-        self.mock_w3.flashbots.send_bundle.side_effect = Exception("Connection refused")
 
-        with patch("executor.relay._relay_direct") as mock_direct:
-            result = _relay_flashbots(self.mock_w3, RAW_TX, target_block=12345679)
+# ── private submission ───────────────────────────────────────────────────────
 
-        self.assertFalse(result.success)
-        self.assertEqual(result.method, "flashbots")
-        self.assertIn("Connection refused", result.error)
-        mock_direct.assert_not_called()
+class TestRelayPrivateSubmission(unittest.TestCase):
+    def setUp(self):
+        self.tmp = __import__("pathlib").Path(
+            __import__("tempfile").mkdtemp(prefix="relay-test-")
+        )
+        self.key = Account.create()
+        _provision_throwaway_store(self.tmp, self.key)
+        self._env = patch.dict(
+            os.environ,
+            {"EXECUTE_ONCHAIN": "true", "DSS_SECRET_STORE": str(self.tmp / "secrets")},
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
 
-    def test_missing_flashbots_provider_fails_closed(self):
-        """Without attached Flashbots middleware the relay fails closed.
+    def _flashbots_w3(self, chain_sequence, send_bundle_result=None):
+        w3 = _FakeW3(chain_sequence)
+        w3.flashbots = MagicMock()
+        w3.flashbots.send_bundle.return_value = send_bundle_result
+        return w3
 
-        This is the current-world equivalent of the retired import-error
-        fallback test: an unavailable private path must not degrade into a
-        public submission.
-        """
-        w3_without_flashbots = MagicMock(spec=["eth"])
-        w3_without_flashbots.eth.block_number = 12345678
-
-        with patch("executor.relay._relay_direct") as mock_direct:
-            result = _relay_flashbots(
-                w3_without_flashbots, RAW_TX, target_block=12345679
+    def test_private_failure_never_falls_back_to_public(self):
+        with patch("executor.relay.FLASHBOTS_CHAINS", frozenset({SEPOLIA})):
+            w3 = self._flashbots_w3([SEPOLIA], send_bundle_result=None)
+            raw = _signed_raw(self.key)
+            result = relay_transaction(
+                w3, raw, expected_chain_id=SEPOLIA,
+                use_flashbots=True, target_block=101,  # fresh target
             )
+            self.assertFalse(result.success)
+            self.assertEqual(result.method, "flashbots")
+            self.assertIn("rejected", result.error)
+            # The public mempool must NEVER have been touched.
+            self.assertEqual(w3.eth.sent, [])
 
-        self.assertIsNotNone(result)
-        self.assertFalse(result.success)
-        self.assertEqual(result.method, "flashbots")
-        mock_direct.assert_not_called()
+    def test_private_submission_respects_chain_mev_policy(self):
+        # Polygon (137): execution_profile marks private_submission=False →
+        # the chain MEV policy refuses atomic backruns regardless of any
+        # registry entry.
+        with patch("executor.relay.FLASHBOTS_CHAINS", frozenset({137})):
+            w3 = self._flashbots_w3([137])
+            raw = _signed_raw(self.key, chain_id=137)
+            result = relay_transaction(
+                w3, raw, expected_chain_id=137,
+                use_flashbots=True, target_block=101,
+            )
+            self.assertFalse(result.success)
+            self.assertIn("not enabled for chain 137", result.error)
+            self.assertEqual(w3.eth.sent, [])
 
-    def test_stale_target_block_fails_closed(self):
-        """A target block at or behind head is refused before submission."""
-        self._successful_bundle_result()
+    def test_private_submission_refused_without_registry_entry(self):
+        # FLASHBOTS_RPCS (and thus FLASHBOTS_CHAINS) has no entry for the
+        # chain → fail closed before any transport interaction.
+        with patch("executor.relay.FLASHBOTS_CHAINS", frozenset()):
+            w3 = self._flashbots_w3([SEPOLIA])
+            raw = _signed_raw(self.key)
+            result = relay_transaction(
+                w3, raw, expected_chain_id=SEPOLIA,
+                use_flashbots=True, target_block=100,
+            )
+            self.assertFalse(result.success)
+            self.assertIn("no Flashbots relay configured", result.error)
+            self.assertEqual(w3.eth.sent, [])
 
-        result = _relay_flashbots(self.mock_w3, RAW_TX, target_block=12345678)
+    def test_stale_target_block_is_refused(self):
+        with patch("executor.relay.FLASHBOTS_CHAINS", frozenset({SEPOLIA})):
+            w3 = self._flashbots_w3([SEPOLIA])
+            # head is 100; a target at or below the head is stale.
+            raw = _signed_raw(self.key)
+            result = relay_transaction(
+                w3, raw, expected_chain_id=SEPOLIA,
+                use_flashbots=True, target_block=100,
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.error, "target block is stale")
+            self.assertEqual(w3.eth.sent, [])
 
-        self.assertFalse(result.success)
-        self.assertEqual(result.method, "flashbots")
-        self.assertIn("target block is stale", result.error)
-        self.mock_w3.flashbots.send_bundle.assert_not_called()
+    # ── DSS-WO-ENG-016 §3C: final chain-identity verification on the
+    # Flashbots route (parity with the direct route) ────────────────────
 
-    def test_result_without_bundle_hash_reports_pending(self):
-        """A result object lacking bundle_hash is still tracked as pending."""
-        mock_result = MagicMock(spec=["wait", "receipts"])
-        self.mock_w3.flashbots.send_bundle.return_value = mock_result
+    def test_chain_change_before_bundle_submission_is_refused(self):
+        # The chain changes between the initial verification (read 1 =
+        # Sepolia, at the relay entry) and the FINAL pre-bundle recheck
+        # (read 2 = chain 1, immediately before send_bundle) → the bundle
+        # is never sent and nothing is broadcast.
+        with patch("executor.relay.FLASHBOTS_CHAINS", frozenset({SEPOLIA})):
+            w3 = self._flashbots_w3([SEPOLIA, 1])
+            raw = _signed_raw(self.key)
+            result = relay_transaction(
+                w3, raw, expected_chain_id=SEPOLIA,
+                use_flashbots=True, target_block=101,
+                target_tx=b"\x09" * 32,  # atomic-backrun bundle shape
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.method, "refused")
+            self.assertIn("chain mismatch", result.error)
+            w3.flashbots.send_bundle.assert_not_called()
+            self.assertEqual(w3.eth.sent, [])
 
-        result = _relay_flashbots(self.mock_w3, RAW_TX, target_block=12345679)
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.method, "flashbots")
-        self.assertEqual(result.tx_hash, "pending")
-
-    def test_bundle_not_included_cancels_and_fails_closed(self):
-        """Regression: a missed bundle cancels and returns a failure result.
-
-        The previous implementation fell through the TransactionNotFound
-        branch and returned None, crashing callers that read RelayResult
-        attributes (executor.py does ``result.success`` unconditionally).
-        """
-        mock_result = self._successful_bundle_result()
-        mock_result.receipts.side_effect = TransactionNotFound("not mined")
-
-        result = _relay_flashbots(self.mock_w3, RAW_TX, target_block=12345679)
-
-        self.mock_w3.flashbots.cancel_bundles.assert_called_once_with("0x" + "ef" * 32)
-        self.assertIsNotNone(result, "relay must never return None")
-        self.assertFalse(result.success)
-        self.assertEqual(result.method, "flashbots")
-        self.assertIn("bundle not included", result.error)
-
-
-class TestRelayTransaction(unittest.TestCase):
-    """Test cases for relay_transaction() — current interface.
-
-    Signature: relay_transaction(w3, raw_tx, target_tx=b"", target_block=None,
-    use_flashbots=False). Chain eligibility is decided by ChainMEVPolicy,
-    derived from execution_profile.PROFILES.
-    """
-
-    def setUp(self):
-        self.mock_w3 = MagicMock()
-        self.mock_w3.eth.chain_id = 1
-        self.mock_w3.eth.block_number = 12345678
-        self.raw_tx = RAW_TX
-
-    @patch("executor.relay._relay_direct")
-    @patch("executor.relay._relay_flashbots")
-    def test_relay_transaction_uses_flashbots_for_supported_chains(self, mock_fb, mock_direct):
-        """Chains with private_submission support use the bundle relay."""
-        mock_fb.return_value = RelayResult(
-            success=True, tx_hash="0xflash", method="flashbots"
-        )
-
-        # Guard against a silent no-op if configuration ever empties this set.
-        self.assertTrue(FLASHBOTS_CHAINS, "no Flashbots-eligible chains configured")
-
-        for chain_id in sorted(FLASHBOTS_CHAINS):
-            with self.subTest(chain_id=chain_id):
-                self.mock_w3.eth.chain_id = chain_id
-                mock_fb.reset_mock()
-                mock_direct.reset_mock()
-
-                result = relay_transaction(
-                    self.mock_w3,
-                    self.raw_tx,
-                    target_block=12345679,
-                    use_flashbots=True,
-                )
-
-                mock_fb.assert_called_once()
-                mock_direct.assert_not_called()
-                self.assertEqual(result.method, "flashbots")
-                self.assertTrue(result.success)
-
-    @patch("executor.relay._relay_flashbots")
-    @patch("executor.relay._relay_direct")
-    def test_relay_transaction_uses_direct_for_unsupported_chains(self, mock_direct, mock_fb):
-        """Chains without private submission support submit directly by default."""
-        mock_direct.return_value = RelayResult(
-            success=True, tx_hash="0xdirect", method="direct"
-        )
-
-        unsupported_chains = [56, 137, 42161, 324]  # BSC, Polygon, Arbitrum, zkSync
-
-        for chain_id in unsupported_chains:
-            with self.subTest(chain_id=chain_id):
-                self.mock_w3.eth.chain_id = chain_id
-                mock_direct.reset_mock()
-                mock_fb.reset_mock()
-
-                result = relay_transaction(
-                    self.mock_w3, self.raw_tx, target_block=12345679
-                )
-
-                mock_direct.assert_called_once_with(self.mock_w3, self.raw_tx)
-                mock_fb.assert_not_called()
-                self.assertEqual(result.method, "direct")
-                self.assertTrue(result.success)
-
-    @patch("executor.relay._relay_flashbots")
-    @patch("executor.relay._relay_direct")
-    def test_relay_transaction_refuses_flashbots_on_unsupported_chain(self, mock_direct, mock_fb):
-        """Explicit use_flashbots on an ineligible chain fails closed.
-
-        The retired behaviour sent unknown chains to the mainnet Flashbots
-        RPC; the current behaviour refuses the submission instead.
-        """
-        self.mock_w3.eth.chain_id = 56
-
-        result = relay_transaction(
-            self.mock_w3, self.raw_tx, target_block=12345679, use_flashbots=True
-        )
-
-        self.assertFalse(result.success)
-        self.assertEqual(result.method, "flashbots")
-        self.assertIn("private atomic backrun not enabled", result.error)
-        mock_fb.assert_not_called()
-        mock_direct.assert_not_called()
-
-    @patch("executor.relay._relay_direct")
-    @patch("executor.relay._relay_flashbots")
-    def test_relay_transaction_auto_targets_next_block(self, mock_fb, mock_direct):
-        """Without an explicit target the next block is targeted."""
-        mock_fb.return_value = RelayResult(
-            success=True, tx_hash="0xflash", method="flashbots"
-        )
-        self.mock_w3.eth.chain_id = 1
-
-        relay_transaction(self.mock_w3, self.raw_tx, use_flashbots=True)
-
-        mock_fb.assert_called_once_with(
-            self.mock_w3, self.raw_tx, 12345679, b""
-        )
-        mock_direct.assert_not_called()
-
-    @patch("executor.relay._relay_flashbots")
-    @patch("executor.relay._relay_direct")
-    def test_relay_transaction_refuses_stale_target_block(self, mock_fb, mock_direct):
-        """A stale explicit target is refused, never silently advanced."""
-        self.mock_w3.eth.chain_id = 1
-        self.mock_w3.eth.block_number = 12345678
-
-        result = relay_transaction(
-            self.mock_w3, self.raw_tx, target_block=12345678, use_flashbots=True
-        )
-
-        self.assertFalse(result.success)
-        self.assertEqual(result.method, "flashbots")
-        self.assertIn("target block is stale", result.error)
-        mock_fb.assert_not_called()
-        mock_direct.assert_not_called()
+    def test_bundle_submitted_when_chain_identity_stable(self):
+        # Control: the chain identity is re-verified and still matches →
+        # the bundle IS submitted exactly once, to the fresh target block.
+        with patch("executor.relay.FLASHBOTS_CHAINS", frozenset({SEPOLIA})):
+            w3 = self._flashbots_w3([SEPOLIA])
+            raw = _signed_raw(self.key)
+            result = relay_transaction(
+                w3, raw, expected_chain_id=SEPOLIA,
+                use_flashbots=True, target_block=101,
+            )
+            w3.flashbots.send_bundle.assert_called_once()
+            self.assertEqual(
+                w3.flashbots.send_bundle.call_args.kwargs.get(
+                    "target_block_number"),
+                101,
+            )
+            self.assertEqual(result.method, "flashbots")
+            self.assertEqual(w3.eth.sent, [])
 
 
-class TestRelayDirect(unittest.TestCase):
-    """Test cases for _relay_direct() function."""
+# ── read-only helpers ────────────────────────────────────────────────────────
+
+class TestWaitForReceipt(unittest.TestCase):
+    """Read-only receipt handling."""
 
     def setUp(self):
         self.mock_w3 = MagicMock()
-        self.raw_tx = RAW_TX
 
-    def test_direct_relay_success(self):
-        """Test successful direct relay submission."""
-        expected_hash_bytes = bytes.fromhex("ab" * 32)
-        self.mock_w3.eth.send_raw_transaction.return_value = expected_hash_bytes
+    def test_returns_receipt_dict_on_success(self):
+        receipt = {"status": 1, "gasUsed": 21000,
+                   "effectiveGasPrice": 1_000_000_000,
+                   "blockNumber": 12345679}
+        self.mock_w3.eth.wait_for_transaction_receipt.return_value = receipt
 
-        result = _relay_direct(self.mock_w3, self.raw_tx)
+        result = wait_for_receipt(self.mock_w3, "0x" + "ab" * 32, timeout=5)
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.method, "direct")
-        # tx_hash should be the hex representation
-        self.assertEqual(result.tx_hash, expected_hash_bytes.hex())
+        self.mock_w3.eth.wait_for_transaction_receipt.assert_called_once_with(
+            "0x" + "ab" * 32, timeout=5, poll_latency=2.0
+        )
+        self.assertEqual(result, receipt)
 
-    def test_direct_relay_success_hex_string(self):
-        """Test successful direct relay when RPC returns hex string."""
-        expected_hash = "0x" + "ab" * 32
-        self.mock_w3.eth.send_raw_transaction.return_value = expected_hash
+    def test_returns_none_on_transaction_not_found(self):
+        self.mock_w3.eth.wait_for_transaction_receipt.side_effect = \
+            TransactionNotFound("not mined")
 
-        result = _relay_direct(self.mock_w3, self.raw_tx)
+        result = wait_for_receipt(self.mock_w3, "0x" + "ab" * 32, timeout=1)
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.method, "direct")
-        self.assertEqual(result.tx_hash, expected_hash)
+        self.assertIsNone(result)
 
-    def test_direct_relay_failure(self):
-        """Test failed direct relay submission."""
-        self.mock_w3.eth.send_raw_transaction.side_effect = Exception("RPC error")
+    def test_returns_none_on_timeout(self):
+        self.mock_w3.eth.wait_for_transaction_receipt.side_effect = \
+            TimeoutError("receipt wait timed out")
 
-        result = _relay_direct(self.mock_w3, self.raw_tx)
+        result = wait_for_receipt(self.mock_w3, "0x" + "ab" * 32, timeout=1)
 
+        self.assertIsNone(result)
+
+
+class TestRelayResultRecord(unittest.TestCase):
+    """The RelayResult record remains a plain result value object."""
+
+    def test_defaults(self):
+        result = RelayResult(success=False, tx_hash="", method="refused")
+        self.assertEqual(result.error, "")
         self.assertFalse(result.success)
-        self.assertEqual(result.method, "direct")
-        self.assertEqual(result.tx_hash, "")
-        self.assertIn("RPC error", result.error)
+
+    def test_method_documented_values(self):
+        for method in ("direct", "flashbots", "refused"):
+            result = RelayResult(success=True, tx_hash="0x" + "ab" * 32,
+                                 method=method)
+            self.assertEqual(result.method, method)
+
+
+class TestRelayErrorContainment(unittest.TestCase):
+    """Relay failures must not echo raw signed payload material."""
+
+    def test_direct_failure_sanitizes_error(self):
+        tmp = __import__("pathlib").Path(
+            __import__("tempfile").mkdtemp(prefix="relay-test-")
+        )
+        key = Account.create()
+        _provision_throwaway_store(tmp, key)
+        with patch.dict(
+            os.environ,
+            {"EXECUTE_ONCHAIN": "true", "DSS_SECRET_STORE": str(tmp / "secrets")},
+        ):
+            class _ExplodingEth(_FakeEth):
+                def send_raw_transaction(self, raw):
+                    self.sent.append(bytes(raw))
+                    raise RuntimeError(f"provider error for {bytes(raw).hex()}")
+
+            w3 = _FakeW3.__new__(_FakeW3)
+            w3.eth = _ExplodingEth([SEPOLIA, SEPOLIA])
+            raw = _signed_raw(key)
+            result = relay_transaction(w3, raw, expected_chain_id=SEPOLIA)
+            self.assertFalse(result.success)
+            # The exact payload hex is layer-1 forbidden material — replaced
+            # wholesale before any generic rule.
+            self.assertNotIn(bytes(raw).hex(), result.error)
+            self.assertIn("<redacted>", result.error)
 
 
 if __name__ == "__main__":

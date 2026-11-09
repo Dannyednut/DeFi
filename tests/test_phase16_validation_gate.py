@@ -66,9 +66,13 @@ def test_execution_validation_requires_full_evm_simulation(monkeypatch):
     validator.address = "0x" + "11" * 20
     ad = (100, 0, ["0x"+"01"*20, "0x"+"02"*20, "0x"+"01"*20], ["0x"+"03"*20, "0x"+"04"*20], [3000,3000], "0x"+"01"*20, 0)
     validator.contract = FakeContract(ad, 1000)
-    fake_signer = ModuleType("executor.signer")
-    fake_signer.get_sender = lambda: "0x" + "aa" * 20
-    monkeypatch.setitem(sys.modules, "executor.signer", fake_signer)
+    # DSS-WO-ENG-015 R4: the sender address is the recorded PUBLIC agent
+    # identity from the single wallet-custody path (executor.signer);
+    # offline tests patch it directly.
+    monkeypatch.setattr(
+        "validation.opportunity.recorded_agent_address",
+        lambda: "0x" + "aa" * 20,
+    )
 
     opp = Opportunity(
         opp_type=OppType.DEX_SPREAD,

@@ -10,14 +10,7 @@ Detects DEX-DEX, Triangular, and Multi-hop arbitrage opportunities.
 
 from __future__ import annotations
 
-import json
 import time
-import requests
-import os
-import concurrent.futures
-from functools import lru_cache
-from itertools import combinations
-from typing import Optional, TYPE_CHECKING
 
 from detectors.base import BaseDetector
 from logger import Opportunity, OppType
@@ -27,7 +20,6 @@ from config import get_chain, NATIVE_PRICE_USD, MIN_PROFIT_USD, DEFAULT_GAS_UNIT
 from tvl import token_price, profit_in_best_unit, token_decimals
 from log import get_logger
 from utils.multicall3 import multicall3_batch_yieldOut, multicall3_batch_quote_v3
-from utils.gecko_terminal import GeckoTerminal
 log = get_logger("cycles")
 
 
@@ -339,6 +331,15 @@ class CycleDetector(BaseDetector):
                     "profit_wei":         token_profit_raw,
                     "profit_unit":        profit_unit,
                     "gas_units":          DEFAULT_GAS_UNITS * gas_multiplier,
+                    # ESTIMATED GAS COST, denominated in tokenIn base units
+                    # ONLY because it is forced to 0 unless the root (borrowed)
+                    # token IS the chain's wrapped native — native wei and
+                    # tokenIn wei are then the same unit. For any other root
+                    # token this stays 0: a native-currency gas figure must
+                    # never be assigned to a token-denominated
+                    # ArbData.minProfit (DSS-WO-ENG-017 §2). Gas economics
+                    # otherwise live off-chain (is_profitable_after_gas /
+                    # execution_economics).
                     "min_profit":         gas_wei,
                     "root_token":         root_token,
                     "arb_data":           ad_tuple,            # ← NEW: sorted ArbData for executor
@@ -366,103 +367,12 @@ class CycleDetector(BaseDetector):
         log.info(f"Block {block_number}: {len(opportunities)} opportunities built from {len(cycles)} cycles")
         return sorted(opportunities, key=lambda x: (x.net_profit_usd, x.metadata.get("hop_count", 0)))
 
-
-
-class SharpeDetector(CycleDetector):
-
-    name = "cycles"
-
-    def __init__(self, w3, graph, logger, cache, chain_id):
-        super().__init__(w3, graph, logger, cache, chain_id)
-        self.gecko = GeckoTerminal()
-
-    def query_cycles(self, pool):
-        pools = self.gecko.related_pools(self.chain_id, pool)
-        all_pools = list(set([p['address'] for p in pools] + [pool]))
-        cycles = []
-
-        if all_pools and len(all_pools) > 1:
-            try:
-                # log.debug(f"Related Pools: {all_pools}")
-                for combo in combinations(all_pools, 2):
-                    resp = requests.get(
-                        "https://www.sharpe.ai/api/v1/arbitrage/dex-scanner/preview",
-                        headers={"Authorization": f"Bearer {os.getenv('SHARPE_API_KEY', '')}"},
-                        params={
-                            "poolUrl": f"https://www.geckoterminal.com/eth/pools/{combo[0]}",
-                            "secondPoolUrl": f"https://www.geckoterminal.com/eth/pools/{combo[1]}",
-                            "minProfitPct": 1,
-                            "mode": "dex_dex",
-                        },
-                    )
-                    data = resp.json()["data"]
-                    pool = data['pool']
-                    secondPool = data['secondPool']
-                    token0 = pool['baseToken']['address'].lower()
-                    token1 = pool['quoteToken']['address'].lower()
-                    token_in = pool['targetToken']['address'].lower()
-                    dex1 = "UniswapV2" if pool['dexName'].replace(" ", "") == "Uniswap" else pool['dexName'].replace(" ", "")
-                    dex2 = "UniswapV2" if secondPool['dexName'].replace(" ", "") == "Uniswap" else secondPool['dexName'].replace(" ", "")
-                    v1 = 2 if "V2" in dex1 else 3
-                    v2 = 2 if "V2" in dex2 else 3
-                    f1 = float(pool['raw'].get('attributes', {}).get('pool_fee_percentage', 0.3) or 0.3)
-                    f2 = float(secondPool['raw'].get('attributes', {}).get('pool_fee_percentage', 0.3) or 0.3)
-                    opp = [i for i in data["opportunities"] if i['legType'] == "dex_dex"][0]
-                    # log.debug(json.dumps(pool, indent=2))
-                    # log.debug(json.dumps(secondPool, indent=2))
-                    cycles.append(ArbitrageCycle(
-                        tokens=[token0, token1, token0],
-                        pools=[pool['poolAddress'].lower(), secondPool['poolAddress'].lower()],
-                        dexes=[dex1, dex2],
-                        fees=[int(f1 * 10000), int(f2 * 10000)],
-                        versions=[v1, v2],
-                        log_weight_sum=opp['spreadPct'],
-                        hop_count=2,
-                        estimated_profit_ratio=float(opp['spreadPct'])
-                    ))
-                for c in cycles:   
-                    log.debug(f"[Sharpe] {c}")
-            except Exception as e:
-                log.error(f"Error querying Sharpe API for cycles: {e}")
-                return []
-        return cycles
-    
-    def on_block(self, block_number: int, touched_pools: set[str] = None) -> list[Opportunity]:
-        if self.graph.pool_count < 2:
-            return []
-
-        # Cache gas price once per block — avoid 1 RPC call per cycle
-        if self._cached_gas_block != block_number:
-            self._cached_gas_usd, self._cache_gas_wei = self._estimate_gas_usd()
-            self._cached_gas_block = block_number
-        gas_usd = self._cached_gas_usd
-        gas_wei = self._cache_gas_wei
-
-        if touched_pools: # Only scan if there was actual volatility
-            seen_cycles = set()
-            all_cycles = []
-            for pool_addr in touched_pools:
-                pool_cycles = self.query_cycles(pool_addr)
-
-                if pool_cycles:
-                    # Filter already-seen cycles
-                    new_cycles = [c for c in pool_cycles if tuple(sorted(c.pools)) not in seen_cycles]
-                    all_cycles.extend(new_cycles)
-                    seen_cycles.update(tuple(sorted(c.pools)) for c in new_cycles)
-
-            # Cleanup old cache entries (simple expiration)
-            expired = [k for k, v in self._cycle_cache.items() if time.time() - v[0] > self._cache_ttl * 2]
-            for k in expired:
-                del self._cycle_cache[k]
-
-            if not all_cycles:
-                return []
-
-            log.debug(f"[Sharpe] Block {block_number}: {len(all_cycles)} unique cycles from {len(touched_pools)} pools")
-
-            # for c in all_cycles:
-            #     log.debug(f"Cycle: pools={c.pools}, dexes={c.dexes}, tokens={c.tokens}, fees={c.fees}, log_weight={c.log_weight_sum}")
-
-            return self.simulate_and_build(all_cycles, block_number, gas_usd, gas_wei, name='SharpeCycle')
-
-        return []
+# The unregistered CycleDetector subclass that sourced two-pool candidates
+# from the external sharpe.ai API via GeckoTerminal related-pool lookups was
+# retired by DSS-WO-ENG-017 §3F: it was never registered in main.py, had no
+# test and no documentation, collided with its parent's detector name
+# ('cycles' — which would have corrupted detector provenance in the
+# canonical engine), was network-bound at detection time, and produced the
+# same executable two-pool cross-DEX routes CycleDetector already discovers
+# from local graph state. An external-API signal source is a future
+# strategy-research option, not an active detector.

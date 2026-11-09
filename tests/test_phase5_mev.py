@@ -1,12 +1,4 @@
-from mev.models import BundleCandidate
-from mempool.reorg import TriggerTracker
 from mev.policy import ChainMEVPolicy
-
-
-def test_bundle_candidate_net_ceiling():
-    c = BundleCandidate(1, "0xtrig", "0xraw", 100, 10_000, 100, 10, 1, 100)
-    assert c.gas_ceiling_wei == 1000
-    assert c.net_ceiling_profit_wei == 8900
 
 
 def test_target_block_policy():
@@ -20,9 +12,22 @@ def test_target_block_policy():
         raise AssertionError("stale/far target block accepted")
 
 
-def test_replacement_by_sender_nonce():
-    t = TriggerTracker()
-    assert t.observe("0xa", "0xsender", 7)[0] is None
-    prev, _ = t.observe("0xb", "0xsender", 7)
-    assert prev == "0xa"
-    assert t._by_hash["0xa"].status == "replaced"
+# DSS-WO-ENG-016 §4: the retired alternative MEV bundle models/orchestration
+# tests were removed with their modules. ChainMEVPolicy (retained — the relay
+# consumes it at private-submission time) is covered by
+# test_target_block_policy above and tests/test_phase6_execution.py.
+
+# DSS-WO-ENG-017 §3D: mempool/reorg.py (TriggerTracker) was retired — it had
+# no production caller. The canonical pipeline already handles trigger
+# replacement and reorg behaviour without it:
+#   * mempool/outcome.py resolves every pending trigger honestly against the
+#     mined block (mined → receipt-based outcome; not mined → aged out as
+#     "dropped" after MAX_PENDING_BLOCKS), and a REPLACED trigger tx re-enters
+#     the pipeline as a fresh pending transaction through the watcher
+#     (new hash → decoded → simulated → possibly promoted);
+#   * a promoted backrun's validity is enforced fail-closed at the execution
+#     boundary (execution_simulation fetches the trigger tx and includes its
+#     raw payload in the bundle — a replaced/dropped trigger fails the
+#     simulation or the bundle is simply not included), not by a separate
+#     bookkeeping tracker.
+# See docs/DEPENDENCIES.md §11 for the full disposition table.

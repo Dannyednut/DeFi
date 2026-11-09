@@ -20,7 +20,8 @@ from web3 import Web3
 from web3 import exceptions as w3_exceptions
 
 from config import (
-    CHAIN_ID, NATIVE_PRICE_USD, EXECUTE_ONCHAIN, MIN_PROFIT_USD, get_chain, get_rpc_configs
+    CHAIN_ID, NATIVE_PRICE_USD, MIN_PROFIT_USD, get_chain, get_rpc_configs,
+    execution_enabled
 )
 from utils.rpc_manager import MultiRPCManager
 from graph import TokenGraph
@@ -32,13 +33,12 @@ from cache import PoolCache
 from crawler import PoolCrawler
 from prices import PriceOracle
 from tvl import set_oracle, init_prices, set_graph_ref
-from detectors.cycles import CycleDetector, SharpeDetector
+from detectors.cycles import CycleDetector
 from detectors.specialized import NewPoolDetector, CrossProtocolDetector, StableImbalanceDetector, LiquidationScanner
 from detectors.advanced import SplitRouteDetector
 from mempool.pipeline import MempoolPipeline
 from execution_router import ExecutionRouter, OppSource, create_router
 from opportunity_engine import OpportunityEngine
-from mempool.decoder import SwapDecoder, build_router_map, get_router_addresses
 from block_information import BlockInformationCollector, ProtocolStateSynchronizer
 
 # ── Global shutdown signal ────────────────────────────────────────────────────
@@ -76,7 +76,6 @@ def build_detectors(w3, graph, logger, cache):
     """Build all detector instances."""
     return [
         CycleDetector(w3, graph, logger, cache, CHAIN_ID),
-        # SharpeDetector(w3, graph, logger, cache, CHAIN_ID),
         NewPoolDetector(w3, graph, logger, cache, CHAIN_ID),
         CrossProtocolDetector(w3, graph, logger, cache, CHAIN_ID),
         StableImbalanceDetector(w3, graph, logger, cache, CHAIN_ID),
@@ -525,14 +524,23 @@ def main():
     opportunity_engine = OpportunityEngine(w3, CHAIN_ID, detectors=detectors, graph=graph)
     log.info("Canonical OpportunityEngine ready")
 
+    # DSS-WO-ENG-015 R4: the master execution switch (EXECUTE_ONCHAIN) is
+    # the single execution authority. It stays disabled by default: the
+    # executor, signer and relay each re-check it at their own boundaries,
+    # so an accidentally armed router still cannot sign or submit.
+    if not execution_enabled():
+        log.info("Execution: DISABLED (EXECUTE_ONCHAIN) — monitoring only")
+
     executor = ArbExecutor(w3, chain_id=CHAIN_ID)
 
-    # Create execution router to centralize opp routing from detectors and mempool
+    # Create execution router to centralize opp routing from detectors and mempool.
+    # The router is the operational gate (it refuses to arm while the master
+    # switch is disabled); the executor/signer/relay enforce the switch
+    # independently at their own boundaries.
     router = create_router(
         tracker=tracker,
         executor=executor,
         config={
-            "EXECUTE_ONCHAIN": EXECUTE_ONCHAIN,
             "MIN_PROFIT_USD": MIN_PROFIT_USD,
             "MAX_EXECUTIONS": 3,
             "STREAMING_MULTIPLIER": 2.0,

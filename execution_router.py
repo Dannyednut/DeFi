@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from dataclasses import dataclass
 from enum import Enum
 
+from config import execution_enabled
 from log import get_logger
 
 if TYPE_CHECKING:
@@ -58,26 +59,43 @@ class ExecutionRouter:
     - Priority-based filtering
     - Result processing and lifecycle updates
     - Batch execution coordination
-    
+
+    EXECUTION GATING (DSS-WO-ENG-015 R4): the router retains its existing
+    responsibility for deciding whether opportunities enter the execution
+    pipeline. It refuses normal execution while the master switch
+    (EXECUTE_ONCHAIN) is disabled — read through ``config.execution_enabled()``
+    at decision time, never a cached snapshot — and while the executor is
+    not ready. The router is an OPERATIONAL control, not the only security
+    boundary: direct calls to the executor, signer or relay are enforced
+    independently at those boundaries.
+
+    SERIAL EXECUTION INVARIANT (DSS-WO-ENG-017 §3B): exactly ONE execution
+    worker ever calls ``executor.submit``. Signing/submission is
+    deliberately serial: the executor fetches a fresh "pending" nonce from
+    the RPC at transaction-build time, and with a single worker there is no
+    concurrent nonce race and no need for a nonce-reservation layer (the
+    unintegrated nonce-reservation utility was retired on that evidence).
+    ``async_workers`` is clamped to 1 — concurrent execution workers are
+    not supported and would double-spend the pending nonce.
+
     Usage:
-        router = ExecutionRouter(tracker, executor, config)
+        router = ExecutionRouter(tracker, executor)
         router.start()
-        
+
         # From detectors
         router.submit_opportunity(opp, OppSource.DETECTOR_CYCLES)
-        
+
         # From mempool
         router.submit_opportunity(opp, OppSource.MEMPOOL, priority=2.0)
-        
+
         router.shutdown()
     """
-    
+
     def __init__(
         self,
         tracker: "OpportunityTracker",
         executor: "ArbExecutor | None",
         *,
-        execute_onchain: bool = False,
         min_profit_usd: float = 0.01,
         max_executions_per_block: int = 3,
         streaming_multiplier: float = 2.0,
@@ -86,13 +104,25 @@ class ExecutionRouter:
     ):
         self.tracker = tracker
         self.executor = executor
-        # Check if executor is properly configured with arb_exec contract
-        executor_ready = executor is not None and getattr(executor, '_arb_exec', None) is not None
-        self.execute_onchain = execute_onchain and executor_ready
+        if self.executor is not None and getattr(self.executor, '_arb_exec', None) is None:
+            log.warning("[ROUTER] Executor has no arb_exec contract configured")
         self.min_profit_usd = min_profit_usd
         self.streaming_threshold = min_profit_usd * streaming_multiplier
         self.max_executions = max_executions_per_block
         self.queue_size = queue_size
+
+        # DSS-WO-ENG-017 §3B — enforce the serial-execution invariant:
+        # signing/submission is deliberately single-worker (fresh "pending"
+        # nonce per tx, no concurrent race). Any configured concurrency is
+        # clamped to 1, loudly, rather than silently racing nonces.
+        if int(async_workers) != 1:
+            log.warning(
+                "[ROUTER] async_workers=%s requested; execution is "
+                "deliberately SERIAL (single worker, fresh pending nonce "
+                "per transaction) — clamping to 1 (DSS-WO-ENG-017 §3B)",
+                async_workers,
+            )
+            async_workers = 1
         
         # Execution state
         self._executed_count = 0
@@ -105,7 +135,8 @@ class ExecutionRouter:
         self._execution_queue: queue.PriorityQueue = queue.PriorityQueue(maxsize=queue_size)
         self._execution_results: queue.Queue[tuple[RoutedOpportunity, Any]] = queue.Queue()
         
-        # Worker threads
+        # Worker threads — always the clamped value (see the serial-execution
+        # invariant above); async_workers was already clamped to 1.
         self._async_workers = async_workers
         self._worker_threads: list[threading.Thread] = []
         self._result_thread: threading.Thread | None = None
@@ -114,6 +145,26 @@ class ExecutionRouter:
     # Public API
     # ═══════════════════════════════════════════════════════════════════════════
     
+    @property
+    def execute_onchain(self) -> bool:
+        """Whether this router currently routes opportunities into the
+        execution pipeline: the executor must be ready AND the master
+        execution switch must be enabled.
+
+        DSS-WO-ENG-015 R4: this is re-evaluated at every access through
+        ``config.execution_enabled()`` — the authoritative process read —
+        so the decision is checked at the actual operation boundaries
+        (arming, submission, batch gating), not merely at construction
+        time. There is no second switch and no authorization object: the
+        executor, signer and relay enforce the same switch independently
+        at their own boundaries.
+        """
+        executor_ready = (
+            self.executor is not None
+            and getattr(self.executor, '_arb_exec', None) is not None
+        )
+        return executor_ready and execution_enabled()
+
     def start(self) -> None:
         """Start execution worker threads."""
         if not self.execute_onchain:
@@ -122,7 +173,7 @@ class ExecutionRouter:
             elif getattr(self.executor, '_arb_exec', None) is None:
                 log.warning("[ROUTER] Execution disabled (no arb_exec contract configured)")
             else:
-                log.warning("[ROUTER] Execution disabled (EXECUTE_ONCHAIN=False)")
+                log.warning("[ROUTER] Execution disabled (EXECUTE_ONCHAIN is disabled)")
             return
             
         log.info(f"[ROUTER] Starting execution router | workers={self._async_workers}")
@@ -240,9 +291,17 @@ class ExecutionRouter:
                 log.warning("[ROUTER] Execution queue full, skipping streaming")
                 return False
         
-        # Lower priority = will be processed in batch at end of block
-        # Just mark as eligible for batch execution
-        return False  # Not queued, but may be picked up by batch processor
+        # Lower priority (non-streaming) opportunities are NOT queued and
+        # NOT batch-processed: nothing in the runtime picks them up for
+        # execution (main.process_block routes every ready opportunity
+        # through submit_opportunity and never calls the batch method;
+        # the legacy Exec multiCall batch path is deliberately dormant —
+        # its individual call-failure behaviour is not equivalent to
+        # atomic batch execution, DSS-WO-ENG-016 §6). They remain tracked
+        # only (lifecycle/logging via tracker.process_block). Returning
+        # False states that disposition honestly: the opportunity was not
+        # accepted for execution.
+        return False
     
     def submit_batch_opportunities(
         self, 
@@ -253,6 +312,14 @@ class ExecutionRouter:
         """
         Submit multiple opportunities for batch execution.
         Returns list of opportunities that were NOT executed (for tracking).
+
+        DSS-WO-ENG-016 §6: this method currently has NO production caller —
+        main.process_block routes every ready opportunity through
+        submit_opportunity() only. The Exec.multiCall batch path it drives
+        is deliberately dormant: multiCall applies calls independently, so
+        one failed call does not revert the others — that is not atomic
+        batch execution. Do not re-enable it as the disposition of
+        lower-priority opportunities without a deliberate safety review.
         """
         if not self.execute_onchain or not opps:
             return opps
@@ -502,14 +569,29 @@ class ExecutionRouter:
 def create_router(
     tracker: "OpportunityTracker",
     executor: "ArbExecutor | None",
-    config: dict | None = None
+    config: dict | None = None,
 ) -> ExecutionRouter:
-    """Factory function to create execution router from config."""
+    """Factory function to create execution router from config.
+
+    DSS-WO-ENG-015 R4: whether execution may proceed is decided by the
+    master execution switch in the REAL process environment
+    (``config.execution_enabled()``), never by a config dict. A config
+    entry named EXECUTE_ONCHAIN is accepted only for backward-compatible
+    call sites and is ignored for the gating decision (an explicit warning
+    is logged when it is present, so an operator relying on the old
+    boolean sees why nothing executes).
+    """
     cfg = config or {}
+    if "EXECUTE_ONCHAIN" in cfg:
+        log.warning(
+            "[ROUTER] config contains EXECUTE_ONCHAIN=%s, but the master "
+            "execution switch is the EXECUTE_ONCHAIN PROCESS ENVIRONMENT "
+            "setting — a config-dict entry does not gate execution",
+            cfg["EXECUTE_ONCHAIN"],
+        )
     return ExecutionRouter(
         tracker=tracker,
         executor=executor,
-        execute_onchain=cfg.get("EXECUTE_ONCHAIN", False),
         min_profit_usd=cfg.get("MIN_PROFIT_USD", 0.01),
         max_executions_per_block=cfg.get("MAX_EXECUTIONS", 3),
         streaming_multiplier=cfg.get("STREAMING_MULTIPLIER", 2.0),

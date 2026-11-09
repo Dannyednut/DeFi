@@ -91,17 +91,71 @@ class OpportunityEngine:
         return self._dedupe(candidates)
 
     @staticmethod
-    def _dedupe(candidates: list[Opportunity]) -> list[Opportunity]:
+    def _identity_key(opp: Opportunity) -> tuple:
+        """Executable-route identity (DSS-WO-ENG-017 §5).
+
+        Two candidates are the SAME executable opportunity when they would
+        produce the same transaction: same chain, same ordered token path
+        (token_in = tokens[0], the borrowed asset), same ordered pool path,
+        same dex set. Detector THESIS information (arb_kind, opp_type,
+        detector name) is deliberately NOT part of the identity: it is
+        semantic strategy classification and must never let two otherwise
+        identical executable routes survive as separate candidates (or be
+        queued/executed twice via different detector sources).
+        """
+        return (
+            int(getattr(opp, "chain_id", 0) or 0),
+            tuple(x.lower() for x in opp.tokens),
+            tuple(x.lower() for x in opp.pools),
+            tuple(sorted({x.lower() for x in opp.dexes})),
+        )
+
+    @staticmethod
+    def _merge_provenance(winner: Opportunity, loser: Opportunity) -> None:
+        """Absorb a consolidated candidate's detector provenance into the
+        canonical opportunity (DSS-WO-ENG-017 §5): thesis and research
+        information are retained, never discarded — but the winner keeps
+        the strongest valid evidence and economics."""
+        meta = dict(winner.metadata or {})
+        provenance = dict(meta.get("detector_provenance") or {})
+        name = str(loser.metadata.get("detector") or getattr(loser.arb_kind, "value", "unknown"))
+        entry = dict(provenance.get(name) or {})
+        entry.setdefault("arb_kind", getattr(loser.arb_kind, "value", str(loser.arb_kind)))
+        entry.setdefault("opp_type", getattr(loser.opp_type, "value", str(loser.opp_type)))
+        if loser.metadata.get("quote_profit_wei") is not None:
+            entry["alt_quote_profit_wei"] = loser.metadata.get("quote_profit_wei")
+        for research_key in ("spread_pct", "buy_protocol", "sell_protocol",
+                             "curve_pool", "comparison_pool", "trigger_tx"):
+            if loser.metadata.get(research_key) is not None:
+                entry.setdefault(research_key, loser.metadata.get(research_key))
+        provenance[name] = entry
+        meta["detector_provenance"] = provenance
+        meta["consolidated_theses"] = sorted(
+            set(meta.get("consolidated_theses") or [])
+            | {getattr(winner.arb_kind, "value", str(winner.arb_kind)),
+               getattr(loser.arb_kind, "value", str(loser.arb_kind))}
+        )
+        winner.metadata = meta
+
+    @classmethod
+    def _dedupe(cls, candidates: list[Opportunity]) -> list[Opportunity]:
+        """Consolidate candidates by EXECUTABLE-ROUTE identity (see
+        _identity_key). The candidate with the strongest validated quote
+        wins; every absorbed candidate's detector provenance is merged
+        into the canonical opportunity instead of being discarded."""
         best = {}
         for opp in candidates:
-            key = (opp.chain_id, opp.arb_kind.value,
-                   tuple(x.lower() for x in opp.tokens),
-                   tuple(x.lower() for x in opp.pools),
-                   tuple(x.lower() for x in opp.dexes))
-            score = float((opp.metadata or {}).get("quote_profit_wei", 0))
+            key = cls._identity_key(opp)
+            score = float((opp.metadata or {}).get("quote_profit_wei", 0) or 0)
             cur = best.get(key)
-            if cur is None or score > cur[0]:
+            if cur is None:
                 best[key] = (score, opp)
+                continue
+            if score > cur[0]:
+                cls._merge_provenance(opp, cur[1])
+                best[key] = (score, opp)
+            else:
+                cls._merge_provenance(cur[1], opp)
         return [v[1] for v in best.values()]
 
     def _apply_validation(self, candidates: list[Opportunity], block_number: int) -> list[Opportunity]:

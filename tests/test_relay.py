@@ -17,6 +17,9 @@ asset):
     matches and the payload is the agent's;
   - the chain is re-checked IMMEDIATELY before broadcast: a chain that
     changes between the first read and the broadcast is refused;
+  - the chain is ALSO re-checked IMMEDIATELY before a private bundle
+    submission (DSS-WO-ENG-016 §3C): a chain that changes between the
+    initial verification and send_bundle() prevents the submission;
   - private (Flashbots) submission NEVER falls back to the public
     mempool on failure;
   - private submission respects the chain-specific MEV policy;
@@ -253,6 +256,47 @@ class TestRelayPrivateSubmission(unittest.TestCase):
             )
             self.assertFalse(result.success)
             self.assertEqual(result.error, "target block is stale")
+            self.assertEqual(w3.eth.sent, [])
+
+    # ── DSS-WO-ENG-016 §3C: final chain-identity verification on the
+    # Flashbots route (parity with the direct route) ────────────────────
+
+    def test_chain_change_before_bundle_submission_is_refused(self):
+        # The chain changes between the initial verification (read 1 =
+        # Sepolia, at the relay entry) and the FINAL pre-bundle recheck
+        # (read 2 = chain 1, immediately before send_bundle) → the bundle
+        # is never sent and nothing is broadcast.
+        with patch("executor.relay.FLASHBOTS_CHAINS", frozenset({SEPOLIA})):
+            w3 = self._flashbots_w3([SEPOLIA, 1])
+            raw = _signed_raw(self.key)
+            result = relay_transaction(
+                w3, raw, expected_chain_id=SEPOLIA,
+                use_flashbots=True, target_block=101,
+                target_tx=b"\x09" * 32,  # atomic-backrun bundle shape
+            )
+            self.assertFalse(result.success)
+            self.assertEqual(result.method, "refused")
+            self.assertIn("chain mismatch", result.error)
+            w3.flashbots.send_bundle.assert_not_called()
+            self.assertEqual(w3.eth.sent, [])
+
+    def test_bundle_submitted_when_chain_identity_stable(self):
+        # Control: the chain identity is re-verified and still matches →
+        # the bundle IS submitted exactly once, to the fresh target block.
+        with patch("executor.relay.FLASHBOTS_CHAINS", frozenset({SEPOLIA})):
+            w3 = self._flashbots_w3([SEPOLIA])
+            raw = _signed_raw(self.key)
+            result = relay_transaction(
+                w3, raw, expected_chain_id=SEPOLIA,
+                use_flashbots=True, target_block=101,
+            )
+            w3.flashbots.send_bundle.assert_called_once()
+            self.assertEqual(
+                w3.flashbots.send_bundle.call_args.kwargs.get(
+                    "target_block_number"),
+                101,
+            )
+            self.assertEqual(result.method, "flashbots")
             self.assertEqual(w3.eth.sent, [])
 
 

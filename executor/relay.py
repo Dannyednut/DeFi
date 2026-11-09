@@ -15,7 +15,8 @@ Enforcement at this boundary (every step fails closed):
      SUBMISSION time — read from the REAL process environment via
      ``config.execution_enabled()``; a disabled run cannot broadcast;
   2. the RPC-REPORTED chain ID must equal the executor's expected chain —
-     re-checked again IMMEDIATELY before the broadcast (not only during
+     re-checked again IMMEDIATELY before the broadcast on BOTH routes
+     (direct send and Flashbots bundle submission alike; not only during
      transaction construction or signing);
   3. the signed transaction must originate from the approved signing
      process and correspond to the expected transaction/network: the raw
@@ -471,6 +472,14 @@ def _relay_flashbots(
         else:
             bundle = [{"signed_transaction": raw_tx}]
 
+        # FINAL chain-identity verification (DSS-WO-ENG-016 §3C — parity
+        # with the direct route): after transport preparation and
+        # immediately before the bundle leaves the process, the
+        # RPC-REPORTED chain must still equal the expected chain. A stale,
+        # re-pointed or mismatched transport at this point prevents the
+        # submission entirely (fail closed).
+        check_chain_identity(w3, chain_id)
+
         result = w3.flashbots.send_bundle(bundle, target_block_number=int(target_block))
 
         if result:
@@ -500,6 +509,12 @@ def _relay_flashbots(
             log.warning("Private bundle submission returned no result; refusing public fallback for atomic backrun")
             return RelayResult(success=False, tx_hash="", method="flashbots", error="private bundle rejected")
 
+    except ExecutionRefused as e:
+        # A policy refusal (e.g. the final chain-identity recheck) is a
+        # REFUSED outcome, not a transport failure — same semantics as the
+        # direct route. Nothing was submitted.
+        log.warning(f"Private relay refused: {e}")
+        return RelayResult(success=False, tx_hash="", method="refused", error=str(e))
     except Exception as e:
         log.warning(
             f"Private bundle relay failed ({sanitize_error(e, *forbidden)}); "

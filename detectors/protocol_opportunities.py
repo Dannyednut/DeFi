@@ -6,6 +6,7 @@ validation, economics and ranking live outside the detectors.
 from __future__ import annotations
 
 from detectors.base import BaseDetector
+from bounded_discovery import BoundedDiscoveryConfig, normalize_pair
 from logger import Opportunity, OppType
 from config import get_chain, MIN_LIQUIDITY_USD
 from routing import ArbKind, execution_capability
@@ -34,67 +35,90 @@ class CrossProtocolDetector(BaseDetector):
     arb_kind = ArbKind.CROSS_DEX_SPREAD
     MIN_SPREAD_PCT = 0.15
 
-    def on_block(self, block_number: int) -> list[Opportunity]:
+    def on_block(self, block_number: int, extra_pairs: list[tuple[str, str]] | None = None) -> list[Opportunity]:
+        """Anchor-pair fragmentation search, optionally supplemented (MI-102B).
+
+        ``extra_pairs`` are the engine-supplied, TVL-ranked additional pairs
+        from the shared RankedPairUniverse. They SUPPLEMENT the anchor pairs:
+        every existing anchor pair is preserved, keys are normalized so
+        opposite directions cannot duplicate a pair, and the total number of
+        pair checks is capped at ``BoundedDiscoveryConfig.max_pair_checks``
+        (MI-001A bounded design: 6 anchor pairs + 24 additional = 30 on
+        chain 1). All venues of a pair are retrieved via
+        all_edges_for_pair(); multi-venue pairs are never reduced to one
+        representative pool.
+        """
         out: list[Opportunity] = []
         chain = get_chain(self.chain_id)
         anchors = [chain.wrapped_native] + list(chain.stablecoins)
+        budget = BoundedDiscoveryConfig().max_pair_checks
         seen: set[tuple[str, str]] = set()
+        pair_list: list[tuple[str, str]] = []
         for i, a in enumerate(anchors):
             for b in anchors[i + 1:]:
-                token_in, token_out = a.lower(), b.lower()
-                key = tuple(sorted((token_in, token_out)))
-                if key in seen:
+                key = normalize_pair(a, b)
+                if key[0] == key[1] or key in seen:
                     continue
                 seen.add(key)
-                edges = [e for e in self.graph.all_edges_for_pair(token_in, token_out)
-                         if e.chain_id == self.chain_id and e.tvl_usd >= MIN_LIQUIDITY_USD
-                         and e.token_in.lower() == token_in]
-                # all_edges_for_pair() returns edges for the PAIR regardless
-                # of direction -- a token_in->token_out rate and its
-                # token_out->token_in reciprocal are NOT comparable
-                # quantities (e.g. ~2000 USDC-per-WETH vs ~0.0005 WETH-per-
-                # USDC), so without the token_in filter above, sorting by
-                # raw exchange_rate below could pick one edge's forward rate
-                # as "buy" and a DIFFERENT edge's reverse rate as "sell",
-                # producing a nonsensical spread (confirmed: a constructed
-                # test case produced a "420249900%" spread this way). This
-                # was previously masked by a separate TokenGraph bug that
-                # silently dropped one direction per pool from the pair
-                # index entirely, so all_edges_for_pair() never actually
-                # returned mixed directions in practice -- fixing that
-                # storage bug exposed this one.
-                if len(edges) < 2:
-                    continue
-                edges.sort(key=lambda e: e.exchange_rate)
-                buy, sell = edges[0], edges[-1]
-                if buy.exchange_rate <= 0 or sell.exchange_rate <= 0:
-                    continue
-                spread = (sell.exchange_rate / buy.exchange_rate - 1.0) * 100.0
-                if spread < self.MIN_SPREAD_PCT:
-                    continue
-                protocols = [buy.protocol, sell.protocol]
-                supported, reason = execution_capability(protocols)
-                out.append(self._opportunity(
-                    opp_type=OppType.CROSS_PROTOCOL,
-                    block_number=block_number,
-                    tokens=[token_in, token_out, token_in],
-                    pools=[buy.pool_address, sell.pool_address],
-                    dexes=[buy.dex_name, sell.dex_name],
-                    estimated_profit_ratio=spread / 100.0,
-                    estimated_profit_usd=0.0,
-                    confidence=0.65,
-                    metadata={
-                        "arb_kind": self.arb_kind.value,
-                        "buy_protocol": buy.protocol,
-                        "sell_protocol": sell.protocol,
-                        "buy_rate": buy.exchange_rate,
-                        "sell_rate": sell.exchange_rate,
-                        "spread_pct": spread,
-                        "execution_supported": supported,
-                        "execution_reason": reason,
-                        "requires_exact_validation": supported,
-                    },
-                ))
+                pair_list.append(key)
+        for pair in extra_pairs or []:
+            if len(pair_list) >= budget:
+                break
+            key = normalize_pair(*pair)
+            if key[0] == key[1] or key in seen:
+                continue
+            seen.add(key)
+            pair_list.append(key)
+        for token_in, token_out in pair_list:
+            edges = [e for e in self.graph.all_edges_for_pair(token_in, token_out)
+                     if e.chain_id == self.chain_id and e.tvl_usd >= MIN_LIQUIDITY_USD
+                     and e.token_in.lower() == token_in]
+            # all_edges_for_pair() returns edges for the PAIR regardless
+            # of direction -- a token_in->token_out rate and its
+            # token_out->token_in reciprocal are NOT comparable
+            # quantities (e.g. ~2000 USDC-per-WETH vs ~0.0005 WETH-per-
+            # USDC), so without the token_in filter above, sorting by
+            # raw exchange_rate below could pick one edge's forward rate
+            # as "buy" and a DIFFERENT edge's reverse rate as "sell",
+            # producing a nonsensical spread (confirmed: a constructed
+            # test case produced a "420249900%" spread this way). This
+            # was previously masked by a separate TokenGraph bug that
+            # silently dropped one direction per pool from the pair
+            # index entirely, so all_edges_for_pair() never actually
+            # returned mixed directions in practice -- fixing that
+            # storage bug exposed this one.
+            if len(edges) < 2:
+                continue
+            edges.sort(key=lambda e: e.exchange_rate)
+            buy, sell = edges[0], edges[-1]
+            if buy.exchange_rate <= 0 or sell.exchange_rate <= 0:
+                continue
+            spread = (sell.exchange_rate / buy.exchange_rate - 1.0) * 100.0
+            if spread < self.MIN_SPREAD_PCT:
+                continue
+            protocols = [buy.protocol, sell.protocol]
+            supported, reason = execution_capability(protocols)
+            out.append(self._opportunity(
+                opp_type=OppType.CROSS_PROTOCOL,
+                block_number=block_number,
+                tokens=[token_in, token_out, token_in],
+                pools=[buy.pool_address, sell.pool_address],
+                dexes=[buy.dex_name, sell.dex_name],
+                estimated_profit_ratio=spread / 100.0,
+                estimated_profit_usd=0.0,
+                confidence=0.65,
+                metadata={
+                    "arb_kind": self.arb_kind.value,
+                    "buy_protocol": buy.protocol,
+                    "sell_protocol": sell.protocol,
+                    "buy_rate": buy.exchange_rate,
+                    "sell_rate": sell.exchange_rate,
+                    "spread_pct": spread,
+                    "execution_supported": supported,
+                    "execution_reason": reason,
+                    "requires_exact_validation": supported,
+                },
+            ))
         return out
 
 

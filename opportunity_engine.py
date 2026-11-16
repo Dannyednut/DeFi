@@ -11,6 +11,8 @@ import time
 from logger import Opportunity, ValidationStage
 from optimizer.opportunity_ranker import rank, RankConfig
 from config import NATIVE_PRICE_USD
+from bounded_discovery import BoundedDiscoveryConfig, RankedPairUniverse, pool_is_searchable
+from log import get_logger
 
 @dataclass(frozen=True)
 class PipelineResult:
@@ -27,6 +29,18 @@ class OpportunityEngine:
     validation_workers: int = 4
     max_ready: int = 12
     graph: object | None = None
+    # ── MI-102B: bounded event-independent discovery ─────────────────────────
+    # The engine owns the cadence and the shared pair universe; detectors are
+    # invoked through their existing on_block contracts and every candidate
+    # converges on the same dedup/validation pipeline below.
+    scheduled_discovery: bool = True
+    scheduled_pass_interval: int = 50
+    bounded_config: BoundedDiscoveryConfig = field(default_factory=BoundedDiscoveryConfig)
+    pair_universe: RankedPairUniverse | None = None
+    _last_scheduled_block: int | None = None
+    _last_scheduled_info: dict = field(default_factory=dict)
+    _last_pass_reason: str = ""
+    _notified_new_pools: list[str] = field(default_factory=list)
 
     def _context(self, block_number: int) -> tuple[int, str]:
         header = self.w3.eth.get_block(block_number)
@@ -61,6 +75,28 @@ class OpportunityEngine:
             _, bh = self._context(block_number)
             state_block = block_number
             state_source = "onchain:block_header"
+
+        def finalize(found, detector_name: str | None) -> None:
+            """Shared canonicalization + route-state annotation for every
+            discovery source (reactive detectors AND the MI-102B scheduled
+            pass), so both paths converge on identical candidate shaping."""
+            for opp in found or []:
+                if int(opp.chain_id) != int(self.chain_id):
+                    continue
+                canonical = self._canonicalize(opp, detector_name, block_number, bh, state_block, state_source)
+                # Discovery provenance (MI-102B): scheduled outputs are tagged
+                # "scheduled" before finalize; everything else is reactive.
+                canonical.metadata.setdefault("discovery_mode", "reactive")
+                if self.graph is not None and canonical.pools:
+                    edges = [e for pool in canonical.pools for e in self.graph.get_edges_for_pool(pool)]
+                    if edges:
+                        route_blocks = [int(e.state_block) for e in edges if int(e.state_block) > 0]
+                        route_statuses = {getattr(e, "state_status", "UNKNOWN") for e in edges}
+                        canonical.metadata["route_state_block"] = min(route_blocks) if route_blocks else 0
+                        canonical.metadata["route_state_status"] = "INVALID" if "INVALID" in route_statuses else ("UNCERTAIN" if "UNCERTAIN" in route_statuses else ("FRESH" if "FRESH" in route_statuses else "STALE"))
+                        canonical.metadata["route_state_source"] = sorted({getattr(e, "state_source", "") for e in edges if getattr(e, "state_source", "")})
+                candidates.append(canonical)
+
         for detector in self.detectors:
             try:
                 interval = max(1, int(getattr(detector, "block_interval", 1) or 1))
@@ -70,25 +106,162 @@ class OpportunityEngine:
                 if interval > 1 and block_number % interval != 0:
                     continue
                 found = detector.on_block(block_number, touched_pools=touched_pools) if detector.name == "cycles" else detector.on_block(block_number)
-                for opp in found or []:
-                    if int(opp.chain_id) != int(self.chain_id):
-                        continue
-                    canonical = self._canonicalize(opp, detector.name, block_number, bh, state_block, state_source)
-                    if self.graph is not None and canonical.pools:
-                        edges = [e for pool in canonical.pools for e in self.graph.get_edges_for_pool(pool)]
-                        if edges:
-                            route_blocks = [int(e.state_block) for e in edges if int(e.state_block) > 0]
-                            route_statuses = {getattr(e, "state_status", "UNKNOWN") for e in edges}
-                            canonical.metadata["route_state_block"] = min(route_blocks) if route_blocks else 0
-                            canonical.metadata["route_state_status"] = "INVALID" if "INVALID" in route_statuses else ("UNCERTAIN" if "UNCERTAIN" in route_statuses else ("FRESH" if "FRESH" in route_statuses else "STALE"))
-                            canonical.metadata["route_state_source"] = sorted({getattr(e, "state_source", "") for e in edges if getattr(e, "state_source", "")})
-                    candidates.append(canonical)
+                finalize(found, detector.name)
             except Exception as exc:
-                from log import get_logger
                 get_logger("opportunity_engine").error(
                     f"Detector '{getattr(detector, 'name', type(detector).__name__)}' failed: {exc}", exc_info=True
                 )
+
+        # MI-102B: bounded event-independent pass. Runs through the same
+        # finalize() shaping and the same _dedupe/_apply_validation pipeline
+        # as the reactive path; a candidate reachable by both paths carries
+        # one executable-route identity and cannot enter the pipeline twice.
+        try:
+            finalize(self._scheduled_pass_opportunities(block_number, touched_pools), None)
+        except Exception as exc:
+            get_logger("opportunity_engine").error(f"Scheduled discovery pass failed: {exc}", exc_info=True)
         return self._dedupe(candidates)
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # MI-102B: bounded event-independent discovery
+    # ════════════════════════════════════════════════════════════════════════════
+
+    def notify_new_pools(self, pool_addresses) -> None:
+        """Graph-growth hook (MI-102B §5): make newly registered pools
+        eligible for the next scheduled discovery pass without waiting for
+        their first swap event. Nothing is discovered here; pools are
+        filtered for searchability when the next pass consumes them."""
+        for addr in pool_addresses or []:
+            a = (addr or "").lower()
+            if a and a not in self._notified_new_pools:
+                self._notified_new_pools.append(a)
+
+    @property
+    def last_scheduled_pass_block(self) -> int | None:
+        """Block number of the most recent scheduled pass (observability)."""
+        return self._last_scheduled_block
+
+    @property
+    def last_scheduled_pass_info(self) -> dict:
+        """Stats of the most recent scheduled pass (observability, §7)."""
+        return dict(self._last_scheduled_info)
+
+    def _consume_new_pool_seeds(self) -> list[str]:
+        """Drain newly registered pools (graph ring + explicit notifications),
+        keep only valid searchable state, bounded per pass. Searchable pools
+        beyond the per-pass budget are retained for the next pass (burst
+        spreading); unsearchable registrations are dropped, not retried: they
+        become discovery-eligible again only through a real state update
+        (which touches them reactively) or re-registration."""
+        pending: list[str] = []
+        ring = getattr(self.graph, "recently_registered", None)
+        if ring is not None:
+            pending.extend(ring.drain())
+        pending.extend(self._notified_new_pools)
+        self._notified_new_pools = []
+        ordered = list(dict.fromkeys(pending))
+        searchable = [p for p in ordered if pool_is_searchable(self.graph, p)]
+        kept = searchable[: self.bounded_config.max_new_pool_seeds_per_pass]
+        self._notified_new_pools = searchable[len(kept):]
+        return kept
+
+    def _scheduled_pass_opportunities(self, block_number: int, touched_pools: set[str] | None) -> list[Opportunity]:
+        """One bounded scheduled pass, or nothing.
+
+        A pass runs when the cadence is due (every ``scheduled_pass_interval``
+        blocks) OR newly registered pools are waiting; an ordinary quiet
+        block therefore costs nothing beyond the reactive path. The pass is
+        NOT a second pipeline: it invokes the existing detectors (cycle
+        search with bounded seeds, pair search with the expanded universe)
+        and returns raw detector output for the shared finalize/dedupe/
+        validation path. Cost is bounded by construction (≤30 pair checks,
+        ≤max_seed_pools DFS origins) and observable via last_scheduled_pass_info.
+        """
+        if not self.scheduled_discovery or self.graph is None:
+            return []
+        ring_len = len(getattr(self.graph, "recently_registered", ()) or ())
+        has_pending = ring_len > 0 or bool(self._notified_new_pools)
+        due = self._last_scheduled_block is None or \
+            (int(block_number) - self._last_scheduled_block) >= max(1, int(self.scheduled_pass_interval))
+        if not due and not has_pending:
+            return []
+        if not due and has_pending and self._last_pass_reason == "new_pools" \
+                and (int(block_number) - self._last_scheduled_block) < max(1, int(self.bounded_config.new_pool_pass_spacing)):
+            # Registration burst (e.g. warm restart): consecutive new-pool
+            # passes are spaced out; a single new pool is still considered on
+            # the very next block.
+            return []
+        started = time.time()
+        reason = "cadence" if due else "new_pools"
+
+        universe = self.pair_universe
+        if universe is None:
+            universe = RankedPairUniverse(self.graph, self.chain_id, self.bounded_config)
+            self.pair_universe = universe
+        universe.refresh(block_number)
+
+        # Newly registered pools seed FIRST so ranking cannot starve them;
+        # the TVL-ranked universe venues fill the remaining seed budget.
+        # Pools the reactive path just scanned are skipped (no double work).
+        touched_lower = {p.lower() for p in (touched_pools or ())}
+        new_seeds = self._consume_new_pool_seeds()
+        seeds: list[str] = []
+        seen: set[str] = set()
+        for s in new_seeds:
+            if s not in seen:
+                seen.add(s)
+                seeds.append(s)
+        for s in universe.seed_pools():
+            if len(seeds) >= self.bounded_config.max_seed_pools:
+                break
+            if s in seen or s in touched_lower:
+                continue
+            seen.add(s)
+            seeds.append(s)
+
+        self._last_scheduled_block = int(block_number)
+        self._last_pass_reason = reason
+        self._last_scheduled_info = {
+            **universe.last_stats,
+            "block": int(block_number),
+            "reason": reason,
+            "new_pool_seeds": len(new_seeds),
+            "seed_pools_selected": len(seeds),
+        }
+
+        out: list[Opportunity] = []
+        for detector in self.detectors:
+            name = getattr(detector, "name", "")
+            try:
+                if name == "cycles":
+                    if not seeds:
+                        continue
+                    found = detector.on_block(block_number, touched_pools=None, scheduled_seeds=set(seeds))
+                elif name == "cross_proto":
+                    found = detector.on_block(block_number, extra_pairs=universe.additional_pairs())
+                else:
+                    # Every other detector keeps its own thesis and cadence
+                    # in the reactive loop above; the scheduled pass does not
+                    # invent new theses.
+                    continue
+                for opp in found or []:
+                    meta = dict(opp.metadata or {})
+                    meta["discovery_mode"] = "scheduled"
+                    meta["scheduled_pass"] = True
+                    meta["scheduled_pass_reason"] = reason
+                    opp.metadata = meta
+                out.extend(found or [])
+            except Exception as exc:
+                get_logger("opportunity_engine").error(
+                    f"Scheduled pass: detector '{name}' failed: {exc}", exc_info=True
+                )
+        self._last_scheduled_info["pass_ms"] = round((time.time() - started) * 1000.0, 3)
+        get_logger("opportunity_engine").info(
+            "[SCHEDULED-PASS] block=%s reason=%s additional_pairs=%s seeds=%d new_pools=%d pass_ms=%s",
+            block_number, reason, self._last_scheduled_info.get("additional_pairs", 0),
+            len(seeds), len(new_seeds), self._last_scheduled_info["pass_ms"],
+        )
+        return out
 
     @staticmethod
     def _identity_key(opp: Opportunity) -> tuple:

@@ -898,8 +898,49 @@ CHAINS: dict[int, ChainConfig] = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ARB_EXEC_ADDRESS = os.getenv("ARB_EXEC_ADDRESS", "").strip() or None
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "").strip() or None
+# DSS-WO-ENG-015 R4: the legacy PRIVATE_KEY-based signing path remains
+# REMOVED. There is no import-time private-key loading anywhere in this
+# repository: the only wallet path is the DSS secret-store custody
+# mechanism in executor/signer.py (load_wallet), reached through the
+# single execution path Router → ArbExecutor → Builder → Signer → Relay.
+# Do NOT reintroduce a PRIVATE_KEY setting.
+#
+# EXECUTE_ONCHAIN is the SINGLE master execution switch (DSS-WO-ENG-015
+# R4: the parallel execution-authorization architecture was retired; the
+# switch is the one and only execution authority — there is no second
+# switch). The constant below is the import-time snapshot used for
+# startup banners and reporting only.
+# Every enforcement point (router, executor, signer, relay) MUST decide
+# through execution_enabled() — the authoritative process read at
+# operation time — so a run started disabled cannot be flipped on by
+# editing module state, and tests patch the real environment instead of
+# config attributes.
 EXECUTE_ONCHAIN = os.getenv("EXECUTE_ONCHAIN", "false").lower() == "true"
+
+
+def execution_enabled() -> bool:
+    """THE single authoritative master-execution-switch decision.
+
+    Reads the REAL process environment (``os.environ``) at CALL time —
+    never a cached module value — so the decision is checked at the
+    actual operation boundaries (router arming, executor submission,
+    signing, relay broadcast), not merely when the application starts.
+
+    Semantics (DSS-WO-ENG-015 R4):
+
+      * ``EXECUTE_ONCHAIN`` is the one master execution switch. It is
+        disabled by default and must be explicitly set to ``true`` in
+        the process environment to enable any signing or submission.
+      * There is deliberately no parameter, no configuration object and
+        no second switch: callers cannot pass an "enabled" flag into a
+        signing or submission API, and no other environment variable
+        participates in the decision.
+      * Offline tests patch ``os.environ`` (the authoritative setting);
+        production deployments set it in the process environment.
+
+    Fail-closed: anything other than an explicit ``true`` is disabled.
+    """
+    return os.environ.get("EXECUTE_ONCHAIN", "false").strip().lower() == "true"
 
 # Enhanced settings
 MIN_PROFIT_USD = float(os.getenv("MIN_PROFIT_USD", "1.0"))

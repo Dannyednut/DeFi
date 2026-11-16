@@ -9,10 +9,15 @@ import sys
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1]))
 
 
-def test_full_pipeline_end_to_end():
+def test_full_pipeline_end_to_end(monkeypatch):
 
     from unittest.mock import MagicMock, patch
     from eth_utils import to_checksum_address
+
+    # DSS-WO-ENG-015 R4: the router is armed by the MASTER EXECUTION SWITCH
+    # (EXECUTE_ONCHAIN) in the REAL process environment; offline tests
+    # simulate the enabled state by patching os.environ (the authoritative
+    # setting). There is no authorization boundary object anymore.
 
     W = 10**18
     WETH = to_checksum_address("0x" + "e0"*20)
@@ -191,7 +196,8 @@ def test_full_pipeline_end_to_end():
     w3v.eth.call.return_value = b""
 
     with patch("validation.opportunity.get_chain") as mock_get_chain, \
-         patch("executor.signer.get_sender", return_value=to_checksum_address("0x" + "11"*20)):
+         patch("validation.opportunity.recorded_agent_address",
+               return_value=to_checksum_address("0x" + "11"*20)):
         mock_get_chain.return_value = MagicMock(arb_exec_address=ARB_EXEC)
         validator = OpportunityValidator(w3v, chain_id=1)
         assert validator.contract is not None, "validator should have picked up the mocked ArbExec address"
@@ -271,7 +277,8 @@ def test_full_pipeline_end_to_end():
     w3v.eth.contract.return_value = fake_contract2
 
     with patch("validation.opportunity.get_chain") as mock_get_chain2, \
-         patch("executor.signer.get_sender", return_value=to_checksum_address("0x" + "11"*20)):
+         patch("validation.opportunity.recorded_agent_address",
+               return_value=to_checksum_address("0x" + "11"*20)):
         mock_get_chain2.return_value = MagicMock(arb_exec_address=ARB_EXEC)
         validator2 = OpportunityValidator(w3v, chain_id=1)
         result2 = validator2.validate(opp2, block_number=100)
@@ -344,10 +351,30 @@ def test_full_pipeline_end_to_end():
     execution_result.block_number = 100
     fake_executor.submit.return_value = execution_result
 
-    router = create_router(tracker=tracker, executor=fake_executor, config={
-        "EXECUTE_ONCHAIN": True, "MIN_PROFIT_USD": 0.01, "MAX_EXECUTIONS": 3,
-    })
-    assert router.execute_onchain is True, "router should be armed given EXECUTE_ONCHAIN=True + a ready executor"
+    # DSS-WO-ENG-015 R4: the master execution switch is the EXECUTE_ONCHAIN
+    # process-environment setting, read through config.execution_enabled()
+    # (monkeypatch keeps the change scoped to this test). A disabled switch
+    # must keep the router disarmed even with a ready executor; a config-
+    # dict entry does not gate execution.
+    monkeypatch.setenv("EXECUTE_ONCHAIN", "false")
+    boolean_only_router = create_router(
+        tracker=tracker, executor=fake_executor,
+        config={"EXECUTE_ONCHAIN": True, "MIN_PROFIT_USD": 0.01, "MAX_EXECUTIONS": 3},
+    )
+    assert boolean_only_router.execute_onchain is False, (
+        "a disabled EXECUTE_ONCHAIN must keep the router disarmed; a "
+        "config-dict entry does not gate execution"
+    )
+
+    monkeypatch.setenv("EXECUTE_ONCHAIN", "true")
+    router = create_router(
+        tracker=tracker, executor=fake_executor,
+        config={"MIN_PROFIT_USD": 0.01, "MAX_EXECUTIONS": 3},
+    )
+    assert router.execute_onchain is True, (
+        "router should be armed given an enabled master switch + a "
+        "ready executor"
+    )
 
     accepted = router.submit_opportunity(opp2, OppSource.DETECTOR_CYCLES, priority=1.0)
     print(f"  submit_opportunity() accepted: {accepted}")

@@ -103,17 +103,14 @@ class PoolCrawler:
                     name=f"crawler_bootstrap_{dex.name}",
                 ))
             elif dex.version == 2 and dex.factory:
-                # NOTE: this used to also start _v2_worker (index-scanning via
-                # allPairsLength()/allPairs(i), one RPC call per new pair)
-                # running concurrently, forever, alongside this log-based
-                # worker — a redundant, strictly more expensive duplicate of
-                # the same discovery job (one get_logs call can find many new
-                # pairs at once; index-scanning needs one call per pair).
-                # register_new_pool()'s has_pool() dedup meant it never
-                # caused duplicate graph entries, just wasted RPC calls.
-                # _v2_worker is kept in the class (below) as an available
-                # fallback if a factory is ever found not to emit
-                # PairCreated reliably, but is no longer started by default.
+                # V2 discovery is THIS log-based worker only: the old
+                # _v2_worker index scanner (allPairsLength()/allPairs(i),
+                # one RPC call per new pair) was retired by
+                # DSS-WO-ENG-017 §4B as a strictly more expensive duplicate
+                # of the same discovery responsibility that nothing could
+                # activate. One get_logs call here finds many new pairs at
+                # once, and the event-discovery worker below catches
+                # PairCreated events for factories outside this loop.
                 tasks.append(asyncio.create_task(
                     self._v2_log_worker(dex.factory, dex.name, dex.fee_bps, dex.deploy_block),
                     name=f"crawler_v2_logs_{dex.name}",
@@ -129,8 +126,16 @@ class PoolCrawler:
         tasks.append(asyncio.create_task(self._authoritative_tvl_loop(), name="crawler_gecko_tvl"))
         tasks.append(asyncio.create_task(self._garbage_collector(), name="crawler_gc"))
         
-        # GOLD UPGRADE: Selective Discovery & Metadata Backfill
-        # Instead of redundant top-50, we backfill metadata for tokens we already know
+        # Token-metadata backfill (DSS-WO-ENG-017 §4B — deliberate
+        # disposition: retained, NOT started). _metadata_backfill_loop()
+        # (below) is the only component that re-fetches symbol/decimals/
+        # price metadata for graph tokens discovered WITHOUT it (its
+        # absence breaks USD pricing for those tokens). It is a slow,
+        # subgraph-bound maintenance job, deliberately not started in the
+        # default worker set. To activate it manually, uncomment the task
+        # line below (or call crawler._metadata_backfill_loop() from an
+        # operator console); it exits cleanly with the crawler's stop flag.
+        #
         # tasks.append(asyncio.create_task(self._metadata_backfill_loop(), name="crawler_metadata_backfill"))
         
         log.info(f"{len(tasks)} workers started")
@@ -604,75 +609,14 @@ class PoolCrawler:
             "event_discovery_dropped": self.event_discovery_dropped,
         }
     
-    # ═══════════════════════════════════════════════════════════════════════════════
-    # V2 WORKER (Ongoing - loads new pairs as they're created)
-    # ═══════════════════════════════════════════════════════════════════════════════
-    
-    async def _v2_worker(self, factory_addr: str, dex_name: str, fee_bps: int) -> None:
-        log.info(f"V2 worker started: {dex_name}")
-        
-        factory = self._w3.eth.contract(
-            address=self._w3.to_checksum_address(factory_addr),
-            abi=UNISWAP_V2_FACTORY_ABI,
-        )
-        
-        while self.running:
-            try:
-                total = await asyncio.get_event_loop().run_in_executor(
-                    None, factory.functions.allPairsLength().call
-                )
-                cursor = self._cache.get_v2_cursor(factory_addr)
-                start = cursor + 1
-                
-                if start >= total:
-                    await asyncio.sleep(30)
-                    continue
-                
-                end = min(start + CRAWLER_V2_BATCH, total)
-                
-                for i in range(start, end):
-                    if not self.running:
-                        return
-                    
-                    try:
-                        pair_addr = await asyncio.get_event_loop().run_in_executor(
-                            None, factory.functions.allPairs(i).call
-                        )
-                        pair_addr = pair_addr.lower()
-                        
-                        if not self._cache.has_pool(pair_addr):
-                            # Delegating to centralized register_new_pool for accurate TVL
-                            await register_new_pool(
-                                self._w3, self._graph, self._cache, self._graph_client,
-                                pair_addr, dex_name, 2, fee_bps
-                            )
-                            self.v2_discovered += 1
-                        else:
-                            self.v2_filtered += 1
-                        
-                        self._cache.set_v2_cursor(factory_addr, i)
-                    
-                    except Exception as e:
-                        if "429" in str(e):
-                            log.warning(f"V2 index {i} rate limit hit (429). Backing off 10s.")
-                            await asyncio.sleep(10)
-                        else:
-                            log.debug(f"V2 index {i} error: {e}")
-                    
-                    await asyncio.sleep(CRAWLER_TICK_SLEEP)
-                
-                self._cache.save_if_dirty()
-            
-            except asyncio.CancelledError:
-                self._cache.save()
-                return
-            except Exception as e:
-                log.warning(f"V2 worker error: {e}")
-                if "429" in str(e):
-                    await asyncio.sleep(15)
-                else:
-                    await asyncio.sleep(5)
-    
+    # The V2 index-scanning worker (_v2_worker, allPairsLength()/allPairs(i)
+    # enumeration) was retired by DSS-WO-ENG-017 §4B: it was a second,
+    # strictly more expensive implementation of the SAME discovery job the
+    # started _v2_log_worker performs (one get_logs call finds many new
+    # pairs; index-scanning needs one RPC call per pair), and nothing —
+    # config, CLI or code — could activate it. PairCreated-based discovery
+    # plus the event-discovery worker below are the single V2 discovery
+    # responsibility.
     async def _v2_log_worker(self, factory_addr: str, dex_name: str, fee_bps: int, deploy_block: int) -> None:
         """V2 Discovery via PairCreated events."""
         log.info(f"V2 log worker started: {dex_name}")

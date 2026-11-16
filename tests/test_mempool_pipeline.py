@@ -21,7 +21,7 @@ def v2_out(amount_in, r_in, r_out, fee_bps=30):
     return aif * r_out // (r_in * 10_000 + aif)
 
 
-def test_mempool_backrun_pipeline_end_to_end():
+def test_mempool_backrun_pipeline_end_to_end(monkeypatch):
     W = 10**18
     WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".lower()
     USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".lower()
@@ -121,7 +121,8 @@ def test_mempool_backrun_pipeline_end_to_end():
     w3v.eth.call.return_value = b""
 
     with patch("validation.opportunity.get_chain") as mock_get_chain, \
-         patch("executor.signer.get_sender", return_value=to_checksum_address("0x" + "11" * 20)):
+         patch("validation.opportunity.recorded_agent_address",
+               return_value=to_checksum_address("0x" + "11" * 20)):
         mock_get_chain.return_value = MagicMock(arb_exec_address=ARB_EXEC)
         validator = OpportunityValidator(w3v, chain_id=1)
         result = validator.validate(tracker_opp, block_number=101)
@@ -166,7 +167,15 @@ def test_mempool_backrun_pipeline_end_to_end():
     exec_result.block_number = 101
     fake_executor.submit.return_value = exec_result
 
-    router = create_router(tracker=tracker, executor=fake_executor, config={"EXECUTE_ONCHAIN": True})
+    # DSS-WO-ENG-015 R4: the router is armed by the MASTER EXECUTION SWITCH
+    # (EXECUTE_ONCHAIN) in the REAL process environment — read through
+    # config.execution_enabled(); monkeypatch keeps the change scoped to
+    # this test. A config-dict entry does not gate execution.
+    monkeypatch.setenv("EXECUTE_ONCHAIN", "true")
+    router = create_router(
+        tracker=tracker, executor=fake_executor,
+        config={"EXECUTE_ONCHAIN": True},
+    )
     enriched.metadata["execution_simulated"] = True
     assert router.submit_opportunity(enriched, OppSource.BACKRUN, priority=2.0) is True
 

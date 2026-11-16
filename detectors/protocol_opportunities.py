@@ -4,13 +4,10 @@ Each detector owns exactly one arbitrage thesis.  Shared opportunity shaping,
 validation, economics and ranking live outside the detectors.
 """
 from __future__ import annotations
-import time
-from typing import Iterable
 
 from detectors.base import BaseDetector
-from graph import TokenGraph
 from logger import Opportunity, OppType
-from config import get_chain, NATIVE_PRICE_USD, MIN_LIQUIDITY_USD
+from config import get_chain, MIN_LIQUIDITY_USD
 from routing import ArbKind, execution_capability
 from log import get_logger
 
@@ -165,13 +162,8 @@ class StableImbalanceDetector(BaseDetector):
         return out
 
 
-class ProtocolOpportunityDetector:
-    """Compatibility facade; runtime orchestration should use distinct detectors."""
-    name = "protocol_opportunities"
-
-    def __init__(self, w3, graph: TokenGraph, chain_id: int):
-        self.cross = CrossProtocolDetector(w3, graph, None, None, chain_id)
-        self.stable = StableImbalanceDetector(w3, graph, None, None, chain_id)
-
-    def on_block(self, block_number: int) -> list[Opportunity]:
-        return self.cross.on_block(block_number) + self.stable.on_block(block_number)
+# The two-detector compatibility facade class that used to live here was
+# retired by DSS-WO-ENG-017 §3E: it had no production or public consumer —
+# main.py registers CrossProtocolDetector and StableImbalanceDetector
+# individually and the canonical engine owns orchestration. The two detector
+# classes above are the canonical implementations and stay here.

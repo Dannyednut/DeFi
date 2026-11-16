@@ -109,7 +109,7 @@ Baseline scope then: 23 failed / 86 passed / 1 error; CI scope: 22 failed / 86 p
 ### Excluded / gated tests (current state after ENG-003 + PR #2 gate work)
 | Test | Status |
 | --- | --- |
-| tests/test_flashbots_integration.py | **Rewritten in ENG-003 (Workstream B, PR #1)** and NO LONGER excluded: the old module-level `PRIVATE_KEY`/signing/broadcast-at-import script is gone. The file now collects safely, never touches keys or network at import, and both live phases skip visibly without `DSS_TESTNET_FLASHBOTS_LIVE=1` + `DSS_TESTNET_RPC_URL` + the agent keystore. Submission additionally requires `DSS_TESTNET_EXEC=1`. Since ENG-004 (PR #2) the test is routed through the unified execution gate (`executor/testnet_gate.py`) — the single wallet/authorization path; the relay is a transport only. Chain-ID gate (mainnet always refused, unknown chains fail closed) is unit-tested offline. CI can never sign, broadcast or submit through it. |
+| tests/test_flashbots_integration.py | **Rewritten in ENG-003 (Workstream B, PR #1)** and NO LONGER excluded: the old module-level `PRIVATE_KEY`/signing/broadcast-at-import script is gone. The file now collects safely, never touches keys or network at import, and both live phases skip visibly without `DSS_TESTNET_FLASHBOTS_LIVE=1`. Since DSS-WO-ENG-015 R4 the test is routed through the retained Builder → Signer → Relay path gated by the EXECUTE_ONCHAIN master switch (the retired `executor/testnet_gate.py` / `DSS_TESTNET_EXEC` no longer exist). Chain-ID gate (mainnet always refused, unknown chains fail closed) is unit-tested offline. CI can never sign, broadcast or submit through it. |
 | tests/test_multicall3_yieldout.py::test_run_multicall3_batch_yieldOut | Still excluded from CI: requires a local artifact from a live run (`logs/pending_opportunities.jsonl`) before it even dials `https://0xrpc.io/eth`; fails on a clean clone with "No cycles to test." Classified network/environment-dependent; candidate for the same gated rewrite later. |
 | tests/test_optimizer.py (live diagnostic portion) | The offline tests always run; the preserved manual live diagnostic skips visibly unless `DSS_LIVE_OPTIMIZER_DIAG=1`. |
 
@@ -175,3 +175,226 @@ testnet signing operation; the Flashbots relay is a transport only:
   PR #1 and are gone after merging `main`; the integrated branch passes
   the corrected baseline. All PR #2 additions (ENG-004 through ENG-011)
   pass.
+
+## 10. DSS-WO-ENG-016 — canonical runtime path reconciliation (PR #3)
+
+One coherent, correctly validated execution path for ordinary and
+mempool-backrun opportunities; the unused alternative orchestration is
+retired with call-site evidence (repository-wide import/call audit):
+
+- **Retired — `executor/mev_execution.py`** (MEVExecutionService): zero
+  production callers (only a structural signature test referenced it).
+  It was an alternative orchestration layer that signed a
+  caller-supplied unsigned transaction dict directly, bypassing the
+  builder's transaction policy. Promotion, validation, simulation and
+  routing already happen in the canonical path
+  (OpportunityEngine → ExecutionRouter → ArbExecutor → Builder → Signer
+  → Relay).
+- **Retired — `mev/models.py`, `mev/simulator.py`, `mev/inclusion.py`:**
+  after the orchestration retirement these had no production consumers
+  (tests + package re-exports only). The canonical simulation paths are
+  `validation/opportunity.py` (eth_call/estimateGas), the adversarial
+  simulator and `executor/relay.simulate_bundle`. The orphaned
+  inclusion-bid arithmetic (`BidConfig`/`BidResult`/`BidOptimizer` in
+  `optimizer/execution_economics.py`) was removed with its only
+  consumer.
+- **Retained — `mev/policy.py`:** production consumer is
+  `executor/relay.py` (ChainMEVPolicy gates private bundle submission).
+- **Retired — `mempool/engine.py`:** the pipeline instantiated
+  MempoolOpportunityEngine but never called any method; classification
+  and execution gating happen in the canonical path. The unused
+  `PendingObservation` import went with it.
+- **Retained (inactive, out of scope):** `mempool/reorg.py`
+  (TriggerTracker), `executor/relay_registry.py`, `executor/nonce_manager.py`
+  have no current production callers but are not part of the named
+  reconciliation scope; disposition deferred to a future work order.
+- **Corrected runtime defects (regression-covered in
+  `tests/test_eng016_backrun_correctness.py` and `tests/test_relay.py`):**
+  mempool execution profit handling (validated-profit fail-closed + the
+  contract-level minProfit guard), preflight-skip audit handling
+  (distinct `skipped` audit outcome, no AttributeError in enabled
+  contexts), and the Flashbots final chain-identity recheck immediately
+  before `send_bundle` (parity with the direct route).
+- **Lower-priority opportunities (§6):** non-streaming opportunities are
+  not queued and not batch-processed — they remain tracked only. The
+  misleading router comment claiming batch pickup was corrected; the
+  dormant `Exec.multiCall` batch path (independent per-call failure —
+  not atomic) was NOT re-enabled.
+
+## 11. DSS-WO-ENG-017 — final architecture reconciliation (PR #3)
+
+This section is the post-reconciliation architecture baseline. It
+describes what the repository ACTUALLY implements. §10's deferral note
+("reorg/relay_registry/nonce_manager retained inactive") is superseded by
+the final dispositions below.
+
+### 11.1 Authoritative production call graph
+
+    PoolCrawler ──► TokenGraph (pool/reserve state) ──┐
+    BlockInformationCollector (per-block state) ──────┤
+    MempoolWatcher ─► MempoolPipeline ─► MempoolSimulator
+                              │  (PendingOpportunity)
+                              ▼
+              OpportunityEngine.process_candidates  ◄── block detectors
+                      │   (dedupe by executable-route identity,
+                      │    validate_many, adversarial sim, enrich, rank)
+                      ▼
+              PipelineResult.ready ──► ExecutionRouter.submit_opportunity
+                      │                  (serial single worker; fingerprint
+                      │                   dedup; streaming priority rules)
+                      ▼
+              ArbExecutor.submit (EXECUTE_ONCHAIN checked here)
+                      │   _validated_profit_wei → lender → profit gate →
+                      │   build_arb_data (validated floor = ArbData.minProfit)
+                      ▼
+              Builder.build_execute_tx (transaction policy)
+                      ▼
+              Signer.sign_transaction (switch/chain/custody)
+                      ▼
+              Relay.relay_transaction (switch/chain/provenance; direct
+                                       or Flashbots bundle + simulation)
+                      ▼
+              OpportunityTracker lifecycle (OPEN/UPDATE/CLOSE) + audit log
+
+Mempool backruns ride the SAME engine/validation/router path
+(MempoolPipeline._promote_and_route → OpportunityEngine.process_candidates
+→ ExecutionRouter.submit_opportunity(source=BACKRUN, priority=2.0)); no
+mempool component can promote a candidate to execution-ready on its own.
+
+### 11.2 Active component responsibilities
+
+| Component | Actual responsibility |
+| --- | --- |
+| `opportunity_engine.py` | Single canonical pipeline: detector scheduling, executable-route dedup, validation, adversarial simulation, economics enrichment, ranking, bounded ready queue (`max_ready`). |
+| `validation/opportunity.py` | Execution-grade validation: on-chain `yieldOut` quote + full state-changing `eth_call`/`estimateGas` at a pinned block; stamps `quote_profit_wei`, `validated_profit_floor_wei` (90 % quote retention), `validated_gas_units`, lender mode. |
+| `validation/adversarial.py` | Backrun adversarial simulation against the trigger transaction. |
+| `optimizer/opportunity_economics.py` | Canonical economics enrichment: converts gas to profit-token units, computes net profit via `ExecutionEconomics`, stamps `economics_profitable`. |
+| `execution_router.py` | Operational gate + serial execution queue (one worker, priority streaming for backruns/high profit, per-block execution cap, fingerprint dedup). |
+| `executor/executor.py` | Per-opportunity execution orchestration: validated-floor resolution (fail closed), lender selection, profit gate, ArbData construction, simulation, sign, relay. |
+| `executor/builder.py` | ArbData + transaction construction; full transaction policy at the construction boundary (single AND batch). |
+| `executor/signer.py` | The only signing path (custody, chain binding, switch recheck). |
+| `executor/relay.py` | The only submission path (direct RPC or Flashbots bundle; switch/chain/provenance rechecks; bundle simulation). |
+| `executor/lender.py` | Flash-loan source selection (Aave → Balancer → pool flash swap). |
+| `executor/audit.py` | Execution audit records (success/refused/failed/skipped). |
+| `mev/policy.py` | `ChainMEVPolicy`: chain MEV capability profile, enforced by the relay at private submission. |
+| `detectors/*` | One thesis each (cycles, new_pool, cross_proto, stable_imbalance, split_route, liquidation); quote/discovery only. |
+| `mempool/*` | Watcher (pending tx stream), decoder, impact simulator, outcome resolver (mined/dropped/accuracy), deduper. |
+| `crawler.py` | Pool discovery workers (V2/V3 log workers, Curve/Balancer/SyncSwap/Aerodrome bootstraps, event discovery, stale refresh, authoritative TVL, GC). |
+| `tracker.py` | Opportunity lifecycle by executable-route fingerprint (OPEN/UPDATE/CLOSE, FILLED_BY_COMPETITOR/EXPIRED). |
+
+### 11.3 Final disposition table (every ENG-017 candidate)
+
+| Candidate | Disposition | Evidence |
+| --- | --- | --- |
+| `executor/mev_execution.py`, `mempool/engine.py`, `mev/models.py`, `mev/simulator.py`, `mev/inclusion.py`, inclusion-bid classes | **Retired (ENG-016, verified)** | Deleted in commit `0dd6525`/`b2e76f8`; zero live imports; only absence-asserting guard tests + docs + explanatory docstrings remain. |
+| `executor/nonce_manager.py` | **Retired (ENG-017 §3B)** | Execution is deliberately SERIAL: `ExecutionRouter` runs exactly one worker (now clamped to 1 with a loud warning) and the executor fetches a fresh `pending` nonce per tx at build time (`build_execute_tx`). No concurrent nonce race exists; an unintegrated reservation utility would only suggest unsupported concurrency. Module deletion + symbol ban enforced in `tests/test_r4_execution_boundary.py`. |
+| `executor/relay_registry.py` | **Retired (ENG-017 §3C)** | Relay selection = chain `FLASHBOTS_RPCS` config + `ChainMEVPolicy` + fail-closed `profile_for` checks in `executor/relay.py`. No multi-relay requirement exists; the registry had zero production importers (test-only). |
+| `mempool/reorg.py` (`TriggerTracker`) | **Retired (ENG-017 §3D)** | `mempool/outcome.py` resolves every pending trigger against the mined block (receipt-based outcome; not-mined ages out as `dropped` after `MAX_PENDING_BLOCKS`); a REPLACED trigger re-enters the pipeline as a fresh pending tx (new hash → decode → simulate → promote). Backrun validity is enforced fail-closed at the execution boundary (`execution_simulation` fetches the trigger tx and bundles its raw payload; a replaced/dropped trigger fails the sim or the bundle is never included). Sole importer was a test. |
+| `ProtocolOpportunityDetector` facade | **Retired (ENG-017 §3E)** | Zero references repo-wide. `main.py` registers `CrossProtocolDetector` + `StableImbalanceDetector` individually; the canonical engine owns orchestration. The two real detector classes remain in `detectors/protocol_opportunities.py`. |
+| Sharpe detector (external-API two-pool subclass) | **Retired (ENG-017 §3F)** | Never registered (`main.py` had it commented out), no test, no docs; detector name collided with its parent (`"cycles"`), which would have corrupted detector provenance; network-bound at detection time; produced the SAME executable two-pool cross-DEX routes CycleDetector already finds from local graph state. An external-API signal source is a future strategy-research option, not an active detector. |
+| `execution/` (`route_ir`, `route_compiler`, `protocol_builders`, `arbexec_adapter`, `atomic`) + `simulation/exact_route.py` | **Research-only (ENG-017 §3G)** | Zero production consumers (only intra-package edges + `simulation/exact_route.py → execution/route_ir.py`). Fully offline-tested (`test_phase7/10/11/13`, `test_exec_contract_alignment`). Retained as the unique route-IR → multi-protocol calldata → Exec-adapter research surface. ISOLATION IS EXPLICIT: compiling/adapting a route does NOT make a protocol executable through the deployed Exec.sol (V2-style pairs + V3 pools only). Known fidelity limits documented in `arbexec_adapter` (fixed 997/1000 V2 fee math; ≥2-pool BadPath floor now enforced). NOT wired into the runtime — that would manufacture the appearance of capability the contract does not have. |
+| `simulation/economics.py`, `simulation/state_transition.py` | **Retired (ENG-017 §3G)** | Zero consumers beyond their own re-exports; pure duplicates (economics delegation to `optimizer.execution_economics`; bundle simulation already in `executor/relay.py`). |
+| `RelayTarget` (mev/policy.py); `EconomicsInput` + `ExecutionEconomics.from_input` | **Retired (ENG-017 §4)** | Zero consumers; `from_input` also hid a unit assumption (gas in the same unit as every other term) that the canonical enrichment deliberately avoids. |
+| `main.py` dead decoder imports; `detectors/base.py` unused imports/dead method/commented blocks; cycles.py orphaned imports; `_v2_worker` | **Retired (ENG-017 §4)** | Text-match leads verified against real usage first: decoder setup lives in `MempoolPipeline`; `_v2_worker` was a strictly more expensive duplicate of the started `_v2_log_worker` that nothing could activate. |
+| `PoolCrawler._metadata_backfill_loop` | **Retained, deliberately NOT started (documented)** | The only token-metadata backfill utility (symbols/decimals/prices for tokens discovered without them). Slow, subgraph-bound maintenance job; activation path documented at the commented launch line in `crawler.start()`. |
+
+### 11.5 Protocol execution-capability matrix
+
+The deployed contract (Dannyednut/EVM @ 898fe82f, `contracts/Exec.sol`) has
+exactly one swap dispatch (`_swap`): a `fee()`-selector probe routes to
+Uniswap-V3 pool logic, everything else must answer the standard
+Uniswap-V2 pair interface (`token0()/token1()/getReserves()/swap()`),
+with V2 outputs computed at the FIXED 997/1000 fee factor
+(`Helper.getAmountOutV2`). Balancer is a flash-loan SOURCE only, never a
+swap venue. Capability requires the chain's `arb_exec_address`
+(configured for chains 1, 56, 11155111 only — every other chain fails
+closed at the builder).
+
+| Protocol label (edge.protocol) | Discovery | Quote/simulation | Route compilation (research/) | Canonical validation | Exec.sol native execution | Production execution eligibility |
+| --- | --- | --- | --- | --- | --- | --- |
+| `uniswap_v2` (incl. SushiswapV2/PancakeV2/RingswapV2 forks — same label by `DexConfig.__post_init__`) | ✅ V2 log worker + factories | ✅ reserves / yieldOut | ✅ route_compiler + adapter | ✅ OpportunityValidator | ✅ standard pair interface — executed at 30 bps math regardless of configured fee (fidelity gap for 25 bps forks) | **YES** (`ARB_EXEC_NATIVE`) |
+| `uniswap_v3` (incl. SushiswapV3/PancakeV3 forks) | ✅ V3 worker + subgraphs | ✅ Quoter / yieldOut | ✅ route_compiler + adapter | ✅ OpportunityValidator | ✅ `fee()`-probe V3 path | **YES** (`ARB_EXEC_NATIVE`) |
+| `aerodrome_v2` | ✅ (Base log worker) | ✅ adapter `getAmountOut` | ✅ `protocol_builders.aerodrome_v2` | ❌ gated out by `execution_capability` | ❌ no Solidly/stable branch in Exec.sol | **NO** — discovery/quote/research only |
+| `curve` | ✅ (bootstrap/API) | ✅ adapter `get_dy` | ✅ pool + Router-NG builders | ❌ | ❌ | **NO** — discovery/quote/research only |
+| `balancer_v2` | ⚠️ vault env config only | ✅ `queryBatchSwap` | ✅ batchSwap builder | ❌ | ❌ as swap venue (flash-loan source only) | **NO** — discovery/quote/research only |
+| `syncswap` | ✅ (zkSync log worker) | ✅ adapter `getAmountOut` | ✅ router swap builder | ❌ | ❌ | **NO** — discovery/quote/research only |
+
+`routing.execution_capability` (single source of truth at detection time)
+keeps every non-`uniswap_v2`/`uniswap_v3` route out of validation and
+execution with an explicit reason string; adapters existing in
+`protocols/` or `execution/protocol_builders.py` do NOT change this.
+
+### 11.6 Canonical opportunity validation, economics and deduplication
+
+* **Validation evidence.** `OpportunityValidator` quotes the route through
+  the real contract (`yieldOut`) and then simulates the full state-changing
+  `swap` at a pinned block. `validated_profit_floor_wei` = 90 % of the
+  validated quote (controlled quote-drift allowance); `quote_profit_wei`
+  is the raw contract quote. Both are TOKEN-denominated (the borrowed
+  `tokenIn`'s base units).
+* **Missing vs invalid (fail closed).** The executor resolves the floor
+  with `optimizer.opportunity_economics.enrich`'s exact precedence:
+  floor key present → must be a positive integer; genuinely absent →
+  permitted positive quote fallback; detector simulation profit as the
+  last evidence tier. An explicitly present zero/negative/non-numeric
+  value is INVALID and fails closed before any build/sign/submit — it is
+  never silently replaced. `enrich` likewise refuses to attach economics
+  to non-positive or malformed evidence.
+* **Contract-level guard.** `ArbData.minProfit` = max(validated floor,
+  retained stricter detector value). The one retained stricter value is
+  the CycleDetector's estimated gas cost, written in tokenIn units ONLY
+  when tokenIn is the chain's wrapped native (otherwise 0) — origin and
+  denomination verified. Native-currency gas figures are NEVER assigned
+  to the token-denominated guard; a successful Flashbots simulation never
+  overwrites or weakens it (simulation runs the real contract, so success
+  itself proves the simulated profit reaches the floor; only the gas
+  LIMIT is refined from measured `gas_used`, and gas economics stay in
+  the off-chain profitability assessment). Ordinary, mempool and batch
+  preparation all run the SAME policy.
+* **Executable-opportunity identity.** Engine dedup and tracker
+  fingerprints share one identity: chain + ordered token path + ordered
+  pool path + dex set. Detector theses (arb_kind/opp_type/detector) are
+  semantic classification, never identity. Equivalent routes from
+  different detectors consolidate into ONE canonical candidate (strongest
+  validated quote wins) with merged `detector_provenance`/
+  `consolidated_theses`; the router's queue dedup rides the same
+  fingerprint, so a duplicate cannot enter execution twice through
+  different detector sources. Methodology note: no representative
+  historical production data exists in the repository; the consolidation
+  and identity rules are proven with deterministic detector-shaped
+  fixtures in `tests/test_eng017_opportunity_identity.py` (3 detector
+  theses over one route → 1 candidate; no production frequency statistics
+  are claimed).
+
+### 11.7 Lower-priority (non-streaming) opportunity disposition
+
+Unchanged from ENG-016 and re-confirmed: non-streaming opportunities are
+NOT queued and NOT batch-processed — they remain tracked only
+(lifecycle via `tracker.process_block`, honest `False` return from
+`submit_opportunity`). The dormant `Exec.multiCall` batch path is NOT a
+safe substitute (independent per-call failure — not atomic) and stays
+disabled; `submit_batch_opportunities` has no production caller.
+Backrun/high-priority candidates retain their streaming priority
+(priority 2.0, backrun boost), the per-block execution cap
+(`MAX_EXECUTIONS=3`) and bounded queue (`QUEUE_SIZE=10`) are respected,
+and no candidate is ever reported queued/executed when it was not (the
+mempool dashboard now records every significant candidate with its
+actual promoted count). Broader opportunity allocation and capital
+prioritisation belong to the upcoming strategy-development phase —
+execution volume and master policy were NOT changed here.
+
+### 11.8 Execution authorization boundary and disabled default
+
+* `EXECUTE_ONCHAIN` (process environment) is the single master switch,
+  default DISABLED. It is read live (`config.execution_enabled()`) at
+  every boundary: router arming/queueing, executor submission (single
+  and batch), signer, and relay (independently re-checked immediately
+  before broadcast and again right before `send_bundle`).
+* The transaction policy at the construction boundary enforces: chain
+  identity, recipient = configured `arb_exec_address`, zero native
+  value, gas/fee ceilings, monetary fee-exposure cap, no access lists —
+  identical for single and batch.
+* Wallet custody remains the single signer path; no key material exists
+  outside `executor/signer.py`. All development and CI runs use offline
+  fixtures and mocked RPC/relay/builder/signer boundaries; no
+  transaction was signed or submitted during this reconciliation.

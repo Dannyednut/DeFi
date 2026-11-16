@@ -1,38 +1,69 @@
 """
 executor/executor.py
 ====================
-Top-level arbitrage execution orchestrator.
+Top-level arbitrage execution orchestrator (DSS-WO-ENG-015 R4).
+
+The EXISTING multi-chain execution architecture is retained and
+strengthened: this module consumes Opportunity objects and executes
+profitable arbitrage through the single application execution path
+
+    ExecutionRouter → ArbExecutor → Builder → Signer → Relay → Receipt/Result
+
+The R1–R3 parallel execution-authorization architecture was retired by
+DSS-WO-ENG-015 R4; the useful security work it introduced lives inside
+the existing components:
+
+  * the MASTER EXECUTION SWITCH (EXECUTE_ONCHAIN) is checked HERE, at
+    every submission entry point, and again independently at the signer
+    and the relay — no single refactored boundary is load-bearing alone;
+  * every transaction is BUILT through the builder's policy validation
+    (chain identity, configured arb recipient, zero native value, gas and
+    monetary fee-exposure ceilings) — the batch path runs the SAME
+    validation as the single path, so neither is a weaker alternative;
+  * every transaction is SIGNED through executor/signer.py (the single
+    authoritative wallet-loading path, wallet-identity binding, chain
+    verification before AND immediately before signing);
+  * every transaction is SUBMITTED through executor/relay.py (submission-
+    time switch check, signed-payload provenance verification, chain
+    recheck immediately before broadcast, fail-closed private submission).
 
 Flow for each Opportunity:
-  1. Extract arb_data and optimal_amount_in from metadata
+  1. Master-switch check (fail closed: a refusal is a FAILED result)
+  2. Extract arb_data and optimal_amount_in from metadata
      - 2-pool: arb_data comes from getProfit() via simulate_cycle()
      - 3+ pool: build arb_data from raw opp fields + golden section amount
-  2. Refine optimal amount off-chain (may improve on on-chain estimate)
-  3. Select lender (Aave → Balancer → pool flash swap)
-  4. Profit gate: verify net profit > gas cost + min threshold
-  5. Build EIP-1559 transaction
-  6. Sign
-  7. Relay (direct or Flashbots bundle)
-  8. Log result
+     - mempool: amountIn=0 (the contract computes its optimal borrow);
+       profit_wei is the canonical validated profit stamped by the
+       pipeline (validated_profit_floor_wei → quote_profit_wei — the
+       same precedence as the canonical economics enrichment) and it is
+       also the contract-level minProfit guard; a candidate without a
+       positive validated profit fails closed (DSS-WO-ENG-016 §3A)
+  3. Refine optimal amount off-chain (may improve on on-chain estimate)
+  4. Select lender (Aave → Balancer → pool flash swap)
+  5. Profit gate: verify net profit > gas cost + min threshold
+  6. Build EIP-1559 transaction (builder enforces the transaction policy)
+  7. Sign (signer enforces switch/chain/custody)
+  8. Relay (relay enforces switch/chain/provenance; direct or Flashbots)
+  9. Log result + audit record
 
 Thread safety: ArbExecutor is designed for single-threaded use within
-process_block(). Nonce is fetched fresh per execution via "pending" tag.
+process_block(). The ExecutionRouter runs exactly ONE execution worker
+(async_workers is clamped to 1), so signing/submission is deliberately
+SERIAL and each transaction's nonce is fetched fresh from the RPC
+("pending" tag) at build time — no concurrent nonce race exists and no
+nonce-reservation layer is needed (DSS-WO-ENG-017 §3B).
 """
 from __future__ import annotations
 
-import os
-import json
-import time
 from dataclasses import dataclass
 
 from web3 import Web3
-from eth_account import Account
 from eth_abi import decode
 from eth_utils import to_bytes
 
 from config import (
     CHAIN_ID, DEFAULT_GAS_UNITS, MIN_PROFIT_USD,
-    ARB_EXEC_ABI, FLASHBOTS_RPCS, get_chain,
+    ARB_EXEC_ABI, FLASHBOTS_RPCS, get_chain, execution_enabled,
 )
 from logger import Opportunity
 from tvl import token_price
@@ -46,7 +77,11 @@ from .builder import (
     MIN_EXECUTION_PROFIT_USD,
 )
 from .signer import sign_transaction, get_sender
-from .relay import relay_transaction, wait_for_receipt, RelayResult
+from .relay import (
+    relay_transaction, wait_for_receipt, simulate_bundle, RelayResult,
+)
+from .errors import ExecutionRefused
+from . import audit as execution_audit
 from log import get_logger
 
 log = get_logger("executor")
@@ -58,7 +93,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="web3")
 class ExecutionResult:
     success: bool
     tx_hash: str
-    method: str           # relay method used
+    method: str           # relay method used: "direct" | "flashbots" | "refused"
     lender: str           # lender used
     amount_in: int        # actual amount borrowed
     profit_wei: int       # expected profit
@@ -84,11 +119,13 @@ class ExecutionResult:
 
 class ArbExecutor:
     """
-    Consumes Opportunity objects and executes profitable arbitrage on-chain.
+    Consumes Opportunity objects and executes profitable arbitrage on-chain
+    through the existing Builder → Signer → Relay path.
 
     Args:
         w3:       Web3 HTTP instance (reliable for tx submission).
-        chain_id: Current chain ID.
+        chain_id: Current chain ID (config.CHAIN_ID — the configured
+                  network identity of the running process).
     """
 
     def __init__(self, w3: Web3, chain_id: int = CHAIN_ID):
@@ -105,77 +142,221 @@ class ArbExecutor:
             )
             log.info(f"ArbExecutor ready | contract={selected_address}")
 
+            # Chain-aware relay SELECTION (which private-relay capability
+            # this chain is configured for). Actual transport attachment
+            # happens lazily inside the relay module on first private
+            # submission — after the master switch, chain-identity and
+            # provenance checks — never at import or construction time.
             relay_uri_available = self.chain_id in FLASHBOTS_RPCS
             try:
-                from flashbots import FlashbotsWeb3, flashbot
+                from flashbots import FlashbotsWeb3, flashbot  # noqa: F401
                 flashbot_available = True
             except ImportError:
                 log.warning("Flashbots package not found; bundle relay disabled")
                 flashbot_available = False
             self.use_flashbots = relay_uri_available and flashbot_available
 
-            if self.use_flashbots:
-                Account.enable_unaudited_hdwallet_features()
-
-                # Flashbots authentication key (different from the signing key for txs)
-                file = os.path.join(os.path.dirname(__file__), "relay_signer.json")
-                password = os.getenv("RELAY_PASSWORD", "relay")
-
-                if os.path.exists(file):
-                    with open(file, "r") as f:
-                        key = Account.decrypt(json.load(f), password)
-                        self.relay_signer = Account.from_key(key)
-                else:
-                    self.relay_signer = Account.create()
-                    # save relay_signer to file
-                    keystore = Account.encrypt(self.relay_signer.key, password)
-                    with open(file, "w") as f:
-                        json.dump(keystore, f, indent=4)
-
-                log.info(f"Relay initialized; identity={self.relay_signer.address}")
-
-                flashbots_rpc = FLASHBOTS_RPCS.get(chain_id, FLASHBOTS_RPCS[1])
-                flashbot(w3, self.relay_signer, flashbots_rpc)
-                log.info(f"Flashbots relay configured | uri={flashbots_rpc}")
-
         else:
             log.warning("ArbExecutor: no arb_exec_address configured — execution disabled")
+
+    # ── enforcement helpers ──────────────────────────────────────────────
+
+    @staticmethod
+    def _validated_profit_wei(opp: Opportunity) -> int | None:
+        """Resolve the canonical token-denominated profit floor.
+
+        Missing-versus-invalid semantics mirror
+        ``optimizer.opportunity_economics.enrich`` exactly: a dict lookup
+        with a default only falls back when the key is ABSENT, so an
+        explicitly present zero, negative or non-numeric value is INVALID
+        evidence and fails closed — it is never silently replaced by
+        another value that would weaken validation (DSS-WO-ENG-017 §2).
+
+        Precedence (all tokenIn-denominated base units):
+          1. ``validated_profit_floor_wei`` — the canonical validator's
+             quote-retention floor (present → must be a positive integer);
+          2. ``quote_profit_wei`` — the permitted positive validated quote
+             fallback, used only when the floor key is genuinely absent;
+          3. ``simulation_profit_wei`` — the detector's own token-
+             denominated simulation profit, the enrichment chain's last
+             evidence tier.
+
+        Returns ``None`` when execution must not proceed (missing or
+        invalid evidence → fail closed).
+        """
+        meta = opp.metadata or {}
+        if "validated_profit_floor_wei" in meta:
+            raw = meta["validated_profit_floor_wei"]
+        elif "quote_profit_wei" in meta:
+            raw = meta["quote_profit_wei"]
+        else:
+            raw = opp.simulation_profit_wei or 0
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _contract_min_profit(meta_min_profit: object, validated_floor_wei: int) -> int:
+        """Resolve the contract-level ``ArbData.minProfit``.
+
+        The canonical validated floor is ALWAYS the authoritative minimum.
+        The one retained stricter value is the detector's metadata
+        ``min_profit``: CycleDetector writes its estimated gas cost there
+        in tokenIn base units ONLY when tokenIn is the chain's wrapped
+        native (otherwise 0), so its origin and token denomination are
+        verified (DSS-WO-ENG-017 §2.7). A malformed value is ignored
+        rather than trusted; a smaller value never lowers the floor.
+        """
+        try:
+            stricter = int(meta_min_profit) if meta_min_profit is not None else 0
+        except (TypeError, ValueError):
+            log.debug(
+                "ignoring non-integer metadata min_profit=%r — the "
+                "validated floor stays the contract minimum",
+                meta_min_profit,
+            )
+            stricter = 0
+        return max(stricter, int(validated_floor_wei))
+
+    @staticmethod
+    def _refused_result(error: str) -> ExecutionResult:
+        """A refused attempt is an explicit FAILED result — never a success
+        and never a silent skip."""
+        return ExecutionResult(
+            success=False, tx_hash="", method="refused", lender="",
+            amount_in=0, profit_wei=0, gas_cost_usd=0.0, error=error,
+        )
+
+    def _audit(self, purpose: str, result: ExecutionResult | None, target: str | None = None) -> None:
+        """Append one attempt/outcome record to the execution audit log.
+
+        Attempts in an ENABLED execution context are always accounted for —
+        successful, refused, failed and uncertain alike — and so are
+        ordinary preflight skips, recorded as the distinct outcome
+        "skipped": the opportunity was rejected before any execution
+        attempt, so nothing was built, signed or submitted (DSS-WO-ENG-016
+        §3B — this must never raise, and it never masks the actual
+        execution outcome). Refusals that happen because the master switch
+        is DISABLED keep the historical disabled-run behaviour: nothing is
+        written, nothing executes, and the refusal is still visible in the
+        returned result and the log stream.
+        """
+        if not execution_enabled():
+            return
+        if result is None:
+            # Preflight skip: rejected/skipped before any execution
+            # attempt. Distinct from "refused" (an attempt the policy
+            # blocked) and "failed" (an attempt that errored).
+            outcome = "skipped"
+        elif result.method == "refused":
+            outcome = "refused"
+        else:
+            outcome = "success" if result.success else "failed"
+        try:
+            execution_audit.record_execution(
+                purpose=purpose,
+                chain_id=self.chain_id,
+                target=target,
+                function=None,
+                estimated_gas=None,
+                actual_gas_used=None,
+                tx_hash=(result.tx_hash or None) if result is not None else None,
+                outcome=outcome,
+                error=(result.error or None) if result is not None else None,
+                max_fee_exposure_wei=None,
+            )
+        except Exception as exc:  # auditing must never mask the outcome
+            log.error(
+                "failed to write execution audit record for %s: %s",
+                purpose, type(exc).__name__,
+            )
+
+    # ── public entry points ──────────────────────────────────────────────
 
     def submit(self, opp: Opportunity) -> ExecutionResult | None:
         """
         Attempt to execute an arbitrage opportunity.
 
-        Returns ExecutionResult on attempt, None if skipped (pre-flight fail).
+        Outcome taxonomy (DSS-WO-ENG-016 §3B — four distinct categories,
+        never conflated):
+          * None                      — the opportunity was rejected or
+                                        skipped BEFORE any execution attempt
+                                        (preflight: no route, no viable
+                                        amount/profit, failed simulation);
+                                        nothing was built, signed or
+                                        submitted;
+          * ExecutionResult(method="refused") — an attempt the policy
+                                        REFUSED (master switch, builder
+                                        policy, signer or relay gate);
+          * ExecutionResult(success=False)    — an attempt that FAILED
+                                        (build/sign/submit error, or an
+                                        on-chain revert);
+          * ExecutionResult(success=True)     — a successful or still
+                                        uncertain submission outcome.
+
+        The master execution switch is checked at this boundary; the signer
+        and the relay check it again independently at theirs.
         """
         if not self._arb_exec:
             return None
 
+        if not execution_enabled():
+            log.warning("Execution refused: EXECUTE_ONCHAIN is disabled (executor boundary)")
+            result = self._refused_result("execution disabled (EXECUTE_ONCHAIN)")
+            self._audit("arb_execution", result)
+            return result
+
         try:
-            return self._execute(opp)
+            result = self._execute(opp)
+        except ExecutionRefused as e:
+            log.warning(f"Execution refused: {e}")
+            result = self._refused_result(str(e))
+            self._audit("arb_execution", result)
+            return result
         except Exception as e:
             log.error(f"Executor error: {e}")
-            return ExecutionResult(
+            result = ExecutionResult(
                 success=False, tx_hash="", method="", lender="",
                 amount_in=0, profit_wei=0, gas_cost_usd=0.0, error=str(e),
             )
+        self._audit("arb_execution", result)
+        return result
 
     def submit_batch(self, opps: list[Opportunity], block_number: int) -> ExecutionResult | None:
         """
-        Attempt to execute an arbitrage opportunity.
-
-        Returns ExecutionResult on attempt, None if skipped (pre-flight fail).
+        Attempt to execute a batch of arbitrage opportunities as ONE combined
+        transaction. The batch route uses the SAME builder validation, signer
+        and relay as the single-opportunity route — it cannot bypass the
+        transaction policy.
         """
         if not self._arb_exec:
             return None
 
-        try:    
-            return self._execute_batch(opps, block_number)
+        if not execution_enabled():
+            log.warning("Batch execution refused: EXECUTE_ONCHAIN is disabled (executor boundary)")
+            result = self._refused_result("execution disabled (EXECUTE_ONCHAIN)")
+            self._audit("arb_batch_execution", result)
+            return result
+
+        try:
+            result = self._execute_batch(opps, block_number)
+        except ExecutionRefused as e:
+            log.warning(f"Batch execution refused: {e}")
+            result = self._refused_result(str(e))
+            self._audit("arb_batch_execution", result)
+            return result
         except Exception as e:
             log.error(f"Executor error: {e}")
-            return ExecutionResult(
+            result = ExecutionResult(
                 success=False, tx_hash="", method="", lender="",
                 amount_in=0, profit_wei=0, gas_cost_usd=0.0, error=str(e),
             )
+        self._audit("arb_batch_execution", result)
+        return result
+
+    # ── execution pipeline ───────────────────────────────────────────────
 
     def _execute(self, opp: Opportunity, for_batch = False) -> ExecutionResult | None:
         meta          = opp.metadata or {}
@@ -199,10 +380,51 @@ class ArbExecutor:
             log.debug("Skipping: missing token_in or pools")
             return None
 
+        # ── Authoritative validated profit floor (DSS-WO-ENG-017 §2) ──────────
+        # ONE consistent policy for ordinary and mempool candidates alike:
+        # the canonical validation evidence is the only source of the
+        # contract-level minimum, and missing or invalid evidence fails
+        # closed here — before any transaction is built, signed or
+        # submitted. minProfit is compared by Exec.sol against the cycle
+        # profit denominated in the BORROWED tokenIn's base units
+        # (contracts/Exec.sol `NoProfit` checks); the values below are
+        # token-denominated and must never be replaced by native-currency
+        # gas figures.
+        validated_floor_wei = self._validated_profit_wei(opp)
+        if validated_floor_wei is None:
+            log.debug(
+                "Skipping: no positive validated profit floor "
+                "(validated_profit_floor_wei/quote_profit_wei absent or "
+                "invalid — failing closed)"
+            )
+            return [None] * 4 if for_batch else None
+
         if from_mempool:
             # ── Step 2: Lender selection ──────────────────────────────────────────
             amount_in = 0
             lender = select_lender(self.w3, self.chain_id, token_in, amount_in, for_mempool=True)
+
+            # Authoritative validated profit for a promoted mempool candidate
+            # (DSS-WO-ENG-016 §3A, unit policy DSS-WO-ENG-017 §2).
+            # PendingOpportunity.to_opportunity() emits NO executor
+            # economics — the value only exists once the canonical pipeline
+            # promoted the candidate (OpportunityEngine.process_candidates →
+            # validate_many → enrich): the validated profit floor (the
+            # contract-quote retention floor), resolved with the SAME
+            # missing-vs-invalid precedence as the canonical economics
+            # enrichment (optimizer.opportunity_economics.enrich) by
+            # _validated_profit_wei above. There is no invented fallback and
+            # no silent zero: a candidate without a positive validated
+            # profit fails closed before anything is built.
+            profit_wei = validated_floor_wei
+
+            # The validated profit floor is also the contract-level guard
+            # (ArbData.minProfit): ArbExec.swap() reverts unless the actual
+            # profit reaches it, so a promoted candidate can execute with
+            # the validator's controlled quote-drift allowance but never
+            # unprofitably. A later successful Flashbots simulation never
+            # overwrites or weakens this floor (DSS-WO-ENG-017 §2).
+            min_profit = self._contract_min_profit(min_profit, profit_wei)
 
             arb_data = build_arb_data(
                 ad_tuple=ad_tuple,
@@ -214,7 +436,7 @@ class ArbExecutor:
                 mode=lender.mode,
                 min_profit=min_profit,
             )
-            log.info(f"Executing mempool arb | lender={lender.lender_name} mode={lender.mode} token_in={token_in} hops={hop_count}")
+            log.info(f"Executing mempool arb | lender={lender.lender_name} mode={lender.mode} token_in={token_in} hops={hop_count} profit_wei={profit_wei}")
         else:
             # ── Step 1: Determine optimal amount ─────────────────────────────────
             on_chain_amount = int(ad_tuple[0]) if ad_tuple else 0
@@ -247,13 +469,20 @@ class ArbExecutor:
             lender = select_lender(self.w3, self.chain_id, token_in, amount_in)
             log.debug(f"Lender: {lender.lender_name} mode={lender.mode}")
 
-            # ── Step 3: Profit gate ───────────────────────────────────────────────
+            # ── Step 3: Profit gate ─────────────────────────────────────────────────
             if not is_profitable_after_gas(
                 profit_wei, token_in, gas_cost_usd,
                 min_profit_usd=max(MIN_PROFIT_USD, MIN_EXECUTION_PROFIT_USD),
             ):
                 log.debug(f"Skipping: profit below gas threshold (gas=${gas_cost_usd:.3f})")
                 return None
+
+            # ── Step 3b: validated-floor contract guard (DSS-WO-ENG-017 §2) ──────
+            # Ordinary opportunities get the SAME validated-floor protection
+            # as mempool backruns: the canonical validated floor (resolved
+            # once above, before either branch) is the authoritative
+            # contract-level minimum for the ordinary path too.
+            min_profit = self._contract_min_profit(min_profit, validated_floor_wei)
 
             # ── Step 4: Build ArbData ─────────────────────────────────────────────
             # for external flash loans (mode 0), borrowPool is ignored by contract
@@ -269,7 +498,8 @@ class ArbExecutor:
                 min_profit=min_profit,
             )
 
-        # ── Simulate transaction ─────────────────────────────────────────
+        # ── Simulate transaction (Flashbots chains only) ─────────────────
+        sim_result = {}
         if self.use_flashbots:
             log.debug(f"Simulating arb | lender={lender.lender_name} mode={lender.mode} amount={amount_in} hops={hop_count}")
             sim_result = self.execution_simulation(
@@ -284,24 +514,36 @@ class ArbExecutor:
                 error = sim_result.get("error") if sim_result else "Unknown simulation error"
                 log.debug(f"Skipping: simulation failed | error={error}")
                 return [None] * 4 if for_batch else None
-            
+
             log.debug(f"Simulation success | gas_used={sim_result.get('gas_used')} gas_fee_wei={sim_result.get('gas_fee_wei')}")
 
-            # return [None] * 4 if for_batch else None
-            arb_data["minProfit"] = int(sim_result.get("gas_fee_wei", 0) * 1.2)  # increase minProfit to account for simulation uncertainty
+            # DSS-WO-ENG-017 §2: a successful Flashbots simulation must NOT
+            # overwrite or weaken the validated profitability floor.
+            #   * sim_result["gas_fee_wei"] (Flashbots gasFees) is NATIVE-
+            #     currency wei — ArbData.minProfit is compared by Exec.sol
+            #     against profit denominated in the BORROWED tokenIn's base
+            #     units. The two denominations are unrelated, so a gas fee
+            #     must never be assigned to minProfit (it could weaken the
+            #     guard below the floor or harden it into a guaranteed
+            #     revert above the simulated profit).
+            #   * The simulation runs the REAL contract with minProfit =
+            #     validated floor, so success itself proves the simulated
+            #     profit reaches the floor (Exec.sol reverts otherwise).
+            #   * Simulation gas economics stay in the off-chain
+            #     economics/profitability assessment
+            #     (is_profitable_after_gas / execution_economics); only the
+            #     gas LIMIT estimate is refined from the measured gas_used.
             gas_units = sim_result.get("gas_used", gas_units)
-        else:
-            sim_result = {}
 
         if for_batch:
             return arb_data, gas_units, gas_cost_usd, builder_tip_bps
 
-        # ── Step 5: Build transaction ─────────────────────────────────────────
+        # ── Step 5: Build transaction (builder enforces the tx policy) ────────
         try:
             sender = get_sender()
-        except RuntimeError as e:
-            log.error(f"Cannot sign: {e}")
-            return None
+        except ExecutionRefused as e:
+            log.error(f"Cannot execute: {e}")
+            raise
 
         tx = build_execute_tx(
             w3=self.w3,
@@ -313,14 +555,10 @@ class ArbExecutor:
             gas_units=gas_units,
         )
 
-        # ── Step 6: Sign ──────────────────────────────────────────────────────
-        try:
-            raw_tx = sign_transaction(self.w3, tx)
-        except Exception as e:
-            log.error(f"Signing failed: {e}")
-            return None
+        # ── Step 6: Sign (signer enforces switch/chain/custody) ───────────────
+        raw_tx = sign_transaction(self.w3, tx, chain_id=self.chain_id)
 
-        # ── Step 7: Relay ─────────────────────────────────────────────────────
+        # ── Step 7: Relay (relay enforces switch/chain/provenance) ────────────
         log.info(
             f"Executing arb | lender={lender.lender_name} mode={lender.mode} "
             f"amount={amount_in} profit_wei={profit_wei} "
@@ -330,6 +568,7 @@ class ArbExecutor:
         result: RelayResult = relay_transaction(
             w3=self.w3,
             raw_tx=raw_tx,
+            expected_chain_id=self.chain_id,
             target_tx=sim_result.get("target_raw_tx", b"") or b"",
             target_block=sim_result.get("target_block") or opp.block_number + 1,
             use_flashbots = self.use_flashbots
@@ -361,13 +600,13 @@ class ArbExecutor:
         )
 
     def _execute_batch(self, opps: list[Opportunity], block_number) -> ExecutionResult | None:
-        # ── Step 5: Build transaction ─────────────────────────────────────────
+        # ── Step 5: Build transaction (members prepared WITHOUT signing) ─────
         calls, total_gas, total_gas_usd = build_batch_calls(self._execute, self._arb_exec, opps)
         try:
             sender = get_sender()
-        except RuntimeError as e:
-            log.error(f"Cannot sign: {e}")
-            return None
+        except ExecutionRefused as e:
+            log.error(f"Cannot execute batch: {e}")
+            raise
 
         tx = build_execute_batch_tx(
             w3=self.w3,
@@ -378,11 +617,7 @@ class ArbExecutor:
         )
 
         # ── Step 6: Sign ──────────────────────────────────────────────────────
-        try:
-            raw_tx = sign_transaction(self.w3, tx)
-        except Exception as e:
-            log.error(f"Signing failed: {e}")
-            return None
+        raw_tx = sign_transaction(self.w3, tx, chain_id=self.chain_id)
 
         # ── Step 7: Relay ─────────────────────────────────────────────────────
         log.info(
@@ -393,6 +628,7 @@ class ArbExecutor:
         result: RelayResult = relay_transaction(
             w3=self.w3,
             raw_tx=raw_tx,
+            expected_chain_id=self.chain_id,
             target_block=block_number + 1,
             use_flashbots = self.use_flashbots
         )
@@ -400,6 +636,7 @@ class ArbExecutor:
         # ── Step 8: Receipt (direct only) ─────────────────────────────────────
         receipt = None
         batch_result = {}
+        summary = None
         if result.success and result.method == "direct":
             receipt = wait_for_receipt(self.w3, result.tx_hash, timeout=30)
             if receipt:
@@ -407,7 +644,7 @@ class ArbExecutor:
                 if status == 1:
                     batch_result = self.extract_batch_result(receipt)
                     summary = batch_result.get('summary')
-                    log.info(f"✅ Batch Arb confirmed | tx={result.tx_hash[:16]} | summary: ({summary.successful} successful, {summary.failed} failed)")
+                    log.info(f"✅ Batch Arb confirmed | tx={result.tx_hash[:16]} | summary: ({summary.successful} successful, {summary.failed} failed)" if summary else f"✅ Batch Arb confirmed | tx={result.tx_hash[:16]}")
                 else:
                     log.warning(f"❌ Batch Arb reverted on-chain | tx={result.tx_hash[:16]}")
                     result.success = False
@@ -424,7 +661,6 @@ class ArbExecutor:
             error=result.error,
             receipt=receipt,
         )
-
 
     def _best_amount(
         self,
@@ -483,7 +719,7 @@ class ArbExecutor:
         Each entry contains: (profit_amount, profit_token)
         """
         profits = []
-        
+
         # 1. Get all DONE events emitted by ArbExec during this tx
         done_events = self._arb_exec.events.DONE().process_receipt(receipt)
         wrapped_native = self._chain.wrapped_native
@@ -491,10 +727,6 @@ class ArbExecutor:
         est_profit_usd = 0
         est_profit_wei = 0
         for event in done_events:
-            # amount_formatted = None
-            # if args.profitToken == wrapped_native and native_price:
-            #     amount_formatted = float(Web3.from_wei(args.amt, 'ether'))
-            #     est_profit_usd += amount_formatted * native_price
             args = event.args
             amount_formatted = float(Web3.from_wei(args.amt, 'ether')) if args.token == wrapped_native else None
             est_profit_usd += amount_formatted * native_price
@@ -504,7 +736,7 @@ class ArbExecutor:
                 'amount': args.amt,           # This is the profit in wei
                 'amount_formatted': amount_formatted
             })
-        
+
         # 2. Get the summary from BatchResult event (optional)
         batch_event = self._arb_exec.events.BATCH().process_receipt(receipt)
         summary = None
@@ -523,18 +755,22 @@ class ArbExecutor:
             'gas_usd': gas_usd,
             'summary': summary
         }
-    
+
     def execution_simulation(
-            self, 
-            arb_data, 
-            force_balancer, 
-            builder_tip, 
+            self,
+            arb_data,
+            force_balancer,
+            builder_tip,
             gas_units,
             target_block: int = None,
             target_tx: str = "") -> int:
         """
         Simulate the execution of an opportunity to get a more accurate profit estimate.
         This can be used for pre-flight checks or for post-detection refinement.
+
+        The probe transaction is built (policy-validated) and signed through
+        the SAME strengthened signer path as a live transaction, then
+        simulated through the relay module's Flashbots transport.
         """
         # ── Step 5: Build transaction ─────────────────────────────────────────
         if not self.use_flashbots:
@@ -543,12 +779,12 @@ class ArbExecutor:
                 "success": False,
                 "error": "Flashbots relay not enabled",
             }
-        
+
         try:
             sender = get_sender()
-        except RuntimeError as e:
-            log.error(f"Cannot sign: {e}")
-            return {}
+        except ExecutionRefused as e:
+            log.error(f"Cannot simulate: {e}")
+            raise
 
         tx = build_execute_tx(
             w3=self.w3,
@@ -560,13 +796,9 @@ class ArbExecutor:
             gas_units=gas_units,
         )
 
-        # ── Step 6: Sign ──────────────────────────────────────────────────────
-        try:
-            raw_tx = sign_transaction(self.w3, tx)
-        except Exception as e:
-            log.error(f"Signing failed: {e}")
-            return {}
-        
+        # ── Step 6: Sign (single authoritative signer path) ──────────────────
+        raw_tx = sign_transaction(self.w3, tx, chain_id=self.chain_id)
+
         if target_tx:
             full_tx = self.w3.eth.get_transaction(target_tx)
             target_raw_tx = serialize(full_tx)
@@ -579,27 +811,30 @@ class ArbExecutor:
             bundle = [{"signed_transaction": raw_tx}]
 
         try:
-            sim = self.w3.flashbots.simulate(bundle, max(target_block, self.w3.eth.block_number))
-            if sim.get("results"):
-                revert_data = sim["results"][0].get("revert")
-                if revert_data:
-                    error = decode(["string"], to_bytes(hexstr="0x" + revert_data[10:])) if len(revert_data) > 64 else revert_data
-                    return {
-                        "success": False,
-                        "error": error,
-                    }
-                return {
-                    "success": True,
-                    "gas_used": sim["totalGasUsed"],
-                    "gas_fee_wei": sim["results"][0].get("gasFees", 0),
-                    "target_block": sim.get("blockNumber"),
-                    "target_raw_tx": target_raw_tx if target_tx else None,
-                }
-        except Exception as e:
-            log.warning(f"Simulation failed: {e}")
+            sim = simulate_bundle(self.w3, bundle, max(target_block, self.w3.eth.block_number))
+        except ExecutionRefused as e:
+            log.warning(f"Simulation refused: {e}")
             return {
                 "success": False,
                 "error": str(e),
             }
-        # sim["signedBundledTransactions"] = None
-        # log.debug(f"Simulation: {json.dumps(sim, indent=2)}")
+
+        if sim.get("results"):
+            revert_data = sim["results"][0].get("revert")
+            if revert_data:
+                error = decode(["string"], to_bytes(hexstr="0x" + revert_data[10:])) if len(revert_data) > 64 else revert_data
+                return {
+                    "success": False,
+                    "error": error,
+                }
+            return {
+                "success": True,
+                "gas_used": sim["totalGasUsed"],
+                "gas_fee_wei": sim["results"][0].get("gasFees", 0),
+                "target_block": sim.get("blockNumber"),
+                "target_raw_tx": target_raw_tx if target_tx else None,
+            }
+        return {
+            "success": False,
+            "error": "simulation returned no results",
+        }

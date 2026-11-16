@@ -2,9 +2,23 @@
 
 Pure-Python, dependency-light components used before an opportunity reaches the
 on-chain executor.  The optimizer deliberately separates:
-  * quote optimization (trade size),
-  * execution economics (gas/loan/protocol/tip costs), and
-  * inclusion bidding (how much of the remaining edge may be paid away).
+  * quote optimization (trade size), and
+  * execution economics (gas/loan/protocol/tip costs).
+
+(Inclusion bidding — BidConfig/BidResult/BidOptimizer — was removed by
+DSS-WO-ENG-016 §4 together with its only consumer, the retired
+mev/inclusion.py policy wrapper: nothing in the canonical runtime path
+selected tips through it. If economics-driven tip selection is wanted
+later, it must be designed into the canonical executor path deliberately,
+not preserved as an orphaned alternative.)
+
+(DSS-WO-ENG-017 §4: the unused EconomicsInput dataclass and
+ExecutionEconomics.from_input() constructor were removed with them —
+no module ever constructed either. Callers construct ExecutionEconomics
+directly, which also avoids from_input()'s hidden assumption that
+gas_units × gas_price_wei share the unit of every other field: the
+canonical enrichment (optimizer/opportunity_economics.py) converts the
+native gas cost into the profit token's base units BEFORE construction.)
 
 All integer amounts are in the route's native token units unless explicitly
 stated otherwise. USD values are floats only at the presentation boundary.
@@ -19,21 +33,6 @@ QuoteFn = Callable[[int], int]
 
 
 @dataclass(frozen=True)
-class EconomicsInput:
-    gross_profit_wei: int
-    gas_units: int = 0
-    gas_price_wei: int = 0
-    flashloan_fee_wei: int = 0
-    protocol_cost_wei: int = 0
-    builder_tip_wei: int = 0
-    execution_buffer_wei: int = 0
-
-    @property
-    def gas_cost_wei(self) -> int:
-        return max(0, int(self.gas_units)) * max(0, int(self.gas_price_wei))
-
-
-@dataclass(frozen=True)
 class ExecutionEconomics:
     gross_profit_wei: int
     gas_cost_wei: int
@@ -43,20 +42,6 @@ class ExecutionEconomics:
     execution_buffer_wei: int = 0
     inclusion_probability: float = 1.0
     failure_cost_wei: int = 0
-
-    @classmethod
-    def from_input(cls, x: EconomicsInput, inclusion_probability: float = 1.0,
-                   failure_cost_wei: int = 0) -> "ExecutionEconomics":
-        return cls(
-            gross_profit_wei=max(0, int(x.gross_profit_wei)),
-            gas_cost_wei=x.gas_cost_wei,
-            flashloan_fee_wei=max(0, int(x.flashloan_fee_wei)),
-            protocol_cost_wei=max(0, int(x.protocol_cost_wei)),
-            builder_tip_wei=max(0, int(x.builder_tip_wei)),
-            execution_buffer_wei=max(0, int(x.execution_buffer_wei)),
-            inclusion_probability=max(0.0, min(1.0, float(inclusion_probability))),
-            failure_cost_wei=max(0, int(failure_cost_wei)),
-        )
 
     @property
     def deterministic_net_wei(self) -> int:
@@ -193,44 +178,3 @@ class TradeSizeOptimizer:
         best = max(candidates, key=lambda p: p.net_profit_wei)
         return TradeSizeResult(best.amount_in, best.amount_out, best.gross_profit_wei,
                                best.net_profit_wei, tuple(sorted({p.amount_in: p for p in candidates}.values(), key=lambda p: p.amount_in)), True)
-
-
-@dataclass(frozen=True)
-class BidConfig:
-    max_tip_bps_of_available: int = 9000
-    safety_bps: int = 250
-    min_net_profit_wei: int = 0
-    min_tip_wei: int = 0
-
-
-@dataclass(frozen=True)
-class BidResult:
-    tip_wei: int
-    max_tip_wei: int
-    expected_net_wei: int
-    inclusion_probability: float
-    accepted: bool
-    reason: str
-
-
-class BidOptimizer:
-    """Choose a builder/validator tip without spending the entire edge."""
-
-    def __init__(self, config: BidConfig | None = None):
-        self.config = config or BidConfig()
-
-    def choose(self, gross_profit_wei: int, fixed_cost_wei: int, *,
-               competing_tip_wei: int = 0, inclusion_probability: float = 1.0,
-               failure_cost_wei: int = 0, private_supported: bool = True) -> BidResult:
-        available = max(0, int(gross_profit_wei) - int(fixed_cost_wei))
-        ceiling = available * max(0, min(10_000, self.config.max_tip_bps_of_available)) // 10_000
-        if not private_supported:
-            return BidResult(0, ceiling, available, 0.0, False, "private inclusion is not supported by chain profile")
-        target = max(0, int(competing_tip_wei))
-        tip = min(ceiling, target) if target else ceiling
-        tip = max(0, tip - tip * max(0, self.config.safety_bps) // 10_000)
-        expected = int(float(inclusion_probability) * (available - tip)
-                       - (1.0 - float(inclusion_probability)) * max(0, int(failure_cost_wei)))
-        accepted = expected >= self.config.min_net_profit_wei and tip >= self.config.min_tip_wei
-        return BidResult(tip, ceiling, expected, max(0.0, min(1.0, float(inclusion_probability))), accepted,
-                         "economically capped bid" if accepted else "expected value below minimum")

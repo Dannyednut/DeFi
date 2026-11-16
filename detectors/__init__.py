@@ -5,15 +5,15 @@ cycle/quoter stack into the interpreter.
 """
 
 __all__ = [
-    "CycleDetector", "SharpeDetector", "NewPoolDetector", "CrossProtocolDetector",
+    "CycleDetector", "NewPoolDetector", "CrossProtocolDetector",
     "StableImbalanceDetector", "SplitRouteDetector", "LiquidationScanner",
 ]
 
 
 def __getattr__(name):
-    if name in {"CycleDetector", "SharpeDetector"}:
-        from .cycles import CycleDetector, SharpeDetector
-        return {"CycleDetector": CycleDetector, "SharpeDetector": SharpeDetector}[name]
+    if name == "CycleDetector":
+        from .cycles import CycleDetector
+        return CycleDetector
     if name in {"NewPoolDetector", "CrossProtocolDetector", "StableImbalanceDetector", "LiquidationScanner"}:
         from .specialized import NewPoolDetector, CrossProtocolDetector, StableImbalanceDetector, LiquidationScanner
         return {"NewPoolDetector": NewPoolDetector, "CrossProtocolDetector": CrossProtocolDetector,

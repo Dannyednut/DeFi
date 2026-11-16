@@ -181,7 +181,13 @@ class CycleDetector(BaseDetector):
         cycles = _filter_pool_conflicts(cycles)
         if name == 'SharpeCycle':
             log.debug(f"[Sharpe] Block {block_number}: {len(cycles)} cycles after pool conflict filtering")
-        cycles = [c.set_amount_in_wei() or c.rotate_to_best_start(self.graph) for c in cycles]
+        # Rotate FIRST, then size the nominal probe on the actual (post-rotation)
+        # starting token. Sizing before rotation left the integer denominated in
+        # the previous start token (e.g. a $10 USDC probe misread as WETH-wei),
+        # which starved or zeroed the fallback simulator (R1, DSS-WO-MI-102A).
+        cycles = [c.rotate_to_best_start(self.graph) for c in cycles]
+        for c in cycles:
+            c.set_amount_in_wei()
         
         # Batch yieldOut via Multicall3
         results = {}

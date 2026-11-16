@@ -256,22 +256,14 @@ class ArbitrageCycle:
         self.dexes = new_dexes
         self.fees = new_fees
         self.versions = new_versions
-        
-        return ArbitrageCycle(
-            tokens=new_tokens,
-            pools=new_pools,
-            dexes=new_dexes,
-            fees=new_fees,
-            versions=new_versions,
-            log_weight_sum=self.log_weight_sum,
-            estimated_profit_ratio=self.estimated_profit_ratio,
-            hop_count=self.hop_count,
-            is_cross_dex=self.is_cross_dex,
-            is_cross_chain=self.is_cross_chain,
-            simulated_via_contract=self.simulated_via_contract,
-            estimated_gas_usd=self.estimated_gas_usd,
-            net_profit_usd=self.net_profit_usd
-        )
+
+        # The in-place rotation above already carries the complete cycle state.
+        # Returning a reconstructed copy here silently reset amount_in_wei to 0
+        # (finding F-19), which made every rotated cycle fail the fallback quote
+        # path in CycleDetector.simulate_and_build (_simulate_slippage_profit on
+        # a 0 amount). Both callers rebind the return value, so returning self
+        # is correct and allocation-free.
+        return self
 
     @property
     def cycle_type(self) -> str:

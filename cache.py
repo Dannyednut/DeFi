@@ -401,9 +401,16 @@ class PoolCache:
                         self._pools[addr]["below_threshold"] = True
                         skipped += 1
                         continue
-                    
-                    ea = PoolEdge(addr, dex, t0, t1, r0, r1, fee, 2, protocol=protocol, pool_token0=t0, pool_token1=t1, metadata=metadata, state_block=state_block, state_block_hash=state_block_hash, state_source=state_source, state_status=state_status)
-                    eb = PoolEdge(addr, dex, t1, t0, r1, r0, fee, 2, protocol=protocol, pool_token0=t0, pool_token1=t1, metadata=metadata, state_block=state_block, state_block_hash=state_block_hash, state_source=state_source, state_status=state_status)
+
+                    # Restore the persisted tvl_usd (GeckoTerminal-authoritative
+                    # once the TVL loop has run, registration-time otherwise) so
+                    # the restored edge is not DFS-pruned as unpriced; the gate
+                    # above deliberately stays estimate-based.
+                    restored_tvl = float(p.get("tvl_usd", 0) or 0)
+                    edge_tvl = restored_tvl if restored_tvl > 0 else tvl
+
+                    ea = PoolEdge(addr, dex, t0, t1, r0, r1, fee, 2, tvl_usd=edge_tvl, protocol=protocol, pool_token0=t0, pool_token1=t1, metadata=metadata, state_block=state_block, state_block_hash=state_block_hash, state_source=state_source, state_status=state_status)
+                    eb = PoolEdge(addr, dex, t1, t0, r1, r0, fee, 2, tvl_usd=edge_tvl, protocol=protocol, pool_token0=t0, pool_token1=t1, metadata=metadata, state_block=state_block, state_block_hash=state_block_hash, state_source=state_source, state_status=state_status)
                 
                 else:
                     if sqrt == 0:
@@ -419,11 +426,15 @@ class PoolCache:
                         self._pools[addr]["below_threshold"] = True
                         skipped += 1
                         continue
-                    
+
+                    # Same persisted-preferred restore as the V2 branch above.
+                    restored_tvl = float(p.get("tvl_usd", 0) or 0)
+                    edge_tvl = restored_tvl if restored_tvl > 0 else tvl
+
                     ea = PoolEdge(addr, dex, t0, t1, 0, 0, fee, 3,
-                                 sqrt_price_x96=sqrt, liquidity=liq, tvl_usd=tvl, protocol=protocol, pool_token0=t0, pool_token1=t1, metadata=metadata, state_block=state_block, state_block_hash=state_block_hash, state_source=state_source, state_status=state_status)
+                                 sqrt_price_x96=sqrt, liquidity=liq, tvl_usd=edge_tvl, protocol=protocol, pool_token0=t0, pool_token1=t1, metadata=metadata, state_block=state_block, state_block_hash=state_block_hash, state_source=state_source, state_status=state_status)
                     eb = PoolEdge(addr, dex, t1, t0, 0, 0, fee, 3,
-                                 sqrt_price_x96=sqrt, liquidity=liq, tvl_usd=tvl, protocol=protocol, pool_token0=t0, pool_token1=t1, metadata=metadata, state_block=state_block, state_block_hash=state_block_hash, state_source=state_source, state_status=state_status)
+                                 sqrt_price_x96=sqrt, liquidity=liq, tvl_usd=edge_tvl, protocol=protocol, pool_token0=t0, pool_token1=t1, metadata=metadata, state_block=state_block, state_block_hash=state_block_hash, state_source=state_source, state_status=state_status)
                 
                 graph.add_or_update_pool(ea, eb)
                 loaded += 1

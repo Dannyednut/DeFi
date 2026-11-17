@@ -36,6 +36,10 @@ class OpportunityEngine:
     # converges on the same dedup/validation pipeline below.
     scheduled_discovery: bool = True
     scheduled_pass_interval: int = 50
+    # R1A §2: bounded per-seed retry budget for failed scheduled cycle
+    # slices. Beyond this the seed moves to failed_seeds (visible; never
+    # reported as processed) — no unbounded hidden retry loops.
+    _max_cycle_retries: int = 3
     bounded_config: BoundedDiscoveryConfig = field(default_factory=BoundedDiscoveryConfig)
     pair_universe: RankedPairUniverse | None = None
     _last_scheduled_block: int | None = None
@@ -152,16 +156,23 @@ class OpportunityEngine:
     def last_scheduled_batch_info(self) -> dict:
         """Live status of the active scheduled batch, or the completion
         summary of the last one (R1 §3.9). A partially processed batch is
-        reported with ``complete: False`` — never as finished work."""
+        reported with ``complete: False`` — never as finished work; a batch
+        whose stages failed beyond their bounded retries additionally
+        reports ``failed_seeds`` / ``pair_checks_ok: False`` (R1A §2)."""
         batch = self._scheduled_batch
         if batch is not None:
             return {
                 "complete": False,
+                "failed": bool(batch["failed_seeds"]) or not batch["pair_checks_ok"],
                 "start_block": batch["start_block"],
                 "reason": batch["reason"],
                 "seeds_total": len(batch["seeds"]) + batch["priority_consumed"],
                 "seeds_processed": batch["seeds_processed"],
                 "seeds_skipped_reactive_overlap": batch["seeds_skipped"],
+                "seeds_deduped": batch["seeds_deduped"],
+                "failed_seeds": len(batch["failed_seeds"]),
+                "pair_checks_ok": batch["pair_checks_ok"],
+                "pair_checks_attempted": batch["pair_checks_attempted"],
                 "main_pending": len(batch["seeds"]) - batch["cursor"],
                 "priority_pending": len(batch["priority"]),
                 "slices": batch["slices"],
@@ -219,7 +230,7 @@ class OpportunityEngine:
         return ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))]
 
     def _scheduled_pass_opportunities(self, block_number: int, touched_pools: set[str] | None) -> list[Opportunity]:
-        """Bounded, INCREMENTAL scheduled search (R1 §3) — or nothing.
+        """Bounded, INCREMENTAL scheduled search (R1 §3, R1A) — or nothing.
 
         One scheduled BATCH is active at a time; it is processed in
         deterministic slices of ``scheduled_seeds_per_slice`` cycle-search
@@ -235,8 +246,29 @@ class OpportunityEngine:
         checked them in the same block, keeping the block within the
         30-pair budget), then process the first slice. Newly registered
         pools join the seed queue with PRIORITY (consumed from the lossless
-        backlog, bounded per invocation) ahead of the ranked-universe
-        venues, which are retained until searched — nothing is discarded.
+        backlog, bounded per invocation); the ranked-universe venues are
+        retained until searched — nothing is discarded.
+
+        Fairness (R1A §1): a continuous stream of registrations must not
+        starve the ranked-universe seeds. Each slice alternates per SLOT
+        between one priority seed and one ranked-universe seed (the
+        persistent ``last_slot`` keeps the alternation fair across slice
+        boundaries — at slice=1, consecutive invocations alternate between
+        registrations and universe seeds). Every selected ranked-universe
+        seed is therefore still searched within the active batch while
+        registrations keep arriving, FIFO registration order is preserved,
+        and nothing is dropped.
+
+        Failure integrity (R1A §2): a failed cycle-detector invocation does
+        NOT advance the work — its seeds are re-queued at the front and
+        retried on the next invocation, with a bounded retry budget per
+        seed; seeds that exhaust their retries move to ``failed_seeds``
+        (visible, never reported as processed). A failed cross-protocol
+        pair-check invocation leaves ``pair_checks_ok`` False and is retried
+        once per invocation (bounded); a batch that ends with failed seeds
+        or failed pair checks reports ``failed``/incomplete state instead
+        of a plain ``complete: True``. No hidden unbounded retries; failures
+        stay visible in the summary.
 
         Every invocation afterwards continues the active batch with exactly
         one slice; a batch is never started while a previous one is
@@ -264,7 +296,9 @@ class OpportunityEngine:
             if universe is None:
                 universe = RankedPairUniverse(self.graph, self.chain_id, self.bounded_config)
                 self.pair_universe = universe
+            t_startup = time.time()
             universe.refresh(block_number)
+            startup_ms = round((time.time() - t_startup) * 1000.0, 3)
 
             # Newly registered pools seed FIRST so ranking cannot starve
             # them; the TVL-ranked universe venues fill the remaining seed
@@ -296,10 +330,17 @@ class OpportunityEngine:
             # Pair checks run ONCE per batch. If the reactive detector
             # already checked the anchor pairs in this block (touched pools
             # present), check ONLY the supplementary pairs here so the
-            # block-wide total respects the 30-pair budget (R1 §5).
+            # block-wide total respects the 30-pair budget (R1 §5). A failed
+            # invocation leaves pair_checks_ok=False and is retried once
+            # per invocation while the batch runs (R1A §2); the batch is
+            # never reported with completed pair checks until it succeeds.
             anchors_checked_reactively = bool(touched_lower)
+            pair_checks_ok = True
+            pair_checks_attempted = 0
+            t_pair = time.time()
             for detector in self.detectors:
                 if getattr(detector, "name", "") == "cross_proto":
+                    pair_checks_attempted += 1
                     try:
                         if anchors_checked_reactively:
                             found = detector.on_block(block_number, extra_pairs=universe.additional_pairs(),
@@ -309,9 +350,12 @@ class OpportunityEngine:
                         self._tag_scheduled(found, reason)
                         out.extend(found or [])
                     except Exception as exc:
+                        pair_checks_ok = False
                         get_logger("opportunity_engine").error(
                             f"Scheduled batch start: cross-protocol detector failed: {exc}", exc_info=True
                         )
+            pair_check_ms = round((time.time() - t_pair) * 1000.0, 3)
+            startup_ms = round(startup_ms + pair_check_ms, 3)
 
             batch = {
                 "start_block": int(block_number),
@@ -323,6 +367,14 @@ class OpportunityEngine:
                 "seeds_skipped": 0,
                 "seeds_deduped": 0,
                 "processed": set(),
+                # R1A §1: per-slot alternation between registrations and
+                # ranked-universe seeds; persisted across invocations.
+                "last_slot": "priority",
+                # R1A §2: bounded retries + explicit failure accounting.
+                "retries": {},
+                "failed_seeds": [],
+                "pair_checks_ok": pair_checks_ok,
+                "pair_checks_attempted": pair_checks_attempted,
                 "slices": 0,
                 "slice_ms": [],
                 "seeds_processed": 0,
@@ -330,14 +382,16 @@ class OpportunityEngine:
                 "additional_pairs": list(universe.additional_pairs()),
                 "anchors_checked_reactively": anchors_checked_reactively,
                 "start_info": dict(self._last_scheduled_info),
+                "startup_ms": startup_ms,
+                "pair_check_ms": pair_check_ms,
             }
             self._scheduled_batch = batch
             get_logger("opportunity_engine").info(
                 "[SCHEDULED-BATCH] start block=%s reason=%s seeds=%d new_pools=%d additional_pairs=%d "
-                "slice_size=%d anchors_via_reactive=%s",
+                "slice_size=%d anchors_via_reactive=%s pair_checks_ok=%s startup_ms=%s",
                 block_number, reason, len(seeds), len(new_seeds),
                 len(batch["additional_pairs"]), self.bounded_config.scheduled_seeds_per_slice,
-                anchors_checked_reactively,
+                anchors_checked_reactively, batch["pair_checks_ok"], batch["startup_ms"],
             )
         else:
             # Active batch: never start an overlapping sweep (R1 §3.6).
@@ -351,34 +405,84 @@ class OpportunityEngine:
                 if taken:
                     batch["priority"].extend(taken)
                     batch["priority_consumed"] += len(taken)
+            # R1A §2: a failed pair-check stage is retried once per
+            # invocation while the batch is active — bounded, visible
+            # (pair_checks_ok in the summary), never silently skipped.
+            if not batch["pair_checks_ok"]:
+                for detector in self.detectors:
+                    if getattr(detector, "name", "") == "cross_proto":
+                        t_pair = time.time()
+                        try:
+                            if batch["anchors_checked_reactively"]:
+                                found = detector.on_block(
+                                    block_number, extra_pairs=batch["additional_pairs"], check_anchors=False)
+                            else:
+                                found = detector.on_block(
+                                    block_number, extra_pairs=batch["additional_pairs"])
+                            self._tag_scheduled(found, batch["reason"])
+                            out.extend(found or [])
+                            batch["pair_checks_ok"] = True
+                        except Exception as exc:
+                            get_logger("opportunity_engine").error(
+                                f"Scheduled pair-check retry failed: {exc}", exc_info=True
+                            )
+                        batch["pair_check_ms"] += round((time.time() - t_pair) * 1000.0, 3)
+                        break
 
-        # ── one deterministic slice: priority seeds first, then the ranked
-        # universe seeds; both filtered against this block's reactive work ──
+        # ── one deterministic slice: per-SLOT alternation between priority
+        # (registrations) and main (ranked-universe) seeds (R1A §1 fairness —
+        # a sustained registration stream can never fully monopolize the
+        # slice), with re-queued failed seeds taking the front slot first.
+        # Every candidate is filtered against this block's reactive work and
+        # against the batch's already-searched set (exactly-once). ──
         slice_budget = max(1, int(self.bounded_config.scheduled_seeds_per_slice))
         slice_seeds: list[str] = []
         t_slice = time.time()
+        retries: dict = batch["retries"]
+        retry_front: list[str] = batch.get("retry_front", [])
         priority: list[str] = batch["priority"]
-        while len(slice_seeds) < slice_budget and priority:
-            cand = priority.pop(0)
+
+        def _book_candidate(cand: str, slot: str) -> bool:
+            """Book one candidate into the slice; False if it must be skipped."""
             if cand in touched_lower or cand in slice_seeds:
                 batch["seeds_skipped"] += 1
-                continue
+                return False
             if cand in batch["processed"]:
                 batch["seeds_deduped"] += 1  # already searched earlier in this batch
-                continue
+                return False
             slice_seeds.append(cand)
-        while len(slice_seeds) < slice_budget and batch["cursor"] < len(batch["seeds"]):
-            cand = batch["seeds"][batch["cursor"]]
-            batch["cursor"] += 1
-            if cand in touched_lower or cand in slice_seeds:
-                batch["seeds_skipped"] += 1
+            batch["last_slot"] = slot
+            return True
+
+        # retry-front first (bounded per-seed retries, R1A §2)
+        while len(slice_seeds) < slice_budget and retry_front:
+            cand = retry_front.pop(0)
+            _book_candidate(cand, "retry")
+
+        # alternate: one registration, one ranked-universe seed, per slot
+        while len(slice_seeds) < slice_budget:
+            if batch["last_slot"] != "priority" and priority:
+                cand = priority.pop(0)
+                if _book_candidate(cand, "priority"):
+                    continue
+                if not priority:  # drained: fall through to main this slot
+                    if batch["cursor"] < len(batch["seeds"]):
+                        cand = batch["seeds"][batch["cursor"]]
+                        batch["cursor"] += 1
+                        _book_candidate(cand, "main")
                 continue
-            if cand in batch["processed"]:
-                batch["seeds_deduped"] += 1
+            if batch["cursor"] < len(batch["seeds"]):
+                cand = batch["seeds"][batch["cursor"]]
+                batch["cursor"] += 1
+                _book_candidate(cand, "main")
                 continue
-            slice_seeds.append(cand)
-        if slice_seeds:
-            batch["processed"].update(slice_seeds)
+            if priority:  # main exhausted: registrations drain alone
+                cand = priority.pop(0)
+                _book_candidate(cand, "priority")
+                continue
+            break
+
+        detector_failed = False
         if slice_seeds:
             for detector in self.detectors:
                 if getattr(detector, "name", "") == "cycles":
@@ -388,16 +492,46 @@ class OpportunityEngine:
                         self._tag_scheduled(found, batch["reason"])
                         out.extend(found or [])
                     except Exception as exc:
+                        detector_failed = True
+                        # R1A §2: the failed seeds are NOT marked processed —
+                        # they are re-queued at the FRONT and retried on the
+                        # next invocation (bounded per-seed retry budget;
+                        # beyond that they stay visible in failed_seeds and
+                        # are never reported as processed).
+                        for cand in slice_seeds:
+                            retries[cand] = retries.get(cand, 0) + 1
+                            if retries[cand] <= self._max_cycle_retries:
+                                retry_front.append(cand)
+                            elif cand not in batch["failed_seeds"]:
+                                batch["failed_seeds"].append(cand)
                         get_logger("opportunity_engine").error(
-                            f"Scheduled slice: cycle detector failed: {exc}", exc_info=True
+                            f"Scheduled slice: cycle detector failed ({len(slice_seeds)} seeds re-queued, "
+                            f"retry counts {retries}): {exc}", exc_info=True
                         )
+        if slice_seeds and not detector_failed:
+            batch["processed"].update(slice_seeds)
         batch["slices"] += 1
-        batch["seeds_processed"] += len(slice_seeds)
+        if not detector_failed:
+            batch["seeds_processed"] += len(slice_seeds)
+        batch["retry_front"] = retry_front
         batch["slice_ms"].append(round((time.time() - t_slice) * 1000.0, 3))
 
-        if batch["cursor"] >= len(batch["seeds"]) and not batch["priority"]:
+        batch_incomplete = bool(batch["priority"]) or bool(batch.get("retry_front", [])) \
+            or batch["cursor"] < len(batch["seeds"])
+        if not batch_incomplete:
+            # R1A §2: a batch is only COMPLETE when every seed was searched
+            # and the pair-check stage succeeded. A terminal batch with
+            # failed seeds or failed pair checks reports an explicit failed
+            # state instead of a misleading complete=True — the affected
+            # seeds are enumerated in the summary.
+            ok = batch["pair_checks_ok"] and not batch["failed_seeds"]
             self._last_batch_summary = {
                 "complete": True,
+                "failed": not ok,
+                "failed_seeds": len(batch["failed_seeds"]),
+                "failed_seed_list": list(batch["failed_seeds"])[:32],
+                "pair_checks_ok": batch["pair_checks_ok"],
+                "pair_checks_attempted": batch["pair_checks_attempted"],
                 "start_block": batch["start_block"],
                 "end_block": int(block_number),
                 "reason": batch["reason"],
@@ -410,24 +544,44 @@ class OpportunityEngine:
                 "slice_ms_p95": self._p95(batch["slice_ms"]),
                 "slice_ms_max": max(batch["slice_ms"], default=0.0),
                 "batch_ms": round(sum(batch["slice_ms"]), 3),
+                # R1A §3: startup (universe refresh + pair checks) reported
+                # separately AND included in the total batch cost.
+                "startup_ms": round(batch.get("startup_ms", 0.0), 3),
+                "pair_check_ms": round(batch.get("pair_check_ms", 0.0), 3),
+                "total_ms_incl_startup": round(sum(batch["slice_ms"]) + batch.get("startup_ms", 0.0)
+                                               + batch.get("pair_check_ms", 0.0), 3),
                 "new_pool_seeds": batch["new_pool_seeds"],
                 "additional_pairs": len(batch["additional_pairs"]),
                 "anchors_checked_reactively": batch["anchors_checked_reactively"],
             }
+            if not ok:
+                self._last_batch_summary["complete"] = False
+                self._last_batch_summary["status"] = "failed"
             self._scheduled_batch = None
-            get_logger("opportunity_engine").info(
-                "[SCHEDULED-BATCH] complete start_block=%s end_block=%s seeds=%d slices=%d batch_ms=%s "
-                "slice_ms(p50/p95/max)=%s/%s/%s",
-                self._last_batch_summary["start_block"], self._last_batch_summary["end_block"],
-                self._last_batch_summary["seeds_processed"], self._last_batch_summary["slices"],
-                self._last_batch_summary["batch_ms"], self._last_batch_summary["slice_ms_median"],
-                self._last_batch_summary["slice_ms_p95"], self._last_batch_summary["slice_ms_max"],
-            )
+            if ok:
+                get_logger("opportunity_engine").info(
+                    "[SCHEDULED-BATCH] complete start_block=%s end_block=%s seeds=%d slices=%d batch_ms=%s "
+                    "slice_ms(p50/p95/max)=%s/%s/%s startup_ms=%s",
+                    self._last_batch_summary["start_block"], self._last_batch_summary["end_block"],
+                    self._last_batch_summary["seeds_processed"], self._last_batch_summary["slices"],
+                    self._last_batch_summary["batch_ms"], self._last_batch_summary["slice_ms_median"],
+                    self._last_batch_summary["slice_ms_p95"], self._last_batch_summary["slice_ms_max"],
+                    self._last_batch_summary["startup_ms"],
+                )
+            else:
+                get_logger("opportunity_engine").error(
+                    "[SCHEDULED-BATCH] FAILED start_block=%s end_block=%s failed_seeds=%s "
+                    "pair_checks_ok=%s — batch NOT reported complete",
+                    self._last_batch_summary["start_block"], self._last_batch_summary["end_block"],
+                    len(batch["failed_seeds"]), batch["pair_checks_ok"],
+                )
         else:
             get_logger("opportunity_engine").debug(
-                "[SCHEDULED-SLICE] block=%s processed=%d main_pending=%d priority_pending=%d (batch incomplete)",
+                "[SCHEDULED-SLICE] block=%s processed=%d main_pending=%d priority_pending=%d "
+                "retry_pending=%d failed_seeds=%d (batch incomplete)",
                 block_number, len(slice_seeds),
                 len(batch["seeds"]) - batch["cursor"], len(batch["priority"]),
+                len(batch.get("retry_front", [])), len(batch["failed_seeds"]),
             )
         return out
 

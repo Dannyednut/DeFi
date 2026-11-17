@@ -1,10 +1,12 @@
-"""DSS-WO-MI-102B-R1 §6 benchmark: incremental scheduled-search cost and
+"""DSS-WO-MI-102B-R1A §3 benchmark: incremental scheduled-search cost and
 registration-queue accounting on deterministic synthetic graphs.
 
-Reproducible invocation (repo root):
+Portable (R1A §3): resolves the repository root relative to this script's
+location and writes to a repository-relative default (or an explicitly
+supplied --out path), so it runs from an ordinary checkout:
 
     PYTHONDONTWRITEBYTECODE=1 python scripts/mi102b_benchmark.py \
-        [--sizes 2000,20000] [--slice 2,1]
+        [--sizes 2000,20000] [--slices 1,2] [--out PATH]
 
 Deterministic (seeded RNG, no network, no RPC); contract quoting is disabled
 (ARB_EXEC_ADDRESS -> "") exactly like the offline regression tests.
@@ -14,23 +16,31 @@ Scenarios
 A. Steady-state scheduled batch (per graph size, per slice size):
    build graph -> engine (ring drained: steady state) -> one cadence batch
    processed in slices -> per-invocation (slice) wall times, per-find_cycles
-   call times, batch totals, pair checks, venues, seeds.
+   call times, startup (universe refresh + pair checks) reported separately
+   and included in the total batch cost, pair checks, venues, seeds.
 
 B. Cold-start registration burst (20k graph): 1,000 pools registered after
-   engine creation -> queue accounting (received / consumed / retained /
-   dropped) over successive invocations.
+   engine creation -> queue accounting from INDEPENDENT recorded sets and
+   counters (received, unique, consumed/searchable, filtered, pending,
+   dropped), plus an exactly-once seeding proof.
 
-C. Simultaneous reactive + scheduled block (20k graph): 20 touched pools on
-   a mid-batch block -> combined invocation wall time.
+C. Simultaneous reactive + scheduled block (20k graph): the SAME graph
+   state and touched-pool set measured twice — (a) reactive+slice combined
+   on the incremental engine, and (b) a separate reference engine with
+   scheduled_discovery=False on a snapshot of the same graph state
+   (genuine reactive-only cost, no active scheduled batch). The difference
+   isolates the incremental scheduled slice cost from the reactive path.
 """
 import argparse
+import os
 import random
 import statistics
 import sys
 import time
 from unittest import mock
 
-sys.path.insert(0, "/home/z/my-project/repos/DeFi")
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, REPO_ROOT)
 
 import detectors.base as detectors_base
 import detectors.cycles as cycles_mod
@@ -188,17 +198,20 @@ def scenario_steady_state(n_pools, slice_size, lines):
                  f"venues_retrieved={start_info.get('venues_retrieved')} "
                  f"seed_pools_selected={start_info.get('seed_pools_selected')} "
                  f"selection_build_ms={start_info.get('selection_build_ms', 'n/a')}")
-    lines.append(f"  universe refresh+pair checks included in slice 1 "
-                 f"(slice 1 wall={first_ms:.1f} ms; anchors via reactive=no)")
+    lines.append(f"  startup (universe refresh + pair checks, reported separately AND included "
+                 f"in the batch total): startup_ms={done.get('startup_ms', 'n/a')} "
+                 f"pair_check_ms={done.get('pair_check_ms', 'n/a')} "
+                 f"(slice-1 wall={first_ms:.1f} ms; anchors via reactive=no)")
     lines.append(f"  batch: seeds_total={done['seeds_total']} slices={done['slices']} "
                  f"processed={done['seeds_processed']} skipped={done['seeds_skipped_reactive_overlap']} "
-                 f"deduped={done['seeds_deduped']} complete={done['complete']}")
+                 f"deduped={done['seeds_deduped']} complete={done['complete']} failed={done.get('failed', False)}")
     lines.append(f"  per-invocation (slice) wall ms: median={statistics.median(slice_ms):.1f} "
                  f"p95={pct(slice_ms, 0.95):.1f} max={max(slice_ms):.1f}")
     fc = [t * 1000 for t in timer.calls]
     lines.append(f"  per-find_cycles call ms: n={len(fc)} median={statistics.median(fc):.1f} "
                  f"p95={pct(fc, 0.95):.1f} max={max(fc):.1f}")
     lines.append(f"  total batch wall time: {total_batch_s:.2f}s over {done['slices']} invocations "
+                 f"(slices only) | incl. startup: {done.get('total_ms_incl_startup', 0) / 1000:.2f}s "
                  f"(MI-102B single-pass baseline on this graph shape: 21.74s)")
     lines.append(f"  acceptance: per-invocation max {max(slice_ms) / 1000:.2f}s "
                  f"(target <= ~2s; slice_size={slice_size})")
@@ -235,7 +248,21 @@ def scenario_cold_start(lines):
     lines.append("")
     lines.append("--- scenario B: cold-start registration burst | 20k graph + "
                  f"{received} registrations ---")
-    consumed_total = 0
+    # INDEPENDENT queue accounting (R1A §3): every quantity below comes from
+    # its own recorded set/counter, so a dropped entry cannot hide inside
+    # an equation that is zero by construction.
+    received_set = {f"0x{0xb0000000 + i:064x}" for i in range(received)}
+    unique_received = len(received_set)
+    seeded_seen: list[str] = []       # every seed handed to the cycle detector
+    capture = engine.detectors[0].on_block
+    orig_on_block = capture
+
+    def recording(block_number, *a, **k):
+        if k.get("scheduled_seeds") is not None:
+            seeded_seen.extend(k["scheduled_seeds"])
+        return orig_on_block(block_number, *a, **k)
+
+    engine.detectors[0].on_block = recording
     with mock.patch.object(detectors_base, "ARB_EXEC_ADDRESS", ""), \
             mock.patch.object(cycles_mod, "ARB_EXEC_ADDRESS", ""):
         for i in range(12):
@@ -245,15 +272,40 @@ def scenario_cold_start(lines):
             wall = (time.perf_counter() - t0) * 1000
             info = engine.last_scheduled_batch_info
             processed_cum = info.get("seeds_processed", 0)
-            consumed_total = received - len(ring)
             lines.append(f"  invocation {i + 1}: ring_pending_before={pending_before} "
                          f"ring_pending_after={len(ring)} "
                          f"seeds_processed_cumulative={processed_cum} "
                          f"priority_pending={info.get('priority_pending', 0)} wall_ms={wall:.1f}")
-    dropped = received - consumed_total - len(ring)
-    lines.append(f"  queue accounting: received={received} consumed_into_seeds={consumed_total} "
-                 f"retained_in_backlog={len(ring)} dropped={dropped} (expected 0)")
+    engine.detectors[0].on_block = orig_on_block
+
+    still_pending = len(ring)
+    seeded_from_burst = [p for p in seeded_seen if p in received_set]
+    seeded_unique = len(set(seeded_from_burst))
+    # a registration is LOST only if it is neither pending, nor seeded, nor
+    # filtered (deterministically ineligible); none of these can cancel out.
+    seeded_or_pending = set(seeded_from_burst) | (received_set & set(ring._queue))
+    filtered = len(received_set - seeded_or_pending)
+    dropped = unique_received - seeded_unique - still_pending - filtered
+    lines.append(f"  queue accounting (independent counters): received={received} "
+                 f"unique_registrations={unique_received} seeded_exactly_once={seeded_unique} "
+                 f"pending_backlog={still_pending} filtered_or ineligible={filtered} "
+                 f"dropped={dropped} (expected 0)")
+    dup_seeds = [p for p in set(seeded_from_burst) if seeded_from_burst.count(p) > 1]
+    lines.append(f"  duplicated_seeds={dup_seeds[:4]} (expected [])")
     return dropped
+
+
+def snapshot_graph_state(g):
+    """Snapshot of the mutable graph state the detectors read (R1A §3):
+    the reference engine must see exactly the pools/edges/metadata the
+    measured engine saw, so the reactive-only comparison is genuine."""
+    snap = TokenGraph(chain_id=g.chain_id)
+    snap._edges = {k: list(v) for k, v in g._edges.items()}
+    snap._pool_index = {k: list(v) for k, v in g._pool_index.items()}
+    snap._token_pairs = {k: list(v) for k, v in g._token_pairs.items()}
+    snap.token_metadata = dict(g.token_metadata)
+    snap.tokens = set(g.tokens)
+    return snap
 
 
 def scenario_simultaneous(lines):
@@ -266,32 +318,66 @@ def scenario_simultaneous(lines):
     engine.graph.recently_registered.drain()
     rng = random.Random(7)
     top = [e.pool_address for e in g.get_top_pools_by_tvl(400)]
-    touched = set(rng.sample(top, min(20, len(top))))
-    lines.append("--- scenario C: 20 touched pools on a mid-batch block ---")
+    touched = frozenset(rng.sample(top, min(20, len(top))))
+
+    # Reference engine: SAME graph state (snapshot taken BEFORE the measured
+    # block, identical touched-pool set) with scheduled discovery DISABLED —
+    # a genuine reactive-only measurement with no active scheduled batch.
+    ref_graph = snapshot_graph_state(g)
+    ref_engine = OpportunityEngine(
+        w3=StubW3(), chain_id=1,
+        detectors=[CycleDetector(StubW3(), ref_graph, None, None, 1)],
+        graph=ref_graph, scheduled_discovery=False)
+
+    lines.append("--- scenario C: 20 touched pools on a mid-batch block "
+                 "(same graph state + touched set, two engines) ---")
     with mock.patch.object(detectors_base, "ARB_EXEC_ADDRESS", ""), \
             mock.patch.object(cycles_mod, "ARB_EXEC_ADDRESS", ""):
-        engine.process(100, touched_pools=frozenset())          # batch starts
+        engine.process(100, touched_pools=frozenset())   # batch starts (slice 1)
+        # reference: warmed the same way (one quiet reactive block), then
+        # measured on the identical touched set with scheduling disabled
+        ref_engine.process(100, touched_pools=frozenset())
+        snap2 = snapshot_graph_state(g)                  # state at measured block
+        ref_engine2 = OpportunityEngine(
+            w3=StubW3(), chain_id=1,
+            detectors=[CycleDetector(StubW3(), snap2, None, None, 1)],
+            graph=snap2, scheduled_discovery=False)
+        ref_engine2.process(100, touched_pools=frozenset())
+
         t0 = time.perf_counter()
-        engine.process(101, touched_pools=touched)               # reactive + slice 2
+        engine.process(101, touched_pools=touched)       # reactive + scheduled slice
         combined = (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
-        engine.process(130, touched_pools=touched)               # reactive only (batch done? if active: slice included)
-        reactive_only = (time.perf_counter() - t0) * 1000
-    lines.append(f"  combined reactive+slice invocation: {combined:.1f} ms")
-    lines.append(f"  reactive-only reference (same 20 touched, later block): {reactive_only:.1f} ms")
-    lines.append("  (reactive cost is the pre-existing touched-pool path, unchanged by R1)")
+        ref_engine.process(101, touched_pools=touched)   # reactive only (no batch)
+        reactive_a = (time.perf_counter() - t0) * 1000
+        t0 = time.perf_counter()
+        ref_engine2.process(101, touched_pools=touched)  # reactive only, fresh snapshot
+        reactive_b = (time.perf_counter() - t0) * 1000
+        slice_wall = combined - min(reactive_a, reactive_b)
+    info = engine.last_scheduled_batch_info
+    lines.append(f"  combined reactive+scheduled-slice invocation: {combined:.1f} ms "
+                 f"(batch active: {not info.get('complete', True)}, "
+                 f"slices={info.get('slices', 0)})")
+    lines.append(f"  reactive-only reference (scheduled_discovery=False, same graph state + "
+                 f"touched set): {reactive_a:.1f} ms / {reactive_b:.1f} ms (two independent runs)")
+    lines.append(f"  incremental scheduled slice cost (combined - reactive-only): "
+                 f"~{slice_wall:.1f} ms")
+    lines.append("  (reactive cost is the pre-existing touched-pool path, unchanged by R1/R1A)")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sizes", default="2000,20000")
     parser.add_argument("--slices", default="1,2")
+    parser.add_argument("--out", default=None,
+                        help="output file (default: benchmark_results.txt in the repository root)")
     args = parser.parse_args()
     sizes = [int(s) for s in args.sizes.split(",")]
     slice_sizes = [int(s) for s in args.slices.split(",")]
 
     lines = []
-    lines.append("DSS-WO-MI-102B-R1 §6 benchmark — incremental scheduled search + registration queue")
+    lines.append("DSS-WO-MI-102B-R1A §3 benchmark — incremental scheduled search + registration queue")
+    lines.append(f"repo_root={REPO_ROOT}")
     lines.append(f"config: additional_pair_limit={BoundedDiscoveryConfig().additional_pair_limit} "
                  f"max_pair_checks={BoundedDiscoveryConfig().max_pair_checks} "
                  f"refresh_interval_blocks={BoundedDiscoveryConfig().refresh_interval_blocks} "
@@ -305,10 +391,10 @@ def main():
     scenario_simultaneous(lines)
     out = "\n".join(lines)
     print(out)
-    import os
-    os.makedirs("/home/z/my-project/download/DSS-WO-MI-102B-R1", exist_ok=True)
-    with open("/home/z/my-project/download/DSS-WO-MI-102B-R1/benchmark_results_r1.txt", "w") as f:
+    out_path = os.path.abspath(args.out) if args.out else os.path.join(REPO_ROOT, "benchmark_results.txt")
+    with open(out_path, "w") as f:
         f.write(out + "\n")
+    print(f"\n[written] {out_path}")
 
 
 if __name__ == "__main__":

@@ -103,7 +103,15 @@ class OpportunityEngine:
                         canonical.metadata["route_state_source"] = sorted({getattr(e, "state_source", "") for e in edges if getattr(e, "state_source", "")})
                 candidates.append(canonical)
 
+        # R1A1 §3: track whether the reactive cycle / cross-protocol
+        # invocations actually COMPLETED for this invocation. The scheduled
+        # pass must not assume reactive success from the mere presence of
+        # touched pools: a failed or partial reactive run keeps the affected
+        # seeds/pairs eligible for scheduled work (dedup handles overlap).
+        reactive_cycle_ok: bool | None = None
+        reactive_cross_ok: bool | None = None
         for detector in self.detectors:
+            name = getattr(detector, "name", "")
             try:
                 interval = max(1, int(getattr(detector, "block_interval", 1) or 1))
                 requires_touched = bool(getattr(detector, "requires_touched_pools", False))
@@ -113,7 +121,15 @@ class OpportunityEngine:
                     continue
                 found = detector.on_block(block_number, touched_pools=touched_pools) if detector.name == "cycles" else detector.on_block(block_number)
                 finalize(found, detector.name)
+                if name == "cycles":
+                    reactive_cycle_ok = True
+                elif name == "cross_proto":
+                    reactive_cross_ok = True
             except Exception as exc:
+                if name == "cycles":
+                    reactive_cycle_ok = False
+                elif name == "cross_proto":
+                    reactive_cross_ok = False
                 get_logger("opportunity_engine").error(
                     f"Detector '{getattr(detector, 'name', type(detector).__name__)}' failed: {exc}", exc_info=True
                 )
@@ -123,7 +139,9 @@ class OpportunityEngine:
         # as the reactive path; a candidate reachable by both paths carries
         # one executable-route identity and cannot enter the pipeline twice.
         try:
-            finalize(self._scheduled_pass_opportunities(block_number, touched_pools), None)
+            finalize(self._scheduled_pass_opportunities(
+                block_number, touched_pools,
+                reactive_cycle_ok=reactive_cycle_ok, reactive_cross_ok=reactive_cross_ok), None)
         except Exception as exc:
             get_logger("opportunity_engine").error(f"Scheduled discovery pass failed: {exc}", exc_info=True)
         return self._dedupe(candidates)
@@ -171,8 +189,14 @@ class OpportunityEngine:
                 "seeds_skipped_reactive_overlap": batch["seeds_skipped"],
                 "seeds_deduped": batch["seeds_deduped"],
                 "failed_seeds": len(batch["failed_seeds"]),
+                # R1A1 §4: failed-seed ADDRESSES in the live status — bounded
+                # display with an explicit truncation indicator; the final
+                # summary carries the FULL list.
+                "failed_seed_list": list(batch["failed_seeds"])[:32],
+                "failed_seed_list_truncated": len(batch["failed_seeds"]) > 32,
                 "pair_checks_ok": batch["pair_checks_ok"],
                 "pair_checks_attempted": batch["pair_checks_attempted"],
+                "anchors_covered": batch["anchors_covered"],
                 "main_pending": len(batch["seeds"]) - batch["cursor"],
                 "priority_pending": len(batch["priority"]),
                 "slices": batch["slices"],
@@ -229,8 +253,22 @@ class OpportunityEngine:
         ordered = sorted(values)
         return ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))]
 
-    def _scheduled_pass_opportunities(self, block_number: int, touched_pools: set[str] | None) -> list[Opportunity]:
-        """Bounded, INCREMENTAL scheduled search (R1 §3, R1A) — or nothing.
+    def _scheduled_pass_opportunities(self, block_number: int, touched_pools: set[str] | None,
+                                      reactive_cycle_ok: bool | None = None,
+                                      reactive_cross_ok: bool | None = None) -> list[Opportunity]:
+        """Bounded, INCREMENTAL scheduled search (R1 §3, R1A, R1A1) — or nothing.
+
+        ``reactive_cycle_ok`` / ``reactive_cross_ok`` (R1A1 §3) carry whether
+        the REACTIVE detector invocations of the current block completed:
+        ``True`` = completed, ``False`` = raised, ``None`` = not invoked.
+        Touched pools are excluded from scheduled cycle search ONLY when the
+        reactive cycle invocation actually succeeded (``True``) — a failed
+        or partial reactive run keeps them scheduled-eligible (candidate
+        dedup handles overlapping results). Anchor pairs are skipped in the
+        scheduled pair-check invocation only when the reactive anchor checks
+        actually succeeded; otherwise the scheduled invocation completes the
+        missing anchor stage itself, and the batch cannot report successful
+        pair checks until that happened.
 
         One scheduled BATCH is active at a time; it is processed in
         deterministic slices of ``scheduled_seeds_per_slice`` cycle-search
@@ -242,12 +280,13 @@ class OpportunityEngine:
         Batch start (when no batch is active and the cadence is due or
         registrations are pending): refresh the ranked pair selection and
         run the cross-protocol pair checks ONCE (never repeated per slice;
-        anchor pairs are skipped here when the reactive detector already
-        checked them in the same block, keeping the block within the
-        30-pair budget), then process the first slice. Newly registered
-        pools join the seed queue with PRIORITY (consumed from the lossless
-        backlog, bounded per invocation); the ranked-universe venues are
-        retained until searched — nothing is discarded.
+        anchor pairs are skipped here only when the reactive detector
+        actually checked them successfully in the same block, keeping the
+        block within the 30-pair budget), then process the first slice.
+        Newly registered pools join the seed queue with PRIORITY (consumed
+        from the lossless backlog, bounded per invocation); the
+        ranked-universe venues are retained until searched — nothing is
+        discarded.
 
         Fairness (R1A §1): a continuous stream of registrations must not
         starve the ranked-universe seeds. Each slice alternates per SLOT
@@ -263,24 +302,25 @@ class OpportunityEngine:
         NOT advance the work — its seeds are re-queued at the front and
         retried on the next invocation, with a bounded retry budget per
         seed; seeds that exhaust their retries move to ``failed_seeds``
-        (visible, never reported as processed). A failed cross-protocol
-        pair-check invocation leaves ``pair_checks_ok`` False and is retried
-        once per invocation (bounded); a batch that ends with failed seeds
-        or failed pair checks reports ``failed``/incomplete state instead
-        of a plain ``complete: True``. No hidden unbounded retries; failures
-        stay visible in the summary.
+        (visible with their addresses, never reported as processed). A
+        failed cross-protocol pair-check invocation leaves
+        ``pair_checks_ok`` False and is retried once per invocation
+        (bounded), completing the missing anchor stage if needed; a batch
+        that ends with failed seeds or failed pair checks reports
+        ``failed``/incomplete state instead of a plain ``complete: True``.
+        No hidden unbounded retries; failures stay visible in the summary.
 
         Every invocation afterwards continues the active batch with exactly
         one slice; a batch is never started while a previous one is
         incomplete, and it completes only when the cursor AND the priority
         queue are exhausted (recorded with start AND completion info).
-
-        Seeds the reactive detector scanned in the current block are
-        dropped from the scheduled slice (no duplicate work in one block).
         """
         if not self.scheduled_discovery or self.graph is None:
             return []
         touched_lower = {p.lower() for p in (touched_pools or ())}
+        # R1A1 §3: duplicate-work suppression applies ONLY to pools the
+        # reactive cycle detector actually scanned successfully this block.
+        suppress_reactive_overlap = bool(touched_lower) and reactive_cycle_ok is True
         out: list[Opportunity] = []
         batch = self._scheduled_batch
         if batch is None:
@@ -298,22 +338,26 @@ class OpportunityEngine:
                 self.pair_universe = universe
             t_startup = time.time()
             universe.refresh(block_number)
+            # R1A1 §4: startup_ms is the UNIVERSE REFRESH time only;
+            # pair-check work is measured separately (pair_check_ms) and the
+            # total adds each component exactly once.
             startup_ms = round((time.time() - t_startup) * 1000.0, 3)
 
             # Newly registered pools seed FIRST so ranking cannot starve
             # them; the TVL-ranked universe venues fill the remaining seed
-            # budget. Pools the reactive path just scanned are skipped.
+            # budget. Pools the reactive path successfully scanned in this
+            # block are skipped (R1A1 §3: only on actual reactive success).
             new_seeds = self._consume_new_pool_seeds()
             seeds: list[str] = []
             seen: set[str] = set()
             for s in new_seeds:
-                if s not in seen and s not in touched_lower:
+                if s not in seen and not (suppress_reactive_overlap and s in touched_lower):
                     seen.add(s)
                     seeds.append(s)
             for s in universe.seed_pools():
                 if len(seeds) >= self.bounded_config.max_seed_pools:
                     break
-                if s in seen or s in touched_lower:
+                if s in seen or (suppress_reactive_overlap and s in touched_lower):
                     continue
                 seen.add(s)
                 seeds.append(s)
@@ -327,14 +371,16 @@ class OpportunityEngine:
                 "seed_pools_selected": len(seeds),
             }
 
-            # Pair checks run ONCE per batch. If the reactive detector
-            # already checked the anchor pairs in this block (touched pools
-            # present), check ONLY the supplementary pairs here so the
-            # block-wide total respects the 30-pair budget (R1 §5). A failed
-            # invocation leaves pair_checks_ok=False and is retried once
-            # per invocation while the batch runs (R1A §2); the batch is
-            # never reported with completed pair checks until it succeeds.
-            anchors_checked_reactively = bool(touched_lower)
+            # Pair checks run ONCE per batch. The anchor stage counts as
+            # covered ONLY when the reactive cross-protocol invocation
+            # actually succeeded in this block (R1A1 §3) — a failed reactive
+            # run means the scheduled invocation must check the anchor pairs
+            # itself (check_anchors=True). A failed scheduled invocation
+            # leaves pair_checks_ok=False and is retried once per invocation
+            # while the batch runs, completing the missing anchor stage
+            # first; the batch is never reported with completed pair checks
+            # until the required checks succeeded.
+            anchors_covered = bool(touched_lower) and reactive_cross_ok is True
             pair_checks_ok = True
             pair_checks_attempted = 0
             t_pair = time.time()
@@ -342,7 +388,7 @@ class OpportunityEngine:
                 if getattr(detector, "name", "") == "cross_proto":
                     pair_checks_attempted += 1
                     try:
-                        if anchors_checked_reactively:
+                        if anchors_covered:
                             found = detector.on_block(block_number, extra_pairs=universe.additional_pairs(),
                                                       check_anchors=False)
                         else:
@@ -355,7 +401,6 @@ class OpportunityEngine:
                             f"Scheduled batch start: cross-protocol detector failed: {exc}", exc_info=True
                         )
             pair_check_ms = round((time.time() - t_pair) * 1000.0, 3)
-            startup_ms = round(startup_ms + pair_check_ms, 3)
 
             batch = {
                 "start_block": int(block_number),
@@ -380,7 +425,7 @@ class OpportunityEngine:
                 "seeds_processed": 0,
                 "new_pool_seeds": len(new_seeds),
                 "additional_pairs": list(universe.additional_pairs()),
-                "anchors_checked_reactively": anchors_checked_reactively,
+                "anchors_covered": anchors_covered,
                 "start_info": dict(self._last_scheduled_info),
                 "startup_ms": startup_ms,
                 "pair_check_ms": pair_check_ms,
@@ -388,10 +433,10 @@ class OpportunityEngine:
             self._scheduled_batch = batch
             get_logger("opportunity_engine").info(
                 "[SCHEDULED-BATCH] start block=%s reason=%s seeds=%d new_pools=%d additional_pairs=%d "
-                "slice_size=%d anchors_via_reactive=%s pair_checks_ok=%s startup_ms=%s",
+                "slice_size=%d anchors_covered=%s pair_checks_ok=%s startup_ms=%s",
                 block_number, reason, len(seeds), len(new_seeds),
                 len(batch["additional_pairs"]), self.bounded_config.scheduled_seeds_per_slice,
-                anchors_checked_reactively, batch["pair_checks_ok"], batch["startup_ms"],
+                anchors_covered, batch["pair_checks_ok"], batch["startup_ms"],
             )
         else:
             # Active batch: never start an overlapping sweep (R1 §3.6).
@@ -405,23 +450,31 @@ class OpportunityEngine:
                 if taken:
                     batch["priority"].extend(taken)
                     batch["priority_consumed"] += len(taken)
-            # R1A §2: a failed pair-check stage is retried once per
+            # R1A §2/R1A1 §3: a failed pair-check stage is retried once per
             # invocation while the batch is active — bounded, visible
-            # (pair_checks_ok in the summary), never silently skipped.
+            # (pair_checks_ok in the summary), never silently skipped. The
+            # retry must also complete the missing ANCHOR stage when the
+            # reactive anchor checks have not succeeded: pair checks may not
+            # be reported successful on supplementary pairs alone.
             if not batch["pair_checks_ok"]:
+                if touched_lower and reactive_cross_ok is True:
+                    batch["anchors_covered"] = True
+                check_anchors = not batch["anchors_covered"]
                 for detector in self.detectors:
                     if getattr(detector, "name", "") == "cross_proto":
                         t_pair = time.time()
                         try:
-                            if batch["anchors_checked_reactively"]:
-                                found = detector.on_block(
-                                    block_number, extra_pairs=batch["additional_pairs"], check_anchors=False)
-                            else:
+                            if check_anchors:
                                 found = detector.on_block(
                                     block_number, extra_pairs=batch["additional_pairs"])
+                            else:
+                                found = detector.on_block(
+                                    block_number, extra_pairs=batch["additional_pairs"], check_anchors=False)
                             self._tag_scheduled(found, batch["reason"])
                             out.extend(found or [])
                             batch["pair_checks_ok"] = True
+                            if check_anchors:
+                                batch["anchors_covered"] = True
                         except Exception as exc:
                             get_logger("opportunity_engine").error(
                                 f"Scheduled pair-check retry failed: {exc}", exc_info=True
@@ -444,7 +497,11 @@ class OpportunityEngine:
 
         def _book_candidate(cand: str, slot: str) -> bool:
             """Book one candidate into the slice; False if it must be skipped."""
-            if cand in touched_lower or cand in slice_seeds:
+            # R1A1 §3: reactive-overlap suppression applies ONLY when the
+            # reactive cycle invocation actually succeeded this block — a
+            # failed/partial reactive run must not silently discard affected
+            # scheduled work (dedup handles overlapping candidates).
+            if (suppress_reactive_overlap and cand in touched_lower) or cand in slice_seeds:
                 batch["seeds_skipped"] += 1
                 return False
             if cand in batch["processed"]:
@@ -529,9 +586,13 @@ class OpportunityEngine:
                 "complete": True,
                 "failed": not ok,
                 "failed_seeds": len(batch["failed_seeds"]),
-                "failed_seed_list": list(batch["failed_seeds"])[:32],
+                # R1A1 §4: the final summary accounts for EVERY failed seed —
+                # full list, never silently truncated.
+                "failed_seed_list": list(batch["failed_seeds"]),
+                "failed_seed_list_truncated": False,
                 "pair_checks_ok": batch["pair_checks_ok"],
                 "pair_checks_attempted": batch["pair_checks_attempted"],
+                "anchors_covered": batch["anchors_covered"],
                 "start_block": batch["start_block"],
                 "end_block": int(block_number),
                 "reason": batch["reason"],
@@ -552,7 +613,7 @@ class OpportunityEngine:
                                                + batch.get("pair_check_ms", 0.0), 3),
                 "new_pool_seeds": batch["new_pool_seeds"],
                 "additional_pairs": len(batch["additional_pairs"]),
-                "anchors_checked_reactively": batch["anchors_checked_reactively"],
+                "anchors_covered_reactively": batch["anchors_covered"],
             }
             if not ok:
                 self._last_batch_summary["complete"] = False

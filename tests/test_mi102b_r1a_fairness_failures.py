@@ -51,13 +51,15 @@ def _token(i: int) -> str:
 
 class SliceRecorder:
     """Records (block, seed) for every scheduled cycle-search slot booking
-    and supports injected detector failures."""
+    and supports injected detector failures (scheduled and/or reactive)."""
 
     def __init__(self, engine):
         self.events = []           # (block, seed) per booked slot
-        self.calls = 0             # successful detector invocations
-        self.fail_next = 0         # fail this many invocations, then succeed
+        self.calls = 0             # successful scheduled invocations
+        self.fail_next = 0         # fail this many SCHEDULED invocations
         self.failed_slices = []    # (block, seeds) of failed invocations
+        self.fail_reactive = False  # fail EVERY reactive (touched) invocation
+        self.reactive_calls = 0
         self.engine = engine
         self._original = engine.detectors[0].on_block
         engine.detectors[0].on_block = self._hook
@@ -70,6 +72,11 @@ class SliceRecorder:
                 raise RuntimeError("injected cycle-detector failure")
             self.calls += 1
             self.events.extend((block_number, s) for s in kwargs["scheduled_seeds"])
+            return self._original(block_number, *args, **kwargs)
+        # reactive invocation (touched pools present)
+        self.reactive_calls += 1
+        if self.fail_reactive:
+            raise RuntimeError("injected REACTIVE cycle-detector failure")
         return self._original(block_number, *args, **kwargs)
 
     @property
@@ -79,20 +86,27 @@ class SliceRecorder:
 
 class CrossRecorder:
     """Wraps the engine's cross_proto detector: records every invocation
-    (anchors checked or not) and supports injected failures."""
+    (reactive vs scheduled, anchors checked or not) and supports injected
+    failures for either path."""
 
     def __init__(self, engine):
         self.invocations = []      # (block, check_anchors) — successful only
+        self.scheduled_calls = []  # (block, check_anchors) for scheduled calls only
         self.failures = 0
-        self.fail_next = 0
+        self.fail_next = 0          # fail this many SCHEDULED invocations
+        self.fail_reactive = False  # fail EVERY reactive invocation
         self.engine = engine
         self._original = engine.detectors[1].on_block
         engine.detectors[1].on_block = self._hook
 
     def _hook(self, block_number, *args, **kwargs):
+        scheduled = "extra_pairs" in kwargs
         anchors = kwargs.get("check_anchors", True)
-        if self.fail_next > 0:
-            self.fail_next -= 1
+        if scheduled:
+            self.scheduled_calls.append((block_number, anchors))
+        if (scheduled and self.fail_next > 0) or (not scheduled and self.fail_reactive):
+            if scheduled:
+                self.fail_next -= 1
             self.failures += 1
             raise RuntimeError("injected cross-protocol failure")
         self.invocations.append((block_number, anchors))
@@ -105,38 +119,68 @@ class CrossRecorder:
 
 class TestSustainedArrivalFairness(unittest.TestCase):
     def setUp(self):
+        # Steady-state fixture: the ranked universe holds seeds that are NOT
+        # part of the arrival stream, and the registration backlog is drained
+        # so the batch's main seed list is PURE ranked-universe selection
+        # (R1A1 §1: batch["seeds"] must not be mistaken for the universe —
+        # it also contains registrations consumed at batch start).
         self.graph = build_profitable_graph()
+        init_prices(2000.0, WETH, [USDC])
+        self.extra_universe_pools = []
+        for i in range(6):
+            pool, tok = _addr(900 + i), _token(900 + i)
+            add_v2_pool(self.graph, pool, WETH, tok, 1.0)
+            self.extra_universe_pools.append(pool)
+        self.graph.recently_registered.drain()  # steady state: backlog empty
 
     def test_ranked_universe_progresses_under_sustained_arrivals(self):
         """Registrations arrive EVERY invocation while a batch is active —
         never a finite pre-existing backlog. The alternation rule must keep
-        ranked-universe seeds advancing; once arrivals stop, every
-        registration must have been seeded exactly once (FIFO), with the
-        per-slice and per-pass bounds respected throughout."""
+        RANKED-UNIVERSE seeds advancing (identified from the universe's own
+        selection, independently of the newly registered pool addresses);
+        once arrivals stop, every registration must have been seeded exactly
+        once (FIFO), with the per-slice and per-pass bounds respected
+        throughout. This test FAILS if registrations monopolize all
+        scheduled slices while ranked-universe seeds remain pending."""
         with patch_quote_path():
             engine = make_engine(self.graph)
             rec = SliceRecorder(engine)
             engine.process(100, touched_pools=frozenset())  # batch starts
             batch = engine._scheduled_batch
             self.assertIsNotNone(batch)
-            universe_seed_set = set(batch["seeds"])
+            # R1A1 §1: ranked-universe seeds come from the universe's OWN
+            # selection — never from the batch seed list, which can mix in
+            # registrations consumed at batch start. The backlog was drained
+            # before engine creation, so the batch list must be a subset of
+            # the ranked selection and contain no stream address.
+            universe_seeds = list(engine.pair_universe.seed_pools())
+            self.assertTrue(universe_seeds, "fixture must provide ranked-universe seeds")
+            self.assertTrue(set(batch["seeds"]) <= set(universe_seeds),
+                            "batch main list is pure ranked-universe selection at start")
+            pure_universe = set(universe_seeds) - set(stream := [_addr(i) for i in range(60)])
+            self.assertTrue(pure_universe,
+                            "ranked-universe seeds must be independent of the arrival stream")
 
             # SUSTAINED arrivals: one new searchable pool per invocation,
             # 60 invocations in a row while the batch is active.
-            stream = [_addr(i) for i in range(60)]
             for i, addr in enumerate(stream):
                 add_v2_pool(self.graph, addr, _token(i), WETH, 2.0)
                 engine.process(101 + i, touched_pools=frozenset())
             mid = engine.last_scheduled_batch_info
             self.assertFalse(mid["complete"], "stream ongoing: batch still active")
 
-            # universe seeds progressed DURING the stream: alternation means
-            # roughly half of the stream window's slots went to the universe.
-            searched_mid = set(rec.seeds)
-            self.assertTrue(universe_seed_set & searched_mid,
-                            "ranked-universe seeds must advance while registrations keep arriving")
-            # and the arrivals so far were seeded too (priority retained)
-            self.assertTrue(set(stream) & searched_mid,
+            # UNIVERSE PROGRESS DURING THE STREAM: at least one actual
+            # ranked-universe seed searched while arrivals continue, and the
+            # cursor kept advancing (more than a one-off) — this is the
+            # assertion that fails under registration monopolization.
+            during_stream = [(b, s) for b, s in rec.events if b >= 101]
+            universe_progress = [s for _, s in during_stream if s in pure_universe]
+            self.assertGreaterEqual(
+                len(set(universe_progress)), 2,
+                "ranked-universe seeds must CONTINUE advancing while registrations "
+                f"keep arriving (got {sorted(set(universe_progress))})")
+            # and the arrivals were seeded too (priority retained)
+            self.assertTrue({s for _, s in during_stream} & set(stream),
                             "simultaneous priority progress expected under alternation")
             # per-slice bound held throughout the stream
             from collections import Counter
@@ -158,6 +202,9 @@ class TestSustainedArrivalFairness(unittest.TestCase):
         counts = Counter(rec.seeds)
         dups = [s for s in stream if counts[s] != 1]
         self.assertEqual(dups, [], "every registration seeded EXACTLY once")
+        # every ranked-universe seed was also searched exactly once
+        universe_dups = [s for s in pure_universe if counts[s] != 1]
+        self.assertEqual(universe_dups, [], "every ranked-universe seed searched exactly once")
         # FIFO: the stream's first-half seeds appear before its second half
         order = {s: i for i, (_, s) in enumerate(rec.events)}
         first_half = [order.get(s) for s in stream[: len(stream) // 2] if s in order]
@@ -308,6 +355,182 @@ class TestCrossProtocolFailureIntegrity(unittest.TestCase):
         self.assertFalse(done["pair_checks_ok"], "persistent pair-check failure visible")
         self.assertTrue(done["failed"], "terminal state explicitly failed")
         self.assertFalse(done["complete"], "not reported as successfully complete")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# R1A1 §3 — reactive detector success is not assumed
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestReactiveFailureHandoff(unittest.TestCase):
+    def setUp(self):
+        init_prices(2000.0, WETH, [USDC])
+        self.graph = build_profitable_graph()
+
+    def _both_detector_engine(self):
+        return make_engine(
+            self.graph,
+            detectors=[CycleDetector(StubW3(), self.graph, None, None, 1),
+                       CrossProtocolDetector(StubW3(), self.graph, None, None, 1)],
+        )
+
+    def test_reactive_cycle_failure_preserves_scheduled_eligibility(self):
+        """R1A1 §3.1: a REACTIVE CycleDetector failure on a block with
+        touched pools and a newly registered pool must not let the scheduled
+        path silently discard that pool. Under the old behavior the pool
+        (present in touched_pools) was excluded from the scheduled slice
+        solely because it appeared touched — consumed from the backlog and
+        never searched."""
+        with patch_quote_path():
+            engine = make_engine(self.graph)
+            rec = SliceRecorder(engine)
+            engine.process(100, touched_pools=frozenset())  # batch starts
+            rec.fail_reactive = True  # every reactive cycle invocation fails
+            new_pool = _addr(500)
+            add_v2_pool(self.graph, new_pool, _token(500), WETH, 2.0)
+            engine.process(101, touched_pools=frozenset({new_pool}))
+            live = engine.last_scheduled_batch_info
+            # the newly registered pool was NOT silently consumed+discarded:
+            # the scheduled slice searched it despite the reactive failure
+            self.assertIn(new_pool, rec.seeds,
+                          "touched pool must stay scheduled-eligible when the "
+                          "reactive cycle invocation failed")
+            self.assertEqual(rec.seeds.count(new_pool), 1, "searched exactly once")
+            block = 102
+            while engine._scheduled_batch is not None:
+                engine.process(block, touched_pools=frozenset())
+                block += 1
+            done = engine.last_scheduled_batch_info
+        self.assertTrue(done["complete"])
+        self.assertFalse(done["failed"])
+        self.assertEqual(done["seeds_skipped_reactive_overlap"], 0,
+                         "nothing may be skipped as reactive-overlap when the "
+                         "reactive cycle invocation failed")
+        self.assertEqual(done["seeds_processed"] + done["seeds_skipped_reactive_overlap"]
+                         + done["seeds_deduped"], done["seeds_total"])
+
+    def test_reactive_cross_failure_completes_anchor_stage(self):
+        """R1A1 §3.2: a REACTIVE CrossProtocol failure on a block that also
+        starts a scheduled batch must not silently skip the anchor-pair
+        checks. The scheduled invocation must run with check_anchors=True,
+        and the batch cannot report successful pair-check completion until
+        the required anchor checks actually succeeded."""
+        from bounded_discovery import anchor_pairs
+        with patch_quote_path():
+            engine = self._both_detector_engine()
+            rec = CrossRecorder(engine)
+            rec.fail_reactive = True        # reactive anchor stage fails
+            rec.fail_next = 1               # first scheduled invocation fails too
+            counter = _PairCountingGraph(self.graph)
+            engine.detectors[1].graph = counter
+            engine.process(100, touched_pools=frozenset({P1}))
+            live = engine.last_scheduled_batch_info
+            self.assertFalse(live["pair_checks_ok"],
+                             "anchors were not checked successfully — pair checks not ok")
+            self.assertFalse(live["complete"])
+            # the scheduled batch-start invocation did NOT skip the anchors
+            self.assertEqual(rec.scheduled_calls[0], (100, True),
+                             "check_anchors=False is only allowed when the reactive "
+                             "anchor checks actually succeeded")
+            # next invocation: retry completes the missing anchor stage
+            engine.process(101, touched_pools=frozenset())
+            self.assertEqual(rec.scheduled_calls[1], (101, True),
+                             "retry must complete the missing anchor-pair stage")
+            live2 = engine.last_scheduled_batch_info
+            self.assertTrue(live2["pair_checks_ok"], "retry covered anchors + supplementary")
+            block = 102
+            while engine._scheduled_batch is not None:
+                engine.process(block, touched_pools=frozenset())
+                block += 1
+            done = engine.last_scheduled_batch_info
+        # every anchor pair was actually checked (by the successful retry)
+        checked = set(counter.calls)
+        for a in anchor_pairs(1):
+            self.assertIn(a, checked, f"anchor pair {a} must be checked before "
+                                      "the batch may report pair checks complete")
+        self.assertTrue(done["complete"])
+        self.assertTrue(done["pair_checks_ok"])
+        self.assertTrue(done["anchors_covered_reactively"],
+                        "anchor stage recorded as covered before completion")
+
+    def test_reactive_success_retains_suppression_and_budget(self):
+        """R1A1 §3.3: when the reactive cycle invocation SUCCEEDS, the
+        existing duplicate-work suppression stays in effect (a touched pool
+        is not scheduled-searched again) and the block-wide pair-check
+        budget stays within 30."""
+        with patch_quote_path():
+            engine = self._both_detector_engine()
+            rec = SliceRecorder(engine)
+            counter = _PairCountingGraph(self.graph)
+            engine.detectors[1].graph = counter
+            engine.process(100, touched_pools=frozenset())
+            calls_after_start = len(counter.calls)
+            self.assertLessEqual(calls_after_start, 30, "batch-start pair budget")
+            touched_pool = _addr(600)
+            add_v2_pool(self.graph, touched_pool, _token(600), WETH, 2.0)
+            engine.process(101, touched_pools=frozenset({touched_pool}))
+            block_calls = len(counter.calls) - calls_after_start
+            self.assertLessEqual(block_calls, 30, "block-wide pair-check budget on success")
+            self.assertNotIn(touched_pool, rec.seeds,
+                             "successfully reactively-scanned pool is not scheduled-searched again")
+            block = 102
+            while engine._scheduled_batch is not None:
+                engine.process(block, touched_pools=frozenset())
+                block += 1
+            done = engine.last_scheduled_batch_info
+        self.assertGreaterEqual(done["seeds_skipped_reactive_overlap"], 1,
+                                "the touched pool was suppressed as reactive overlap")
+        self.assertTrue(done["complete"])
+        self.assertEqual(done["seeds_processed"] + done["seeds_skipped_reactive_overlap"]
+                         + done["seeds_deduped"], done["seeds_total"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# R1A1 §4 — failure visibility: addresses, truncation indicator, full summary
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestFailureVisibility(unittest.TestCase):
+    def test_failed_seed_addresses_visible_and_fully_accounted(self):
+        """Failed-seed ADDRESSES appear in the live batch status (bounded
+        display with an explicit truncation indicator), and the final
+        summary accounts for EVERY failed seed with the full list."""
+        graph = build_profitable_graph()
+        for i in range(40):
+            add_v2_pool(graph, _addr(700 + i), _token(700 + i), WETH, 2.0)
+        with patch_quote_path():
+            engine = make_engine(graph)
+            rec = SliceRecorder(engine)
+            rec.fail_next = 10**6  # every scheduled slice fails, persistently
+            engine.process(100, touched_pools=frozenset())
+            saw_truncated = False
+            saw_addresses = False
+            block = 101
+            while engine._scheduled_batch is not None and block < 800:
+                engine.process(block, touched_pools=frozenset())
+                if engine._scheduled_batch is None:
+                    break  # went terminal this invocation — summary checked below
+                live = engine.last_scheduled_batch_info
+                if live["failed_seeds"] > 32:
+                    self.assertTrue(live["failed_seed_list_truncated"],
+                                    "bounded display must flag truncation explicitly")
+                    self.assertEqual(len(live["failed_seed_list"]), 32)
+                    saw_truncated = True
+                if live["failed_seeds"] > 0:
+                    self.assertTrue(live["failed_seed_list"],
+                                    "live status must carry failed-seed addresses")
+                    saw_addresses = True
+                block += 1
+            done = engine.last_scheduled_batch_info
+        self.assertTrue(saw_addresses, "failed-seed addresses observed in live status")
+        self.assertTrue(saw_truncated, "truncation indicator observed in live status")
+        self.assertTrue(done["failed"], "terminal failed state preserved")
+        self.assertFalse(done["complete"])
+        self.assertFalse(done["failed_seed_list_truncated"],
+                         "final summary list is never truncated")
+        self.assertEqual(done["failed_seeds"], len(done["failed_seed_list"]),
+                         "final summary accounts for EVERY failed seed")
+        failed_observed = {s for _, seeds in rec.failed_slices for s in seeds}
+        self.assertEqual(set(done["failed_seed_list"]), failed_observed,
+                         "full failure list matches the actually failed seeds")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

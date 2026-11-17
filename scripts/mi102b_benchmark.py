@@ -44,7 +44,8 @@ sys.path.insert(0, REPO_ROOT)
 
 import detectors.base as detectors_base
 import detectors.cycles as cycles_mod
-from bounded_discovery import BoundedDiscoveryConfig
+from bounded_discovery import BoundedDiscoveryConfig, pool_is_searchable
+from collections import Counter
 from detectors.cycles import CycleDetector
 from graph import PoolEdge, TokenGraph
 from opportunity_engine import OpportunityEngine
@@ -198,22 +199,30 @@ def scenario_steady_state(n_pools, slice_size, lines):
                  f"venues_retrieved={start_info.get('venues_retrieved')} "
                  f"seed_pools_selected={start_info.get('seed_pools_selected')} "
                  f"selection_build_ms={start_info.get('selection_build_ms', 'n/a')}")
-    lines.append(f"  startup (universe refresh + pair checks, reported separately AND included "
-                 f"in the batch total): startup_ms={done.get('startup_ms', 'n/a')} "
-                 f"pair_check_ms={done.get('pair_check_ms', 'n/a')} "
-                 f"(slice-1 wall={first_ms:.1f} ms; anchors via reactive=no)")
+    lines.append(f"  startup (R1A1 §4 definitions): startup_ms={done.get('startup_ms', 'n/a')} "
+                 f"(UNIVERSE REFRESH only) | pair_check_ms={done.get('pair_check_ms', 'n/a')} "
+                 f"(pair checks, batch start + retries) | total_ms_incl_startup="
+                 f"{done.get('total_ms_incl_startup', 'n/a')} "
+                 f"= startup + pair-check + slice costs, each counted exactly once "
+                 f"(first whole-invocation wall={first_ms:.1f} ms; anchors via reactive=no)")
     lines.append(f"  batch: seeds_total={done['seeds_total']} slices={done['slices']} "
                  f"processed={done['seeds_processed']} skipped={done['seeds_skipped_reactive_overlap']} "
                  f"deduped={done['seeds_deduped']} complete={done['complete']} failed={done.get('failed', False)}")
-    lines.append(f"  per-invocation (slice) wall ms: median={statistics.median(slice_ms):.1f} "
+    lines.append(f"  WHOLE-invocation wall ms (engine.process(): reactive path + scheduled work, "
+                 f"includes universe refresh + pair checks on the first invocation): "
+                 f"median={statistics.median(slice_ms):.1f} "
                  f"p95={pct(slice_ms, 0.95):.1f} max={max(slice_ms):.1f}")
+    lines.append(f"  scheduled-slice wall ms (engine summary; cycle-search work only, excludes "
+                 f"startup and pair checks): median={done.get('slice_ms_median', 0):.1f} "
+                 f"p95={done.get('slice_ms_p95', 0):.1f} max={done.get('slice_ms_max', 0):.1f}")
     fc = [t * 1000 for t in timer.calls]
     lines.append(f"  per-find_cycles call ms: n={len(fc)} median={statistics.median(fc):.1f} "
                  f"p95={pct(fc, 0.95):.1f} max={max(fc):.1f}")
-    lines.append(f"  total batch wall time: {total_batch_s:.2f}s over {done['slices']} invocations "
-                 f"(slices only) | incl. startup: {done.get('total_ms_incl_startup', 0) / 1000:.2f}s "
+    lines.append(f"  total WHOLE-invocation wall: {total_batch_s:.2f}s over {done['slices']} invocations | "
+                 f"engine-accounted batch cost (startup+pair+slices, once each): "
+                 f"{done.get('total_ms_incl_startup', 0) / 1000:.2f}s "
                  f"(MI-102B single-pass baseline on this graph shape: 21.74s)")
-    lines.append(f"  acceptance: per-invocation max {max(slice_ms) / 1000:.2f}s "
+    lines.append(f"  acceptance: whole-invocation max {max(slice_ms) / 1000:.2f}s "
                  f"(target <= ~2s; slice_size={slice_size})")
     return {"graph": g.pool_count, "slice": slice_size, "done": done, "slice_ms": slice_ms, "fc": fc}
 
@@ -230,10 +239,12 @@ def scenario_cold_start(lines):
     engine.graph.recently_registered.drain()
     ring = g.recently_registered
     received = 1000
+    n_ineligible = 5  # first 5 registrations deliberately below the TVL gate
     for i in range(received):
         t = f"0x{0xa0000000 + i:064x}"
         r_in = 10**22
-        common = dict(dex_name="UniswapV2", fee_bps=30, version=2, tvl_usd=50_000.0,
+        tvl = 100.0 if i < n_ineligible else 50_000.0
+        common = dict(dex_name="UniswapV2", fee_bps=30, version=2, tvl_usd=tvl,
                       protocol="uniswap_v2", pool_token0=WETH, pool_token1=t)
         g.add_or_update_pool(
             PoolEdge(f"0x{0xb0000000 + i:064x}", token_in=WETH, token_out=t,
@@ -247,15 +258,15 @@ def scenario_cold_start(lines):
 
     lines.append("")
     lines.append("--- scenario B: cold-start registration burst | 20k graph + "
-                 f"{received} registrations ---")
-    # INDEPENDENT queue accounting (R1A §3): every quantity below comes from
-    # its own recorded set/counter, so a dropped entry cannot hide inside
-    # an equation that is zero by construction.
+                 f"{received} registrations (first {n_ineligible} below the "
+                 f"searchability TVL gate) ---")
+    # R1A1 §2: COMPLETE registration-state partition from ACTUAL recorded
+    # addresses and ACTUAL scheduler state. Every category below is read
+    # from its own source; none is defined as the residual of the others,
+    # so a dropped entry cannot hide inside a zero-by-construction equation.
     received_set = {f"0x{0xb0000000 + i:064x}" for i in range(received)}
-    unique_received = len(received_set)
     seeded_seen: list[str] = []       # every seed handed to the cycle detector
-    capture = engine.detectors[0].on_block
-    orig_on_block = capture
+    orig_on_block = engine.detectors[0].on_block
 
     def recording(block_number, *a, **k):
         if k.get("scheduled_seeds") is not None:
@@ -278,20 +289,61 @@ def scenario_cold_start(lines):
                          f"priority_pending={info.get('priority_pending', 0)} wall_ms={wall:.1f}")
     engine.detectors[0].on_block = orig_on_block
 
-    still_pending = len(ring)
-    seeded_from_burst = [p for p in seeded_seen if p in received_set]
-    seeded_unique = len(set(seeded_from_burst))
-    # a registration is LOST only if it is neither pending, nor seeded, nor
-    # filtered (deterministically ineligible); none of these can cancel out.
-    seeded_or_pending = set(seeded_from_burst) | (received_set & set(ring._queue))
-    filtered = len(received_set - seeded_or_pending)
-    dropped = unique_received - seeded_unique - still_pending - filtered
-    lines.append(f"  queue accounting (independent counters): received={received} "
-                 f"unique_registrations={unique_received} seeded_exactly_once={seeded_unique} "
-                 f"pending_backlog={still_pending} filtered_or ineligible={filtered} "
-                 f"dropped={dropped} (expected 0)")
-    dup_seeds = [p for p in set(seeded_from_burst) if seeded_from_burst.count(p) > 1]
-    lines.append(f"  duplicated_seeds={dup_seeds[:4]} (expected [])")
+    # ── snapshot of every valid state category (actual addresses) ──
+    batch = engine._scheduled_batch
+    seed_counts = Counter(seeded_seen)
+    ring_set = set(ring._queue)                      # pending in graph backlog
+    staging_set = set(engine._notified_new_pools)    # popped, awaiting hand-off
+    main_pending = set(batch["seeds"][batch["cursor"]:]) if batch else set()
+    priority_set = set(batch["priority"]) if batch else set()
+    retry_set = set(batch.get("retry_front", [])) if batch else set()
+    failed_set = set(batch["failed_seeds"]) if batch else set()
+
+    categories: dict[str, set] = {}
+    remaining = set(received_set)
+
+    def take(name: str, members) -> None:
+        got = remaining & set(members)
+        remaining.difference_update(got)
+        categories[name] = got
+
+    # searched: per-ADDRESS counts — a unique-address count is not an
+    # exactly-once count (R1A1 §2)
+    take("searched_multiple_times", {p for p in received_set if seed_counts.get(p, 0) > 1})
+    take("searched_exactly_once", {p for p in received_set if seed_counts.get(p, 0) == 1})
+    take("pending_ring_backlog", ring_set)
+    take("pending_staging", staging_set)
+    take("pending_batch_main_seeds", main_pending)
+    take("pending_batch_priority", priority_set)
+    take("pending_retry_queue", retry_set)
+    take("failed_after_retry_exhaustion", failed_set)
+    # explicitly filtered: the EXACT production eligibility condition
+    categories["filtered_ineligible"] = {p for p in remaining if not pool_is_searchable(g, p)}
+    remaining -= categories["filtered_ineligible"]
+    categories["dropped"] = remaining  # absent from EVERY valid category
+
+    dropped = categories["dropped"]
+    assert not dropped, f"registrations lost (absent from every valid state): {sorted(dropped)[:8]}"
+    assert not categories["searched_multiple_times"], \
+        f"registrations seeded more than once: {sorted(categories['searched_multiple_times'])[:8]}"
+
+    accounted = sum(len(v) for v in categories.values())
+    assert accounted == len(received_set), \
+        f"partition does not cover all registrations: {accounted} != {len(received_set)}"
+
+    handed = len(received_set) - len(categories["pending_ring_backlog"])
+    lines.append("  registration-state partition (actual scheduler state, mutually exclusive):")
+    for name, members in categories.items():
+        sample = sorted(members)[:3]
+        lines.append(f"    {name}: {len(members)}"
+                     + (f" e.g. {sample}" if members and name == "dropped" else ""))
+    lines.append(f"  totals: received={received} accounted={accounted} "
+                 f"handed_to_scheduler={handed} "
+                 f"waiting_in_graph_backlog={len(categories['pending_ring_backlog'])} "
+                 f"dropped={len(dropped)} (expected 0, asserted)")
+    lines.append("  (registrations still waiting in the graph backlog have NOT been handed "
+                 "to the scheduler yet; the full exactly-once drain proof over the whole "
+                 "backlog is the 1,000-pool regression in the test suite)")
     return dropped
 
 

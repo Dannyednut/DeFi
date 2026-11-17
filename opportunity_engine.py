@@ -6,6 +6,7 @@ execution-ready.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+import statistics
 import time
 
 from logger import Opportunity, ValidationStage
@@ -39,7 +40,8 @@ class OpportunityEngine:
     pair_universe: RankedPairUniverse | None = None
     _last_scheduled_block: int | None = None
     _last_scheduled_info: dict = field(default_factory=dict)
-    _last_pass_reason: str = ""
+    _scheduled_batch: dict | None = None
+    _last_batch_summary: dict = field(default_factory=dict)
     _notified_new_pools: list[str] = field(default_factory=list)
 
     def _context(self, block_number: int) -> tuple[int, str]:
@@ -138,129 +140,295 @@ class OpportunityEngine:
 
     @property
     def last_scheduled_pass_block(self) -> int | None:
-        """Block number of the most recent scheduled pass (observability)."""
+        """Block number where the most recent scheduled BATCH started."""
         return self._last_scheduled_block
 
     @property
     def last_scheduled_pass_info(self) -> dict:
-        """Stats of the most recent scheduled pass (observability, §7)."""
+        """Start stats of the most recent scheduled batch (observability)."""
         return dict(self._last_scheduled_info)
 
-    def _consume_new_pool_seeds(self) -> list[str]:
-        """Drain newly registered pools (graph ring + explicit notifications),
-        keep only valid searchable state, bounded per pass. Searchable pools
-        beyond the per-pass budget are retained for the next pass (burst
-        spreading); unsearchable registrations are dropped, not retried: they
-        become discovery-eligible again only through a real state update
-        (which touches them reactively) or re-registration."""
-        pending: list[str] = []
+    @property
+    def last_scheduled_batch_info(self) -> dict:
+        """Live status of the active scheduled batch, or the completion
+        summary of the last one (R1 §3.9). A partially processed batch is
+        reported with ``complete: False`` — never as finished work."""
+        batch = self._scheduled_batch
+        if batch is not None:
+            return {
+                "complete": False,
+                "start_block": batch["start_block"],
+                "reason": batch["reason"],
+                "seeds_total": len(batch["seeds"]) + batch["priority_consumed"],
+                "seeds_processed": batch["seeds_processed"],
+                "seeds_skipped_reactive_overlap": batch["seeds_skipped"],
+                "main_pending": len(batch["seeds"]) - batch["cursor"],
+                "priority_pending": len(batch["priority"]),
+                "slices": batch["slices"],
+            }
+        return dict(self._last_batch_summary)
+
+    def _consume_new_pool_seeds(self, limit: int | None = None) -> list[str]:
+        """Bounded consumption from the LOSSLESS registration backlog (R1 §2).
+
+        Pops at most ``limit`` (default ``max_new_pool_seeds_per_pass``)
+        entries per invocation (retained overflow from earlier invocations is
+        consumed first so FIFO order is preserved); the backlog itself keeps
+        everything not yet popped. Registrations are filtered for valid
+        searchable state — including the same minimum-liquidity gate the
+        ranked pair selection applies (R1 §4). Ineligible registrations are
+        dropped, not retried: they become discovery-eligible again only
+        through a real state update (which touches them reactively) or
+        re-registration."""
+        budget = max(1, int(self.bounded_config.max_new_pool_seeds_per_pass))
+        if limit is not None:
+            budget = max(0, min(budget, int(limit)))
+        if budget == 0:
+            return []
+        pending: list[str] = list(self._notified_new_pools)  # retained overflow = oldest first
+        self._notified_new_pools = []
         ring = getattr(self.graph, "recently_registered", None)
         if ring is not None:
-            pending.extend(ring.drain())
-        pending.extend(self._notified_new_pools)
-        self._notified_new_pools = []
-        ordered = list(dict.fromkeys(pending))
-        searchable = [p for p in ordered if pool_is_searchable(self.graph, p)]
-        kept = searchable[: self.bounded_config.max_new_pool_seeds_per_pass]
+            pending.extend(ring.pop_upto(max(0, budget - len(pending))))
+        searchable = []
+        seen: set[str] = set()
+        for p in pending:
+            if p in seen:
+                continue
+            seen.add(p)
+            if pool_is_searchable(self.graph, p):
+                searchable.append(p)
+        kept = searchable[:budget]
         self._notified_new_pools = searchable[len(kept):]
         return kept
 
-    def _scheduled_pass_opportunities(self, block_number: int, touched_pools: set[str] | None) -> list[Opportunity]:
-        """One bounded scheduled pass, or nothing.
+    @staticmethod
+    def _tag_scheduled(found, reason: str) -> None:
+        for opp in found or []:
+            meta = dict(opp.metadata or {})
+            meta["discovery_mode"] = "scheduled"
+            meta["scheduled_pass"] = True
+            meta["scheduled_pass_reason"] = reason
+            opp.metadata = meta
 
-        A pass runs when the cadence is due (every ``scheduled_pass_interval``
-        blocks) OR newly registered pools are waiting; an ordinary quiet
-        block therefore costs nothing beyond the reactive path. The pass is
-        NOT a second pipeline: it invokes the existing detectors (cycle
-        search with bounded seeds, pair search with the expanded universe)
-        and returns raw detector output for the shared finalize/dedupe/
-        validation path. Cost is bounded by construction (≤30 pair checks,
-        ≤max_seed_pools DFS origins) and observable via last_scheduled_pass_info.
+    @staticmethod
+    def _p95(values: list) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        return ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))]
+
+    def _scheduled_pass_opportunities(self, block_number: int, touched_pools: set[str] | None) -> list[Opportunity]:
+        """Bounded, INCREMENTAL scheduled search (R1 §3) — or nothing.
+
+        One scheduled BATCH is active at a time; it is processed in
+        deterministic slices of ``scheduled_seeds_per_slice`` cycle-search
+        seeds per ``process()`` invocation, so a 20k-pool batch never
+        stalls one block the way the single-pass MI-102B design did
+        (measured 21.7 s). The batch state (seed list + cursor + priority
+        queue) lives on the engine; no daemon, no second scheduler.
+
+        Batch start (when no batch is active and the cadence is due or
+        registrations are pending): refresh the ranked pair selection and
+        run the cross-protocol pair checks ONCE (never repeated per slice;
+        anchor pairs are skipped here when the reactive detector already
+        checked them in the same block, keeping the block within the
+        30-pair budget), then process the first slice. Newly registered
+        pools join the seed queue with PRIORITY (consumed from the lossless
+        backlog, bounded per invocation) ahead of the ranked-universe
+        venues, which are retained until searched — nothing is discarded.
+
+        Every invocation afterwards continues the active batch with exactly
+        one slice; a batch is never started while a previous one is
+        incomplete, and it completes only when the cursor AND the priority
+        queue are exhausted (recorded with start AND completion info).
+
+        Seeds the reactive detector scanned in the current block are
+        dropped from the scheduled slice (no duplicate work in one block).
         """
         if not self.scheduled_discovery or self.graph is None:
             return []
-        ring_len = len(getattr(self.graph, "recently_registered", ()) or ())
-        has_pending = ring_len > 0 or bool(self._notified_new_pools)
-        due = self._last_scheduled_block is None or \
-            (int(block_number) - self._last_scheduled_block) >= max(1, int(self.scheduled_pass_interval))
-        if not due and not has_pending:
-            return []
-        if not due and has_pending and self._last_pass_reason == "new_pools" \
-                and (int(block_number) - self._last_scheduled_block) < max(1, int(self.bounded_config.new_pool_pass_spacing)):
-            # Registration burst (e.g. warm restart): consecutive new-pool
-            # passes are spaced out; a single new pool is still considered on
-            # the very next block.
-            return []
-        started = time.time()
-        reason = "cadence" if due else "new_pools"
-
-        universe = self.pair_universe
-        if universe is None:
-            universe = RankedPairUniverse(self.graph, self.chain_id, self.bounded_config)
-            self.pair_universe = universe
-        universe.refresh(block_number)
-
-        # Newly registered pools seed FIRST so ranking cannot starve them;
-        # the TVL-ranked universe venues fill the remaining seed budget.
-        # Pools the reactive path just scanned are skipped (no double work).
         touched_lower = {p.lower() for p in (touched_pools or ())}
-        new_seeds = self._consume_new_pool_seeds()
-        seeds: list[str] = []
-        seen: set[str] = set()
-        for s in new_seeds:
-            if s not in seen:
+        out: list[Opportunity] = []
+        batch = self._scheduled_batch
+        if batch is None:
+            ring = getattr(self.graph, "recently_registered", None)
+            has_pending = (len(ring) if ring is not None else 0) > 0 or bool(self._notified_new_pools)
+            due = self._last_scheduled_block is None or \
+                (int(block_number) - self._last_scheduled_block) >= max(1, int(self.scheduled_pass_interval))
+            if not due and not has_pending:
+                return []
+            reason = "cadence" if due else "new_pools"
+
+            universe = self.pair_universe
+            if universe is None:
+                universe = RankedPairUniverse(self.graph, self.chain_id, self.bounded_config)
+                self.pair_universe = universe
+            universe.refresh(block_number)
+
+            # Newly registered pools seed FIRST so ranking cannot starve
+            # them; the TVL-ranked universe venues fill the remaining seed
+            # budget. Pools the reactive path just scanned are skipped.
+            new_seeds = self._consume_new_pool_seeds()
+            seeds: list[str] = []
+            seen: set[str] = set()
+            for s in new_seeds:
+                if s not in seen and s not in touched_lower:
+                    seen.add(s)
+                    seeds.append(s)
+            for s in universe.seed_pools():
+                if len(seeds) >= self.bounded_config.max_seed_pools:
+                    break
+                if s in seen or s in touched_lower:
+                    continue
                 seen.add(s)
                 seeds.append(s)
-        for s in universe.seed_pools():
-            if len(seeds) >= self.bounded_config.max_seed_pools:
-                break
-            if s in seen or s in touched_lower:
+
+            self._last_scheduled_block = int(block_number)
+            self._last_scheduled_info = {
+                **universe.last_stats,
+                "block": int(block_number),
+                "reason": reason,
+                "new_pool_seeds": len(new_seeds),
+                "seed_pools_selected": len(seeds),
+            }
+
+            # Pair checks run ONCE per batch. If the reactive detector
+            # already checked the anchor pairs in this block (touched pools
+            # present), check ONLY the supplementary pairs here so the
+            # block-wide total respects the 30-pair budget (R1 §5).
+            anchors_checked_reactively = bool(touched_lower)
+            for detector in self.detectors:
+                if getattr(detector, "name", "") == "cross_proto":
+                    try:
+                        if anchors_checked_reactively:
+                            found = detector.on_block(block_number, extra_pairs=universe.additional_pairs(),
+                                                      check_anchors=False)
+                        else:
+                            found = detector.on_block(block_number, extra_pairs=universe.additional_pairs())
+                        self._tag_scheduled(found, reason)
+                        out.extend(found or [])
+                    except Exception as exc:
+                        get_logger("opportunity_engine").error(
+                            f"Scheduled batch start: cross-protocol detector failed: {exc}", exc_info=True
+                        )
+
+            batch = {
+                "start_block": int(block_number),
+                "reason": reason,
+                "seeds": seeds,
+                "cursor": 0,
+                "priority": [],
+                "priority_consumed": 0,
+                "seeds_skipped": 0,
+                "seeds_deduped": 0,
+                "processed": set(),
+                "slices": 0,
+                "slice_ms": [],
+                "seeds_processed": 0,
+                "new_pool_seeds": len(new_seeds),
+                "additional_pairs": list(universe.additional_pairs()),
+                "anchors_checked_reactively": anchors_checked_reactively,
+                "start_info": dict(self._last_scheduled_info),
+            }
+            self._scheduled_batch = batch
+            get_logger("opportunity_engine").info(
+                "[SCHEDULED-BATCH] start block=%s reason=%s seeds=%d new_pools=%d additional_pairs=%d "
+                "slice_size=%d anchors_via_reactive=%s",
+                block_number, reason, len(seeds), len(new_seeds),
+                len(batch["additional_pairs"]), self.bounded_config.scheduled_seeds_per_slice,
+                anchors_checked_reactively,
+            )
+        else:
+            # Active batch: never start an overlapping sweep (R1 §3.6).
+            # Mid-batch registrations join the priority queue; consumption
+            # from the lossless backlog stays bounded per invocation AND the
+            # staging queue itself stays bounded — the backlog lives in the
+            # ring until seeds are actually about to be processed.
+            cap = max(1, int(self.bounded_config.max_new_pool_seeds_per_pass))
+            if len(batch["priority"]) < cap:
+                taken = self._consume_new_pool_seeds(limit=cap - len(batch["priority"]))
+                if taken:
+                    batch["priority"].extend(taken)
+                    batch["priority_consumed"] += len(taken)
+
+        # ── one deterministic slice: priority seeds first, then the ranked
+        # universe seeds; both filtered against this block's reactive work ──
+        slice_budget = max(1, int(self.bounded_config.scheduled_seeds_per_slice))
+        slice_seeds: list[str] = []
+        t_slice = time.time()
+        priority: list[str] = batch["priority"]
+        while len(slice_seeds) < slice_budget and priority:
+            cand = priority.pop(0)
+            if cand in touched_lower or cand in slice_seeds:
+                batch["seeds_skipped"] += 1
                 continue
-            seen.add(s)
-            seeds.append(s)
+            if cand in batch["processed"]:
+                batch["seeds_deduped"] += 1  # already searched earlier in this batch
+                continue
+            slice_seeds.append(cand)
+        while len(slice_seeds) < slice_budget and batch["cursor"] < len(batch["seeds"]):
+            cand = batch["seeds"][batch["cursor"]]
+            batch["cursor"] += 1
+            if cand in touched_lower or cand in slice_seeds:
+                batch["seeds_skipped"] += 1
+                continue
+            if cand in batch["processed"]:
+                batch["seeds_deduped"] += 1
+                continue
+            slice_seeds.append(cand)
+        if slice_seeds:
+            batch["processed"].update(slice_seeds)
+        if slice_seeds:
+            for detector in self.detectors:
+                if getattr(detector, "name", "") == "cycles":
+                    try:
+                        found = detector.on_block(block_number, touched_pools=None,
+                                                  scheduled_seeds=set(slice_seeds))
+                        self._tag_scheduled(found, batch["reason"])
+                        out.extend(found or [])
+                    except Exception as exc:
+                        get_logger("opportunity_engine").error(
+                            f"Scheduled slice: cycle detector failed: {exc}", exc_info=True
+                        )
+        batch["slices"] += 1
+        batch["seeds_processed"] += len(slice_seeds)
+        batch["slice_ms"].append(round((time.time() - t_slice) * 1000.0, 3))
 
-        self._last_scheduled_block = int(block_number)
-        self._last_pass_reason = reason
-        self._last_scheduled_info = {
-            **universe.last_stats,
-            "block": int(block_number),
-            "reason": reason,
-            "new_pool_seeds": len(new_seeds),
-            "seed_pools_selected": len(seeds),
-        }
-
-        out: list[Opportunity] = []
-        for detector in self.detectors:
-            name = getattr(detector, "name", "")
-            try:
-                if name == "cycles":
-                    if not seeds:
-                        continue
-                    found = detector.on_block(block_number, touched_pools=None, scheduled_seeds=set(seeds))
-                elif name == "cross_proto":
-                    found = detector.on_block(block_number, extra_pairs=universe.additional_pairs())
-                else:
-                    # Every other detector keeps its own thesis and cadence
-                    # in the reactive loop above; the scheduled pass does not
-                    # invent new theses.
-                    continue
-                for opp in found or []:
-                    meta = dict(opp.metadata or {})
-                    meta["discovery_mode"] = "scheduled"
-                    meta["scheduled_pass"] = True
-                    meta["scheduled_pass_reason"] = reason
-                    opp.metadata = meta
-                out.extend(found or [])
-            except Exception as exc:
-                get_logger("opportunity_engine").error(
-                    f"Scheduled pass: detector '{name}' failed: {exc}", exc_info=True
-                )
-        self._last_scheduled_info["pass_ms"] = round((time.time() - started) * 1000.0, 3)
-        get_logger("opportunity_engine").info(
-            "[SCHEDULED-PASS] block=%s reason=%s additional_pairs=%s seeds=%d new_pools=%d pass_ms=%s",
-            block_number, reason, self._last_scheduled_info.get("additional_pairs", 0),
-            len(seeds), len(new_seeds), self._last_scheduled_info["pass_ms"],
-        )
+        if batch["cursor"] >= len(batch["seeds"]) and not batch["priority"]:
+            self._last_batch_summary = {
+                "complete": True,
+                "start_block": batch["start_block"],
+                "end_block": int(block_number),
+                "reason": batch["reason"],
+                "seeds_total": len(batch["seeds"]) + batch["priority_consumed"],
+                "seeds_processed": batch["seeds_processed"],
+                "seeds_skipped_reactive_overlap": batch["seeds_skipped"],
+                "seeds_deduped": batch["seeds_deduped"],
+                "slices": batch["slices"],
+                "slice_ms_median": round(statistics.median(batch["slice_ms"]), 3) if batch["slice_ms"] else 0.0,
+                "slice_ms_p95": self._p95(batch["slice_ms"]),
+                "slice_ms_max": max(batch["slice_ms"], default=0.0),
+                "batch_ms": round(sum(batch["slice_ms"]), 3),
+                "new_pool_seeds": batch["new_pool_seeds"],
+                "additional_pairs": len(batch["additional_pairs"]),
+                "anchors_checked_reactively": batch["anchors_checked_reactively"],
+            }
+            self._scheduled_batch = None
+            get_logger("opportunity_engine").info(
+                "[SCHEDULED-BATCH] complete start_block=%s end_block=%s seeds=%d slices=%d batch_ms=%s "
+                "slice_ms(p50/p95/max)=%s/%s/%s",
+                self._last_batch_summary["start_block"], self._last_batch_summary["end_block"],
+                self._last_batch_summary["seeds_processed"], self._last_batch_summary["slices"],
+                self._last_batch_summary["batch_ms"], self._last_batch_summary["slice_ms_median"],
+                self._last_batch_summary["slice_ms_p95"], self._last_batch_summary["slice_ms_max"],
+            )
+        else:
+            get_logger("opportunity_engine").debug(
+                "[SCHEDULED-SLICE] block=%s processed=%d main_pending=%d priority_pending=%d (batch incomplete)",
+                block_number, len(slice_seeds),
+                len(batch["seeds"]) - batch["cursor"], len(batch["priority"]),
+            )
         return out
 
     @staticmethod

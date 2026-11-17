@@ -44,11 +44,6 @@ if TYPE_CHECKING:  # pragma: no cover
 
 log = get_logger("bounded_discovery")
 
-# How many newly registered pools a single scheduled pass may consume as
-# discovery seeds. Registration bursts (e.g. a warm restart restoring
-# thousands of pools) therefore cannot blow up one pass.
-RECENTLY_REGISTERED_CAPACITY = 256
-
 
 @dataclass(frozen=True)
 class BoundedDiscoveryConfig:
@@ -66,18 +61,27 @@ class BoundedDiscoveryConfig:
     # Anchor pairs contribute their top venue (they are additionally covered
     # by the reactive touched-pool scan and the per-pass pair checks); the
     # ranked additional pairs may contribute up to max_venues_per_pair each.
-    # The overall cap bounds the pass: one find_cycles() per seed pool, the
-    # same primitive the reactive path pays per touched pool.
+    # The overall cap bounds the batch: one find_cycles() per seed pool, the
+    # same primitive the reactive path pays per touched pool. The batch is
+    # processed in slices of scheduled_seeds_per_slice seeds per engine
+    # invocation (DSS-WO-MI-102B-R1 §3), so no single invocation runs the
+    # whole batch synchronously.
     max_venues_per_pair: int = 3
     max_seed_pools: int = 36
-    # Newly registered pools consumed as seeds per scheduled pass.
+    # Newly registered pools consumed from the lossless backlog per scheduled
+    # invocation. Consumption is bounded; the backlog itself is NOT bounded —
+    # every eligible registration is retained until consumed (R1 §2).
     max_new_pool_seeds_per_pass: int = 24
-    # Minimum spacing (blocks) between CONSECUTIVE new-pool-triggered passes.
-    # A single new registration is still considered on the very next block;
-    # this only spreads registration bursts (e.g. a warm restart restoring
-    # thousands of pools) over the cadence scale instead of stalling
-    # consecutive blocks.
-    new_pool_pass_spacing: int = 5
+    # Deterministic cycle-search seeds processed per engine invocation while
+    # a scheduled batch is active (R1 §3). Default 1: the 20k-pool benchmark
+    # (scripts/mi102b_benchmark.py) measures per-find_cycles cost as
+    # median ~69 ms / p95 ~2.9 s / max ~3.2 s on the most hub-connected
+    # seeds — a single call can exceed the ~2 s per-invocation target on its
+    # own, so pairing seeds only widens the worst case (max slice 3.2 s at
+    # slice=2 vs 2.9 s at slice=1). See the benchmark evidence in the R1
+    # delivery report for the smallest necessary follow-up (a per-call node
+    # budget inside the shared find_cycles primitive).
+    scheduled_seeds_per_slice: int = 1
 
 
 def normalize_pair(t1: str, t2: str) -> tuple[str, str]:
@@ -106,19 +110,23 @@ def anchor_pairs(chain_id: int) -> list[tuple[str, str]]:
     return out
 
 
-def pool_is_searchable(graph: "TokenGraph", pool_address: str) -> bool:
+def pool_is_searchable(graph: "TokenGraph", pool_address: str,
+                       min_tvl_usd: float = MIN_POOL_LIQUIDITY_USD) -> bool:
     """True when a registered pool has valid, usable search state.
 
-    Deliberately conservative (DSS-WO-MI-102B §5): incomplete, zero-reserve,
-    pending ("waiting room") or unpriced pools are NOT discovery-eligible.
-    This is the same state the warm gate and reactive paths require.
+    Deliberately conservative (DSS-WO-MI-102B §5, R1 §4): incomplete,
+    zero-reserve, pending ("waiting room"), unpriced, dust and otherwise
+    sub-threshold pools are NOT discovery-eligible. The TVL gate reuses the
+    existing production threshold and comparator (>= the same
+    MIN_POOL_LIQUIDITY_USD gate the ranked pair selection applies), not a
+    new independent threshold.
     """
     edges = graph.get_edges_for_pool(pool_address)
     if not edges:
         return False
     if any(getattr(e, "is_pending", False) for e in edges):
         return False
-    if float(getattr(edges[0], "tvl_usd", 0.0) or 0.0) <= 0.0:
+    if float(getattr(edges[0], "tvl_usd", 0.0) or 0.0) < float(min_tvl_usd):
         return False
     for e in edges:
         if e.version == 2:
@@ -225,7 +233,11 @@ class RankedPairUniverse:
             edges = [
                 e for e in self._graph.all_edges_for_pair(pair[0], pair[1])
                 if not getattr(e, "is_pending", False)
-                and float(getattr(e, "tvl_usd", 0.0) or 0.0) > 0.0
+                # R1 §4: cycle-search origins obey the SAME minimum-liquidity
+                # eligibility the ranked pair selection applies. Sub-threshold
+                # venues stay visible to pair searches (which filter with
+                # their own existing semantics) but never become DFS origins.
+                and float(getattr(e, "tvl_usd", 0.0) or 0.0) >= self.cfg.min_pair_tvl_usd
             ]
             venues_retrieved += len(edges)
             # One seed per VENUE (pool): dedupe pool addresses before the
@@ -259,28 +271,52 @@ class RankedPairUniverse:
 
 
 class RecentlyRegistered:
-    """Bounded ring of pools newly registered into the graph.
+    """Lossless FIFO of pools newly registered into the graph (R1 §2).
 
-    Extended graph-growth trigger (DSS-WO-MI-102B §5): every registration
-    source (crawler, NewPoolDetector, warm restore, registry) already funnels
-    through TokenGraph.upsert_pool_edges; recording the address there makes
-    the pool eligible for the next scheduled pass without waiting for its
-    first swap event and without any new event framework.
+    Every registration source funnels through TokenGraph.upsert_pool_edges;
+    recording the address there makes the pool eligible for the scheduled
+    discovery batches without waiting for its first swap event and without
+    any new event framework.
+
+    The backlog is deliberately NOT a fixed-size ring: it grows with the
+    number of genuinely unprocessed registrations and never silently drops
+    an entry to overflow (the MI-102B deque(maxlen=256) did, which this
+    class replaces). Addresses are case-normalized and deduplicated, so
+    mixed-case re-registrations cannot create duplicates. Consumption is
+    bounded per invocation via pop_upto(); work per engine call stays
+    bounded even while the backlog is large.
     """
 
-    def __init__(self, capacity: int = RECENTLY_REGISTERED_CAPACITY):
-        self._items: deque[str] = deque(maxlen=capacity)
+    def __init__(self) -> None:
+        self._queue: deque = deque()
+        self._member: set[str] = set()
+        self.received = 0
 
     def record(self, pool_address: str) -> None:
         addr = (pool_address or "").lower()
-        if addr and addr not in self._items:
-            self._items.append(addr)
+        if not addr:
+            return
+        self.received += 1
+        if addr in self._member:
+            return
+        self._member.add(addr)
+        self._queue.append(addr)
+
+    def pop_upto(self, n: int) -> list[str]:
+        """Pop at most ``n`` oldest entries; the rest remain queued."""
+        out: list[str] = []
+        while self._queue and len(out) < max(0, n):
+            addr = self._queue.popleft()
+            self._member.discard(addr)
+            out.append(addr)
+        return out
 
     def drain(self) -> list[str]:
-        """Return and clear all pending addresses (oldest first)."""
-        out = list(self._items)
-        self._items.clear()
+        """Return and clear ALL pending addresses (oldest first)."""
+        out = list(self._queue)
+        self._queue.clear()
+        self._member.clear()
         return out
 
     def __len__(self) -> int:
-        return len(self._items)
+        return len(self._queue)

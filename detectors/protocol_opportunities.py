@@ -35,7 +35,8 @@ class CrossProtocolDetector(BaseDetector):
     arb_kind = ArbKind.CROSS_DEX_SPREAD
     MIN_SPREAD_PCT = 0.15
 
-    def on_block(self, block_number: int, extra_pairs: list[tuple[str, str]] | None = None) -> list[Opportunity]:
+    def on_block(self, block_number: int, extra_pairs: list[tuple[str, str]] | None = None,
+                 check_anchors: bool = True) -> list[Opportunity]:
         """Anchor-pair fragmentation search, optionally supplemented (MI-102B).
 
         ``extra_pairs`` are the engine-supplied, TVL-ranked additional pairs
@@ -47,6 +48,13 @@ class CrossProtocolDetector(BaseDetector):
         chain 1). All venues of a pair are retrieved via
         all_edges_for_pair(); multi-venue pairs are never reduced to one
         representative pool.
+
+        ``check_anchors`` (MI-102B-R1 §5): when the reactive invocation of
+        this detector already checked the anchor pairs in the same block
+        (touched pools present), the scheduled batch start passes
+        ``check_anchors=False`` so each anchor pair is checked exactly once
+        per block and the block-wide pair-check total stays within the
+        30-pair budget.
         """
         out: list[Opportunity] = []
         chain = get_chain(self.chain_id)
@@ -54,13 +62,14 @@ class CrossProtocolDetector(BaseDetector):
         budget = BoundedDiscoveryConfig().max_pair_checks
         seen: set[tuple[str, str]] = set()
         pair_list: list[tuple[str, str]] = []
-        for i, a in enumerate(anchors):
-            for b in anchors[i + 1:]:
-                key = normalize_pair(a, b)
-                if key[0] == key[1] or key in seen:
-                    continue
-                seen.add(key)
-                pair_list.append(key)
+        if check_anchors:
+            for i, a in enumerate(anchors):
+                for b in anchors[i + 1:]:
+                    key = normalize_pair(a, b)
+                    if key[0] == key[1] or key in seen:
+                        continue
+                    seen.add(key)
+                    pair_list.append(key)
         for pair in extra_pairs or []:
             if len(pair_list) >= budget:
                 break

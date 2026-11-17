@@ -233,20 +233,33 @@ class TestScheduledPass(unittest.TestCase):
         self.assertLessEqual(info["total_pair_checks"], 30)
         self.assertGreater(info["seed_pools_selected"], 0)
 
-    def test_ordinary_quiet_block_does_not_rescan(self):
-        engine, _ = self._run(100)
-        detector = engine.detectors[0]
-        calls = {"n": 0}
-        original = detector.on_block
-
-        def counting(*a, **k):
-            calls["n"] += 1
-            return original(*a, **k)
-
-        detector.on_block = counting
+    def test_ordinary_quiet_block_does_not_start_new_batch(self):
+        """R1 §3 semantics: a quiet block does not START a new scheduled
+        batch; an ACTIVE batch continues with its bounded slice, and once
+        the batch is complete a quiet block runs nothing."""
         with patch_quote_path():
-            engine.process(101, touched_pools=frozenset())
-        self.assertEqual(calls["n"], 0, "quiet block must not re-run the cycle search")
+            engine = make_engine(self.graph)
+            engine.process(100, touched_pools=frozenset())
+            self.assertIsNotNone(engine._scheduled_batch, "batch started, slice 1 processed")
+            block = 101
+            while engine._scheduled_batch is not None:  # drain the batch (slice-agnostic)
+                engine.process(block, touched_pools=frozenset())
+                block += 1
+            self.assertIsNone(engine._scheduled_batch, "batch completed")
+            info = engine.last_scheduled_batch_info
+            self.assertTrue(info["complete"])
+            self.assertEqual(info["seeds_processed"], info["seeds_total"])
+            detector = engine.detectors[0]
+            calls = {"n": 0}
+            original = detector.on_block
+
+            def counting(*a, **k):
+                calls["n"] += 1
+                return original(*a, **k)
+
+            detector.on_block = counting
+            engine.process(block + 1, touched_pools=frozenset())
+        self.assertEqual(calls["n"], 0, "quiet block after batch completion must not re-run the cycle search")
         self.assertEqual(engine.last_scheduled_pass_block, 100)
 
     def test_cadence_interval_respected(self):
@@ -254,10 +267,14 @@ class TestScheduledPass(unittest.TestCase):
             engine = make_engine(self.graph)
             engine.process(100, touched_pools=frozenset())
             self.assertEqual(engine.last_scheduled_pass_block, 100)
+            block = 101
+            while engine._scheduled_batch is not None:  # drain the batch (slice-agnostic)
+                engine.process(block, touched_pools=frozenset())
+                block += 1
             engine.process(149, touched_pools=frozenset())
-            self.assertEqual(engine.last_scheduled_pass_block, 100, "before interval: no pass")
+            self.assertEqual(engine.last_scheduled_pass_block, 100, "before interval: no new batch")
             engine.process(150, touched_pools=frozenset())
-            self.assertEqual(engine.last_scheduled_pass_block, 150, "interval due: pass")
+            self.assertEqual(engine.last_scheduled_pass_block, 150, "interval due: new batch")
 
     def test_scheduled_shares_validation_and_identity_with_reactive(self):
         validated = []
@@ -300,44 +317,77 @@ class TestNewPoolDiscovery(unittest.TestCase):
 
     def test_newly_registered_pool_discoverable_before_first_swap(self):
         """A new pool completes a NEW profitable route the ranked universe
-        does not know yet; it must be considered without any swap event."""
+        does not know yet; it must be considered without any swap event —
+        with priority over the remaining ranked-universe seeds (R1 §3.5)."""
+        P4 = "0x" + "04" * 20
+        P5 = "0x" + "05" * 20
+        X = "0x" + "88" * 20
+        seen_scheduled_seeds: list[tuple[int, set]] = []
         with patch_quote_path():
             engine = make_engine(self.graph)
+            detector = engine.detectors[0]
+            original = detector.on_block
+
+            def capturing(*a, **k):
+                if k.get("scheduled_seeds") is not None:
+                    seen_scheduled_seeds.append((a[0] if a else 0, set(k["scheduled_seeds"])))
+                return original(*a, **k)
+
+            detector.on_block = capturing
             first = engine.process(100, touched_pools=frozenset())
             self.assertEqual(engine.last_scheduled_pass_info["reason"], "cadence")
+            # batch is mid-flight (3 seeds, slice size 2 -> 1 main seed left)
 
-            # X/WETH pool making WETH -> X -> ... profitable with P2/P3:
-            # cycle [X, WETH, B, X]: X->WETH 1/0.3, WETH->B 1/0.26... build a
-            # simple 2-hop cross-dex spread instead: X->WETH (P4) vs WETH->X
-            # is same pool -- use two venues for pair X/WETH with a spread.
-            P4 = "0x" + "04" * 20
-            P5 = "0x" + "05" * 20
-            X = "0x" + "88" * 20
+            # two venues for pair X/WETH with a spread:
+            # 2-hop X -> WETH -> X: 1 * 0.0005 * 2100 = 1.05 profitable
             add_v2_pool(self.graph, P4, X, WETH, 1.0 / 2000.0)     # 1 X = 0.0005 WETH
             add_v2_pool(self.graph, P5, WETH, X, 2000.0 * 1.05)    # 1 WETH = 2100 X
-            # (2-hop X -> WETH -> X: 1 * 0.0005 * 2100 = 1.05 profitable)
 
             result = engine.process(101, touched_pools=frozenset())
-            self.assertEqual(engine.last_scheduled_pass_info["reason"], "new_pools")
-            pools_of = [{p.lower() for p in c.pools} for c in result.candidates]
-            self.assertTrue(any({P4, P5} <= pools for pools in pools_of),
-                            f"new pools must be discoverable pre-swap: {pools_of}")
+            # drain the rest of the batch so P5 (queued behind P4 at slice=1)
+            # is searched too
+            block = 102
+            while engine._scheduled_batch is not None:
+                engine.process(block, touched_pools=frozenset())
+                block += 1
+        # the new pools were searched with priority in the block-101 slice
+        block101_seeds = [s for blk, s in seen_scheduled_seeds if blk == 101]
+        self.assertTrue(block101_seeds and P4 in block101_seeds[0],
+                        f"new pool must be seeded with priority at 101: {seen_scheduled_seeds}")
+        self.assertTrue(any(P5 in s for _, s in seen_scheduled_seeds),
+                        "the second new pool is searched as the batch continues")
+        self.assertEqual(sum(1 for _, s in seen_scheduled_seeds for x in s if x in (P4, P5)), 2,
+                         "each new pool searched exactly once")
+        pools_of = [{p.lower() for p in c.pools} for c in result.candidates]
+        self.assertTrue(any({P4, P5} <= pools for pools in pools_of),
+                        f"new pools must be discoverable pre-swap: {pools_of}")
+        for c in result.candidates:
+            if {P4, P5} <= {p.lower() for p in c.pools}:
+                self.assertEqual(c.metadata["discovery_mode"], "scheduled")
 
     def test_incomplete_pool_state_triggers_no_false_opportunity(self):
         bad = "0x" + "09" * 20
+        seen_scheduled_seeds: list[set] = []
         with patch_quote_path():
             engine = make_engine(self.graph)
-            engine.process(100, touched_pools=frozenset())  # drains fixture registrations
+            detector = engine.detectors[0]
+            original = detector.on_block
+
+            def capturing(*a, **k):
+                if k.get("scheduled_seeds") is not None:
+                    seen_scheduled_seeds.append(set(k["scheduled_seeds"]))
+                return original(*a, **k)
+
+            detector.on_block = capturing
             # zero-reserve registration (invalid search state)
             self.graph.add_or_update_pool(
                 _edge(bad, "UniswapV2", WETH, A, 0, 0, tvl=0.0),
                 _edge(bad, "UniswapV2", A, WETH, 0, 0, tvl=0.0),
             )
             self.assertFalse(pool_is_searchable(self.graph, bad))
-            result = engine.process(101, touched_pools=frozenset())
-        info = engine.last_scheduled_pass_info
-        self.assertEqual(info["reason"], "new_pools", "registration must trigger a pass")
-        self.assertEqual(info["new_pool_seeds"], 0, "unsearchable state must not seed discovery")
+            result = engine.process(100, touched_pools=frozenset())
+        self.assertFalse(any(bad in s for s in seen_scheduled_seeds),
+                         "unsearchable state must never become a scheduled seed")
         for c in result.candidates:
             self.assertNotIn(bad, {p.lower() for p in c.pools})
             self.assertNotIn(bad, {p.lower() for p in c.tokens})
@@ -350,48 +400,83 @@ class TestNewPoolDiscovery(unittest.TestCase):
         self.assertFalse(pool_is_searchable(self.graph, p))
 
     def test_registration_burst_is_spaced_not_stalling(self):
-        """30 registrations > one pass's 24-pool budget: consecutive
-        new-pool passes are spaced (5 blocks), spreading the burst over the
-        cadence scale instead of stalling consecutive blocks."""
+        """30 registrations, adapted to the R1 incremental design: the burst
+        spreads over successive bounded slices (≤2 cycle-search seeds per
+        invocation), every pool is searched exactly once, none is lost, and
+        no invocation runs the whole burst synchronously."""
+        registered = [f"0x{0xb000 + i:064x}" for i in range(30)]
+        seen_scheduled_seeds: list[set] = []
         with patch_quote_path():
             engine = make_engine(self.graph)
-            engine.process(100, touched_pools=frozenset())  # cadence pass
-            for i in range(30):
-                addr = f"0x{0xb000 + i:064x}"
+            engine.process(100, touched_pools=frozenset())  # cadence batch starts
+            block = 101
+            while engine._scheduled_batch is not None:  # drain the batch (slice-agnostic)
+                engine.process(block, touched_pools=frozenset())
+                block += 1
+            self.assertIsNone(engine._scheduled_batch)
+            detector = engine.detectors[0]
+            original = detector.on_block
+
+            def capturing(*a, **k):
+                if k.get("scheduled_seeds") is not None:
+                    seen_scheduled_seeds.append(set(k["scheduled_seeds"]))
+                return original(*a, **k)
+
+            detector.on_block = capturing
+            for i, addr in enumerate(registered):
                 add_v2_pool(self.graph, addr, WETH, f"0x{0xc000 + i:064x}", 2.0)
-            blocks_with_pass = []
-            for b in range(101, 110):
+            for b in range(block, block + 45):
                 engine.process(b, touched_pools=frozenset())
-                blocks_with_pass.append((b, engine.last_scheduled_pass_block))
-            self.assertEqual(blocks_with_pass[0][1], 101, "first burst pass: immediate")
-            for b, last in blocks_with_pass[1:5]:
-                self.assertEqual(last, 101, f"block {b}: consecutive burst pass spaced out")
-            self.assertEqual(blocks_with_pass[5][1], 106, "spacing elapsed: burst pass resumes")
-            self.assertEqual(blocks_with_pass[8][1], 106, "burst drained: no further passes")
+        # every burst pool searched exactly once, bounded per slice
+        all_seeds = [s for slice_seeds in seen_scheduled_seeds for s in slice_seeds]
+        self.assertEqual(len(all_seeds), len(set(all_seeds)), "no seed searched twice")
+        self.assertTrue(set(registered) <= set(all_seeds), "every burst pool eventually searched")
+        self.assertTrue(all(len(s) <= 2 for s in seen_scheduled_seeds),
+                        f"per-invocation slice bound respected: {[len(s) for s in seen_scheduled_seeds]}")
+        info = engine.last_scheduled_batch_info
+        self.assertTrue(info["complete"], "the batch drains to completion")
+        self.assertEqual(info["seeds_processed"], info["seeds_total"])
+        # 30 burst pools via priority (24 at batch start + 6 on the next
+        # invocation from the lossless backlog) plus the ranked-universe
+        # seeds, all processed at <= 2 cycle-search seeds per invocation.
 
     def test_unchanged_pool_not_retriggered_block_after_block(self):
+        P4 = "0x" + "04" * 20
+        seen_scheduled_seeds: list[set] = []
         with patch_quote_path():
             engine = make_engine(self.graph)
-            engine.process(100, touched_pools=frozenset())
-            P4 = "0x" + "04" * 20
-            add_v2_pool(self.graph, P4, WETH, A, 2.0)  # registration event
-            engine.process(101, touched_pools=frozenset())
-            self.assertEqual(engine.last_scheduled_pass_block, 101)
             detector = engine.detectors[0]
-            calls = {"n": 0}
             original = detector.on_block
+
+            def capturing(*a, **k):
+                if k.get("scheduled_seeds") is not None:
+                    seen_scheduled_seeds.append(set(k["scheduled_seeds"]))
+                return original(*a, **k)
+
+            detector.on_block = capturing
+            engine.process(100, touched_pools=frozenset())
+            add_v2_pool(self.graph, P4, WETH, A, 2.0)  # registration event mid-batch
+            block = 101
+            while engine._scheduled_batch is not None:  # drain the batch (slice-agnostic)
+                engine.process(block, touched_pools=frozenset())
+                block += 1
+            self.assertIsNone(engine._scheduled_batch)
+            self.assertEqual(engine.last_scheduled_pass_block, 100, "one batch, started at 100")
+            p4_searches = sum(1 for s in seen_scheduled_seeds if P4 in s)
+            self.assertEqual(p4_searches, 1, "the new pool is searched exactly once")
+            calls = {"n": 0}
 
             def counting(*a, **k):
                 calls["n"] += 1
                 return original(*a, **k)
 
             detector.on_block = counting
-            engine.process(102, touched_pools=frozenset())
-            engine.process(103, touched_pools=frozenset())
+            engine.process(block + 1, touched_pools=frozenset())
+            engine.process(block + 2, touched_pools=frozenset())
             self.assertEqual(calls["n"], 0, "no pending growth: quiet blocks cost nothing")
             # re-registering (updating) the same pool does not re-trigger either
             add_v2_pool(self.graph, P4, WETH, A, 2.0)
-            engine.process(104, touched_pools=frozenset())
+            engine.process(block + 3, touched_pools=frozenset())
             self.assertEqual(calls["n"], 0, "unchanged pool must not re-trigger discovery")
 
 

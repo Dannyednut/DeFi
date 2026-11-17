@@ -409,17 +409,18 @@ class TestReactiveFailureHandoff(unittest.TestCase):
                          + done["seeds_deduped"], done["seeds_total"])
 
     def test_reactive_cross_failure_completes_anchor_stage(self):
-        """R1A1 §3.2: a REACTIVE CrossProtocol failure on a block that also
-        starts a scheduled batch must not silently skip the anchor-pair
-        checks. The scheduled invocation must run with check_anchors=True,
-        and the batch cannot report successful pair-check completion until
-        the required anchor checks actually succeeded."""
+        """R1A1 §3.2 / R1A2 §2: a REACTIVE CrossProtocol failure on a block
+        that also starts a scheduled batch must not silently skip the
+        anchor-pair checks — AND the scheduled fallback must not repeat the
+        anchor stage inside the same process() invocation (R1A2 block
+        budget). The stage stays explicitly pending; a subsequent invocation
+        completes the missing anchor + supplementary stages, and pair-check
+        success is reported only after those stages actually succeeded."""
         from bounded_discovery import anchor_pairs
         with patch_quote_path():
             engine = self._both_detector_engine()
             rec = CrossRecorder(engine)
-            rec.fail_reactive = True        # reactive anchor stage fails
-            rec.fail_next = 1               # first scheduled invocation fails too
+            rec.fail_reactive = True        # reactive anchor stage fails (before any lookup)
             counter = _PairCountingGraph(self.graph)
             engine.detectors[1].graph = counter
             engine.process(100, touched_pools=frozenset({P1}))
@@ -427,16 +428,26 @@ class TestReactiveFailureHandoff(unittest.TestCase):
             self.assertFalse(live["pair_checks_ok"],
                              "anchors were not checked successfully — pair checks not ok")
             self.assertFalse(live["complete"])
-            # the scheduled batch-start invocation did NOT skip the anchors
-            self.assertEqual(rec.scheduled_calls[0], (100, True),
-                             "check_anchors=False is only allowed when the reactive "
-                             "anchor checks actually succeeded")
-            # next invocation: retry completes the missing anchor stage
+            self.assertFalse(live["anchor_stage_covered"])
+            # R1A2 §2: NO scheduled cross invocation in the same process()
+            # call — the anchor stage is not repeated immediately
+            self.assertEqual(rec.scheduled_calls, [],
+                             "the scheduled fallback must not repeat the anchor stage "
+                             "in the same invocation after a reactive failure")
+            self.assertEqual(counter.calls, [],
+                             "reactive failure happened before any pair lookup")
+            # next invocation (reactive not invoked): retry completes the
+            # missing anchor + supplementary stages in one bounded call
+            calls_before = len(counter.calls)
             engine.process(101, touched_pools=frozenset())
-            self.assertEqual(rec.scheduled_calls[1], (101, True),
-                             "retry must complete the missing anchor-pair stage")
+            self.assertEqual(rec.scheduled_calls, [(101, True)],
+                             "retry completes the missing anchor stage "
+                             "(check_anchors=True) once, on the next invocation")
+            block_calls = len(counter.calls) - calls_before
+            self.assertLessEqual(block_calls, 30, "retry stays within the block budget")
             live2 = engine.last_scheduled_batch_info
             self.assertTrue(live2["pair_checks_ok"], "retry covered anchors + supplementary")
+            self.assertTrue(live2["anchor_stage_covered"])
             block = 102
             while engine._scheduled_batch is not None:
                 engine.process(block, touched_pools=frozenset())
@@ -449,8 +460,74 @@ class TestReactiveFailureHandoff(unittest.TestCase):
                                       "the batch may report pair checks complete")
         self.assertTrue(done["complete"])
         self.assertTrue(done["pair_checks_ok"])
-        self.assertTrue(done["anchors_covered_reactively"],
+        self.assertTrue(done["anchor_stage_covered"],
                         "anchor stage recorded as covered before completion")
+
+    def test_partial_reactive_failure_within_block_budget(self):
+        """R1A2 §3: the reactive detector checks TWO anchor pairs, then
+        raises an injected exception before finishing the anchor list, and
+        the scheduled discovery stage runs in the SAME process() invocation.
+        The combined actual pair-call count of that invocation stays within
+        the 30-pair budget, the scheduled fallback does not repeat the full
+        anchor list immediately, pair_checks_ok stays false while the stage
+        is pending, and a subsequent invocation completes the missing anchor
+        and supplementary stages before success is reported."""
+        from bounded_discovery import anchor_pairs
+        with patch_quote_path():
+            engine = self._both_detector_engine()
+            rec = CrossRecorder(engine)
+            counter = _FailingPairGraph(self.graph)
+            counter.fail_after = 2  # two successful anchor lookups, then raise
+            engine.detectors[1].graph = counter
+
+            calls_before = len(counter.calls)
+            engine.process(100, touched_pools=frozenset({P1}))  # batch start
+            reactive_calls = len(counter.calls) - calls_before
+            live = engine.last_scheduled_batch_info
+            # the reactive invocation reached and checked exactly two anchor
+            # pairs before the injected exception
+            self.assertEqual(reactive_calls, 2,
+                             "reactive detector checked two anchor pairs, then failed")
+            checked = set(counter.calls)
+            self.assertTrue(checked <= set(anchor_pairs(1)),
+                            "the partial progress was inside the anchor list")
+            # combined block budget: reactive partial + deferred scheduled = 2 <= 30
+            self.assertLessEqual(reactive_calls, 30,
+                                 "combined actual pair calls in the invocation within budget")
+            # the scheduled fallback did NOT repeat the full anchor list
+            self.assertEqual(rec.scheduled_calls, [],
+                             "no scheduled anchor repetition after the partial reactive failure")
+            # the stage stays explicitly pending and visible
+            self.assertFalse(live["pair_checks_ok"], "pair checks pending after partial failure")
+            self.assertFalse(live["complete"])
+            self.assertFalse(live["anchor_stage_covered"])
+
+            # subsequent invocation (reactive not invoked): completes the
+            # missing anchor + supplementary stages. The injected partial
+            # failure applied only to the reactive invocation of block 100.
+            counter.fail_after = None
+            calls_before = len(counter.calls)
+            engine.process(101, touched_pools=frozenset())
+            retry_calls = len(counter.calls) - calls_before
+            self.assertLessEqual(retry_calls, 30, "retry invocation within budget")
+            self.assertEqual(rec.scheduled_calls, [(101, True)],
+                             "one scheduled retry completes anchors + supplementary")
+            live2 = engine.last_scheduled_batch_info
+            self.assertTrue(live2["pair_checks_ok"],
+                            "pair-check success only after the stages actually succeeded")
+            self.assertTrue(live2["anchor_stage_covered"])
+            block = 102
+            while engine._scheduled_batch is not None:
+                engine.process(block, touched_pools=frozenset())
+                block += 1
+            done = engine.last_scheduled_batch_info
+        # every anchor pair was checked across the two invocations
+        checked = set(counter.calls)
+        for a in anchor_pairs(1):
+            self.assertIn(a, checked, f"anchor pair {a} must be checked before completion")
+        self.assertTrue(done["complete"])
+        self.assertTrue(done["pair_checks_ok"])
+        self.assertTrue(done["anchor_stage_covered"])
 
     def test_reactive_success_retains_suppression_and_budget(self):
         """R1A1 §3.3: when the reactive cycle invocation SUCCEEDS, the
@@ -550,6 +627,22 @@ class _PairCountingGraph:
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+class _FailingPairGraph(_PairCountingGraph):
+    """_PairCountingGraph with injectable PARTIAL failure: when
+    ``fail_after`` is set to N, the first N all_edges_for_pair calls
+    succeed and every later call raises — simulating a reactive detector
+    that made real pair-check progress and then failed mid-anchor-list."""
+
+    def __init__(self, inner):
+        super().__init__(inner)
+        self.fail_after = None
+
+    def all_edges_for_pair(self, a, b):
+        if self.fail_after is not None and len(self.calls) >= self.fail_after:
+            raise RuntimeError("injected partial pair-check failure")
+        return super().all_edges_for_pair(a, b)
 
 
 class TestPairCheckCallBudget(unittest.TestCase):

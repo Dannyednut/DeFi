@@ -196,7 +196,7 @@ class OpportunityEngine:
                 "failed_seed_list_truncated": len(batch["failed_seeds"]) > 32,
                 "pair_checks_ok": batch["pair_checks_ok"],
                 "pair_checks_attempted": batch["pair_checks_attempted"],
-                "anchors_covered": batch["anchors_covered"],
+                "anchor_stage_covered": batch["anchor_stage_covered"],
                 "main_pending": len(batch["seeds"]) - batch["cursor"],
                 "priority_pending": len(batch["priority"]),
                 "slices": batch["slices"],
@@ -373,34 +373,50 @@ class OpportunityEngine:
 
             # Pair checks run ONCE per batch. The anchor stage counts as
             # covered ONLY when the reactive cross-protocol invocation
-            # actually succeeded in this block (R1A1 §3) — a failed reactive
-            # run means the scheduled invocation must check the anchor pairs
-            # itself (check_anchors=True). A failed scheduled invocation
-            # leaves pair_checks_ok=False and is retried once per invocation
-            # while the batch runs, completing the missing anchor stage
-            # first; the batch is never reported with completed pair checks
-            # until the required checks succeeded.
-            anchors_covered = bool(touched_lower) and reactive_cross_ok is True
+            # actually succeeded in this block (R1A1 §3). R1A2 §2: when the
+            # reactive invocation FAILED this block (possibly after partial
+            # anchor checks), the scheduled fallback does NOT repeat the
+            # anchor stage inside the same process() invocation — the whole
+            # scheduled pair-check stage stays explicitly pending
+            # (pair_checks_ok=False) and is retried on the NEXT invocation,
+            # so the block's actual pair lookups stay within the 30-pair
+            # budget. A failed scheduled invocation also leaves
+            # pair_checks_ok=False (retried once per invocation, completing
+            # the missing anchor stage first); the batch is never reported
+            # with completed pair checks until the required checks succeeded.
+            anchor_stage_covered = False
             pair_checks_ok = True
             pair_checks_attempted = 0
-            t_pair = time.time()
-            for detector in self.detectors:
-                if getattr(detector, "name", "") == "cross_proto":
-                    pair_checks_attempted += 1
-                    try:
-                        if anchors_covered:
-                            found = detector.on_block(block_number, extra_pairs=universe.additional_pairs(),
-                                                      check_anchors=False)
-                        else:
-                            found = detector.on_block(block_number, extra_pairs=universe.additional_pairs())
-                        self._tag_scheduled(found, reason)
-                        out.extend(found or [])
-                    except Exception as exc:
-                        pair_checks_ok = False
-                        get_logger("opportunity_engine").error(
-                            f"Scheduled batch start: cross-protocol detector failed: {exc}", exc_info=True
-                        )
-            pair_check_ms = round((time.time() - t_pair) * 1000.0, 3)
+            pair_check_ms = 0.0
+            if reactive_cross_ok is False:
+                pair_checks_ok = False
+                get_logger("opportunity_engine").info(
+                    "[SCHEDULED-BATCH] pair-check stage deferred: reactive cross-protocol "
+                    "invocation failed this block; stage stays pending (pair_checks_ok=False)")
+            else:
+                anchor_stage_covered = bool(touched_lower) and reactive_cross_ok is True
+                t_pair = time.time()
+                for detector in self.detectors:
+                    if getattr(detector, "name", "") == "cross_proto":
+                        pair_checks_attempted += 1
+                        try:
+                            if anchor_stage_covered:
+                                found = detector.on_block(block_number, extra_pairs=universe.additional_pairs(),
+                                                          check_anchors=False)
+                            else:
+                                found = detector.on_block(block_number, extra_pairs=universe.additional_pairs())
+                            self._tag_scheduled(found, reason)
+                            out.extend(found or [])
+                            if not anchor_stage_covered:
+                                # the successful call just completed the anchor
+                                # stage itself (check_anchors defaulted True)
+                                anchor_stage_covered = True
+                        except Exception as exc:
+                            pair_checks_ok = False
+                            get_logger("opportunity_engine").error(
+                                f"Scheduled batch start: cross-protocol detector failed: {exc}", exc_info=True
+                            )
+                pair_check_ms = round((time.time() - t_pair) * 1000.0, 3)
 
             batch = {
                 "start_block": int(block_number),
@@ -425,7 +441,7 @@ class OpportunityEngine:
                 "seeds_processed": 0,
                 "new_pool_seeds": len(new_seeds),
                 "additional_pairs": list(universe.additional_pairs()),
-                "anchors_covered": anchors_covered,
+                "anchor_stage_covered": anchor_stage_covered,
                 "start_info": dict(self._last_scheduled_info),
                 "startup_ms": startup_ms,
                 "pair_check_ms": pair_check_ms,
@@ -433,10 +449,10 @@ class OpportunityEngine:
             self._scheduled_batch = batch
             get_logger("opportunity_engine").info(
                 "[SCHEDULED-BATCH] start block=%s reason=%s seeds=%d new_pools=%d additional_pairs=%d "
-                "slice_size=%d anchors_covered=%s pair_checks_ok=%s startup_ms=%s",
+                "slice_size=%d anchor_stage_covered=%s pair_checks_ok=%s startup_ms=%s",
                 block_number, reason, len(seeds), len(new_seeds),
                 len(batch["additional_pairs"]), self.bounded_config.scheduled_seeds_per_slice,
-                anchors_covered, batch["pair_checks_ok"], batch["startup_ms"],
+                anchor_stage_covered, batch["pair_checks_ok"], batch["startup_ms"],
             )
         else:
             # Active batch: never start an overlapping sweep (R1 §3.6).
@@ -450,37 +466,49 @@ class OpportunityEngine:
                 if taken:
                     batch["priority"].extend(taken)
                     batch["priority_consumed"] += len(taken)
-            # R1A §2/R1A1 §3: a failed pair-check stage is retried once per
-            # invocation while the batch is active — bounded, visible
-            # (pair_checks_ok in the summary), never silently skipped. The
-            # retry must also complete the missing ANCHOR stage when the
-            # reactive anchor checks have not succeeded: pair checks may not
-            # be reported successful on supplementary pairs alone.
+            # R1A §2 / R1A1 §3 / R1A2 §2: a failed pair-check stage is
+            # retried once per invocation while the batch is active —
+            # bounded, visible (pair_checks_ok in the status), never
+            # silently skipped. The retry completes the missing ANCHOR
+            # stage when the reactive anchor checks have not succeeded:
+            # pair checks may not be reported successful on supplementary
+            # pairs alone. R1A2 §2: when the REACTIVE cross-protocol
+            # invocation failed THIS invocation (possibly after partial
+            # anchor checks), the scheduled fallback does NOT issue another
+            # anchor-stage call in the same process() invocation — the
+            # stage stays explicitly pending and visible, so the block's
+            # actual pair lookups stay within the 30-pair budget.
             if not batch["pair_checks_ok"]:
                 if touched_lower and reactive_cross_ok is True:
-                    batch["anchors_covered"] = True
-                check_anchors = not batch["anchors_covered"]
-                for detector in self.detectors:
-                    if getattr(detector, "name", "") == "cross_proto":
-                        t_pair = time.time()
-                        try:
-                            if check_anchors:
-                                found = detector.on_block(
-                                    block_number, extra_pairs=batch["additional_pairs"])
-                            else:
-                                found = detector.on_block(
-                                    block_number, extra_pairs=batch["additional_pairs"], check_anchors=False)
-                            self._tag_scheduled(found, batch["reason"])
-                            out.extend(found or [])
-                            batch["pair_checks_ok"] = True
-                            if check_anchors:
-                                batch["anchors_covered"] = True
-                        except Exception as exc:
-                            get_logger("opportunity_engine").error(
-                                f"Scheduled pair-check retry failed: {exc}", exc_info=True
-                            )
-                        batch["pair_check_ms"] += round((time.time() - t_pair) * 1000.0, 3)
-                        break
+                    batch["anchor_stage_covered"] = True
+                if reactive_cross_ok is False:
+                    get_logger("opportunity_engine").info(
+                        "[SCHEDULED-BATCH] pair-check stage deferred: reactive cross-protocol "
+                        "invocation failed this block; stage stays pending (pair_checks_ok=False)")
+                else:
+                    check_anchors = not batch["anchor_stage_covered"]
+                    for detector in self.detectors:
+                        if getattr(detector, "name", "") == "cross_proto":
+                            batch["pair_checks_attempted"] += 1
+                            t_pair = time.time()
+                            try:
+                                if check_anchors:
+                                    found = detector.on_block(
+                                        block_number, extra_pairs=batch["additional_pairs"])
+                                else:
+                                    found = detector.on_block(
+                                        block_number, extra_pairs=batch["additional_pairs"], check_anchors=False)
+                                self._tag_scheduled(found, batch["reason"])
+                                out.extend(found or [])
+                                batch["pair_checks_ok"] = True
+                                if check_anchors:
+                                    batch["anchor_stage_covered"] = True
+                            except Exception as exc:
+                                get_logger("opportunity_engine").error(
+                                    f"Scheduled pair-check retry failed: {exc}", exc_info=True
+                                )
+                            batch["pair_check_ms"] += round((time.time() - t_pair) * 1000.0, 3)
+                            break
 
         # ── one deterministic slice: per-SLOT alternation between priority
         # (registrations) and main (ranked-universe) seeds (R1A §1 fairness —
@@ -592,7 +620,11 @@ class OpportunityEngine:
                 "failed_seed_list_truncated": False,
                 "pair_checks_ok": batch["pair_checks_ok"],
                 "pair_checks_attempted": batch["pair_checks_attempted"],
-                "anchors_covered": batch["anchors_covered"],
+                # R1A2 §4: semantically accurate name — the anchor stage is
+                # "covered" whether the REACTIVE invocation or the scheduled
+                # fallback completed it; the old *covered_reactively* name
+                # could read as true via the scheduled fallback alone.
+                "anchor_stage_covered": batch["anchor_stage_covered"],
                 "start_block": batch["start_block"],
                 "end_block": int(block_number),
                 "reason": batch["reason"],
@@ -613,7 +645,7 @@ class OpportunityEngine:
                                                + batch.get("pair_check_ms", 0.0), 3),
                 "new_pool_seeds": batch["new_pool_seeds"],
                 "additional_pairs": len(batch["additional_pairs"]),
-                "anchors_covered_reactively": batch["anchors_covered"],
+                "anchor_stage_covered": batch["anchor_stage_covered"],
             }
             if not ok:
                 self._last_batch_summary["complete"] = False

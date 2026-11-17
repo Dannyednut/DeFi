@@ -44,9 +44,10 @@ sys.path.insert(0, REPO_ROOT)
 
 import detectors.base as detectors_base
 import detectors.cycles as cycles_mod
-from bounded_discovery import BoundedDiscoveryConfig, pool_is_searchable
+from bounded_discovery import BoundedDiscoveryConfig, anchor_pairs, pool_is_searchable
 from collections import Counter
 from detectors.cycles import CycleDetector
+from detectors.protocol_opportunities import CrossProtocolDetector
 from graph import PoolEdge, TokenGraph
 from opportunity_engine import OpportunityEngine
 from tvl import init_prices
@@ -147,6 +148,30 @@ class FindCyclesTimer:
         return False
 
 
+class PairCallTimer:
+    """R1A2 §1: counts and times ACTUAL all_edges_for_pair() calls made by
+    the cross-protocol detector. Installed as the DETECTOR's graph handle
+    (engine.detectors[i].graph), so the engine graph — and therefore the
+    RankedPairUniverse refresh, which uses the engine graph directly — is
+    untouched and cannot pollute the measurement."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = []     # one entry per actual pair lookup
+        self.call_ms = []   # per-call wall time (ms)
+
+    def all_edges_for_pair(self, a, b):
+        t0 = time.perf_counter()
+        try:
+            return self._inner.all_edges_for_pair(a, b)
+        finally:
+            self.calls.append((str(a).lower(), str(b).lower()))
+            self.call_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def pct(values, q):
     if not values:
         return 0.0
@@ -160,10 +185,16 @@ def scenario_steady_state(n_pools, slice_size, lines):
     g = build_synthetic_graph(n_pools)
     build_s = time.perf_counter() - t0
     cfg = BoundedDiscoveryConfig(scheduled_seeds_per_slice=slice_size)
+    # R1A2 §1: production-equivalent detector set — the real scheduled
+    # CrossProtocolDetector runs alongside CycleDetector, so pair_check_ms
+    # measures the ACTUAL pair-check workload.
     engine = OpportunityEngine(
         w3=StubW3(), chain_id=1,
-        detectors=[CycleDetector(StubW3(), g, None, None, 1)],
+        detectors=[CycleDetector(StubW3(), g, None, None, 1),
+                   CrossProtocolDetector(StubW3(), g, None, None, 1)],
         graph=g, scheduled_pass_interval=50, bounded_config=cfg)
+    pairtimer = PairCallTimer(g)
+    engine.detectors[1].graph = pairtimer
     # Steady state: the pre-populated graph fills the registration ring
     # (cold-start burst); scenario B covers that separately with accounting.
     engine.graph.recently_registered.drain()
@@ -176,9 +207,11 @@ def scenario_steady_state(n_pools, slice_size, lines):
             mock.patch.object(detectors_base, "ARB_EXEC_ADDRESS", ""), \
             mock.patch.object(cycles_mod, "ARB_EXEC_ADDRESS", ""):
         block = 100
+        pair_calls_before_start = len(pairtimer.calls)
         t0 = time.perf_counter()
         engine.process(block, touched_pools=frozenset())
         first_ms = (time.perf_counter() - t0) * 1000
+        start_pair_calls = len(pairtimer.calls) - pair_calls_before_start
         start_info = engine.last_scheduled_pass_info
         start_batch = engine.last_scheduled_batch_info
         slice_ms = [first_ms]
@@ -191,23 +224,45 @@ def scenario_steady_state(n_pools, slice_size, lines):
         done = engine.last_scheduled_batch_info
     total_batch_s = sum(slice_ms) / 1000
 
+    # R1A2 §1: verify the event-free scheduled batch actually checked its
+    # anchors AND supplementary pairs within the 30-pair budget.
+    max_pair_checks = BoundedDiscoveryConfig().max_pair_checks
+    pair_calls = len(pairtimer.calls)
+    pair_call_ms = sum(pairtimer.call_ms)
+    checked_pairs = set(pairtimer.calls)
+    missing_anchors = [p for p in anchor_pairs(1) if p not in checked_pairs]
+    assert pair_calls <= max_pair_checks, \
+        f"event-free scheduled batch exceeded the pair budget: {pair_calls} > {max_pair_checks}"
+    assert not missing_anchors, f"anchor pairs not actually checked: {missing_anchors}"
+    assert start_pair_calls == pair_calls, \
+        "event-free run: every pair call must come from the scheduled batch-start invocation"
+
     lines.append(f"  universe: pools_scanned={start_info.get('pools_scanned')} "
                  f"unique_pairs_considered={start_info.get('unique_pairs')} "
                  f"anchor_pairs={start_info.get('anchor_pairs')} "
                  f"additional_pairs={start_info.get('additional_pairs')} "
-                 f"total_pair_checks={start_info.get('total_pair_checks')} "
+                 f"total_pair_checks={start_info.get('total_pair_checks')} (selected pair KEYS) "
                  f"venues_retrieved={start_info.get('venues_retrieved')} "
                  f"seed_pools_selected={start_info.get('seed_pools_selected')} "
                  f"selection_build_ms={start_info.get('selection_build_ms', 'n/a')}")
     lines.append(f"  startup (R1A1 §4 definitions): startup_ms={done.get('startup_ms', 'n/a')} "
                  f"(UNIVERSE REFRESH only) | pair_check_ms={done.get('pair_check_ms', 'n/a')} "
-                 f"(pair checks, batch start + retries) | total_ms_incl_startup="
-                 f"{done.get('total_ms_incl_startup', 'n/a')} "
+                 f"(scheduled CrossProtocolDetector wall, batch start + retries) | "
+                 f"total_ms_incl_startup={done.get('total_ms_incl_startup', 'n/a')} "
                  f"= startup + pair-check + slice costs, each counted exactly once "
-                 f"(first whole-invocation wall={first_ms:.1f} ms; anchors via reactive=no)")
+                 f"(first whole-invocation wall={first_ms:.1f} ms; event-free block: the reactive "
+                 f"cross-protocol detector is not invoked, the scheduled stage checks "
+                 f"anchors + supplementary pairs)")
+    lines.append(f"  ACTUAL scheduled pair checks (R1A2 §1, proxy-measured): "
+                 f"{pair_calls} all_edges_for_pair() calls in the batch-start invocation "
+                 f"(graph-lookup wall {pair_call_ms:.2f} ms total, "
+                 f"median {statistics.median(pairtimer.call_ms):.2f} / max {max(pairtimer.call_ms):.2f} ms "
+                 f"per call) | within the {max_pair_checks}-pair budget: YES | "
+                 f"anchor pairs actually checked: {len(anchor_pairs(1))}/{len(anchor_pairs(1))}")
     lines.append(f"  batch: seeds_total={done['seeds_total']} slices={done['slices']} "
                  f"processed={done['seeds_processed']} skipped={done['seeds_skipped_reactive_overlap']} "
-                 f"deduped={done['seeds_deduped']} complete={done['complete']} failed={done.get('failed', False)}")
+                 f"deduped={done['seeds_deduped']} complete={done['complete']} failed={done.get('failed', False)} "
+                 f"pair_checks_ok={done['pair_checks_ok']} anchor_stage_covered={done['anchor_stage_covered']}")
     lines.append(f"  WHOLE-invocation wall ms (engine.process(): reactive path + scheduled work, "
                  f"includes universe refresh + pair checks on the first invocation): "
                  f"median={statistics.median(slice_ms):.1f} "
@@ -224,7 +279,8 @@ def scenario_steady_state(n_pools, slice_size, lines):
                  f"(MI-102B single-pass baseline on this graph shape: 21.74s)")
     lines.append(f"  acceptance: whole-invocation max {max(slice_ms) / 1000:.2f}s "
                  f"(target <= ~2s; slice_size={slice_size})")
-    return {"graph": g.pool_count, "slice": slice_size, "done": done, "slice_ms": slice_ms, "fc": fc}
+    return {"graph": g.pool_count, "slice": slice_size, "done": done, "slice_ms": slice_ms, "fc": fc,
+            "pair_calls": pair_calls, "pair_call_ms": pair_call_ms}
 
 
 def scenario_cold_start(lines):
@@ -363,10 +419,17 @@ def snapshot_graph_state(g):
 def scenario_simultaneous(lines):
     print("\n=== simultaneous reactive + scheduled block (20k graph) ===", flush=True)
     g = build_synthetic_graph(20_000)
+    # R1A2 §1: production-equivalent detector set in BOTH engines — the
+    # incremental engine and the scheduled_discovery=False reference engine
+    # run the same CycleDetector + CrossProtocolDetector pair, so the
+    # reactive baseline includes the same reactive pair-check work.
     engine = OpportunityEngine(
         w3=StubW3(), chain_id=1,
-        detectors=[CycleDetector(StubW3(), g, None, None, 1)],
+        detectors=[CycleDetector(StubW3(), g, None, None, 1),
+                   CrossProtocolDetector(StubW3(), g, None, None, 1)],
         graph=g, scheduled_pass_interval=50)
+    inc_pairs = PairCallTimer(g)
+    engine.detectors[1].graph = inc_pairs
     engine.graph.recently_registered.drain()
     rng = random.Random(7)
     top = [e.pool_address for e in g.get_top_pools_by_tvl(400)]
@@ -378,33 +441,48 @@ def scenario_simultaneous(lines):
     ref_graph = snapshot_graph_state(g)
     ref_engine = OpportunityEngine(
         w3=StubW3(), chain_id=1,
-        detectors=[CycleDetector(StubW3(), ref_graph, None, None, 1)],
+        detectors=[CycleDetector(StubW3(), ref_graph, None, None, 1),
+                   CrossProtocolDetector(StubW3(), ref_graph, None, None, 1)],
         graph=ref_graph, scheduled_discovery=False)
+    ref_pairs = PairCallTimer(ref_graph)
+    ref_engine.detectors[1].graph = ref_pairs
 
     lines.append("--- scenario C: 20 touched pools on a mid-batch block "
-                 "(same graph state + touched set, two engines) ---")
+                 "(same graph state + touched set, two engines, identical "
+                 "production-equivalent detector sets) ---")
     with mock.patch.object(detectors_base, "ARB_EXEC_ADDRESS", ""), \
             mock.patch.object(cycles_mod, "ARB_EXEC_ADDRESS", ""):
+        inc_before_start = len(inc_pairs.calls)
         engine.process(100, touched_pools=frozenset())   # batch starts (slice 1)
+        inc_start_pair_calls = len(inc_pairs.calls) - inc_before_start
         # reference: warmed the same way (one quiet reactive block), then
         # measured on the identical touched set with scheduling disabled
         ref_engine.process(100, touched_pools=frozenset())
         snap2 = snapshot_graph_state(g)                  # state at measured block
         ref_engine2 = OpportunityEngine(
             w3=StubW3(), chain_id=1,
-            detectors=[CycleDetector(StubW3(), snap2, None, None, 1)],
+            detectors=[CycleDetector(StubW3(), snap2, None, None, 1),
+                       CrossProtocolDetector(StubW3(), snap2, None, None, 1)],
             graph=snap2, scheduled_discovery=False)
+        ref_pairs2 = PairCallTimer(snap2)
+        ref_engine2.detectors[1].graph = ref_pairs2
         ref_engine2.process(100, touched_pools=frozenset())
 
+        inc_before = len(inc_pairs.calls)
+        ref_before_a = len(ref_pairs.calls)
         t0 = time.perf_counter()
         engine.process(101, touched_pools=touched)       # reactive + scheduled slice
         combined = (time.perf_counter() - t0) * 1000
+        inc_measured_pair_calls = len(inc_pairs.calls) - inc_before
         t0 = time.perf_counter()
         ref_engine.process(101, touched_pools=touched)   # reactive only (no batch)
         reactive_a = (time.perf_counter() - t0) * 1000
+        ref_measured_a = len(ref_pairs.calls) - ref_before_a
+        ref_before_b = len(ref_pairs2.calls)
         t0 = time.perf_counter()
         ref_engine2.process(101, touched_pools=touched)  # reactive only, fresh snapshot
         reactive_b = (time.perf_counter() - t0) * 1000
+        ref_measured_b = len(ref_pairs2.calls) - ref_before_b
         slice_wall = combined - min(reactive_a, reactive_b)
     info = engine.last_scheduled_batch_info
     lines.append(f"  combined reactive+scheduled-slice invocation: {combined:.1f} ms "
@@ -414,7 +492,14 @@ def scenario_simultaneous(lines):
                  f"touched set): {reactive_a:.1f} ms / {reactive_b:.1f} ms (two independent runs)")
     lines.append(f"  incremental scheduled slice cost (combined - reactive-only): "
                  f"~{slice_wall:.1f} ms")
-    lines.append("  (reactive cost is the pre-existing touched-pool path, unchanged by R1/R1A)")
+    lines.append(f"  ACTUAL pair calls (R1A2 §1): batch-start invocation "
+                 f"{inc_start_pair_calls} (event-free scheduled anchors+supplementary, "
+                 f"within the 30-pair budget: {'YES' if inc_start_pair_calls <= 30 else 'NO'}) | "
+                 f"measured block: incremental engine {inc_measured_pair_calls} "
+                 f"(reactive anchors; scheduled stage already complete) vs "
+                 f"reference engines {ref_measured_a}/{ref_measured_b} (reactive anchors) — "
+                 f"identical reactive work in both engines")
+    lines.append("  (reactive cost is the pre-existing touched-pool path, unchanged by R1/R1A/R1A1/R1A2)")
 
 
 def main():
@@ -428,7 +513,7 @@ def main():
     slice_sizes = [int(s) for s in args.slices.split(",")]
 
     lines = []
-    lines.append("DSS-WO-MI-102B-R1A §3 benchmark — incremental scheduled search + registration queue")
+    lines.append("DSS-WO-MI-102B-R1A2 §1 benchmark — scheduled pair checks measured, recovery bounded")
     lines.append(f"repo_root={REPO_ROOT}")
     lines.append(f"config: additional_pair_limit={BoundedDiscoveryConfig().additional_pair_limit} "
                  f"max_pair_checks={BoundedDiscoveryConfig().max_pair_checks} "

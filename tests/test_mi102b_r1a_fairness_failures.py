@@ -769,6 +769,190 @@ class TestPairStageSeedExhaustion(unittest.TestCase):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# R1A4 §2 — registration retention on terminal pair-stage failure
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestRegistrationRetentionOnTerminalFailure(unittest.TestCase):
+    """R1A4 §2: a terminal pair-stage failure (the three-unresolved-invocation
+    bound) must not discard registrations that already left the lossless
+    backlog — unprocessed registration seeds are restored to the
+    _notified_new_pools staging list in their original FIFO order, ahead of
+    newer pending registrations, while already processed seeds, seeds
+    successfully covered by reactive-overlap suppression and terminally
+    failed cycle seeds are NOT restored. The restored seeds must each be
+    searched exactly once by the next eligible batch."""
+
+    def _graph_with_registration_pools(self, count, base):
+        """Fixture loop + `count` searchable pools (tvl default) that can be
+        registered via notify_new_pools."""
+        g = build_profitable_graph()
+        for i in range(count):
+            add_v2_pool(g, _addr(base + i), _token(base + i), WETH, 2.0)
+        return g
+
+    def _both_detector_engine(self, g, **kw):
+        return make_engine(
+            g, detectors=[CycleDetector(StubW3(), g, None, None, 1),
+                          CrossProtocolDetector(StubW3(), g, None, None, 1)], **kw)
+
+    def test_batch_creation_registrations_restored_in_fifo_order(self):
+        """Eight searchable registrations seed a batch (slice size one);
+        persistent reactive CrossProtocol deferrals reach the
+        three-unresolved-invocation bound with four of them unprocessed. The
+        terminal failure restores exactly those four in FIFO order, ahead of
+        a newer registration; the processed, terminally failed and
+        reactive-overlap-covered seeds are not restored; the next eligible
+        batch searches each restored seed exactly once."""
+        reg_pools = [_addr(700 + i) for i in range(8)]
+        newer_registration = _addr(708)
+        g = self._graph_with_registration_pools(9, 700)
+        g.recently_registered.drain()  # steady state: only explicit notifications count
+        with patch_quote_path():
+            engine = self._both_detector_engine(g, _max_cycle_retries=0)
+            # test-local cycle-retry bound: ONE failed slice attempt moves a
+            # seed to terminal failed_seeds, so a terminally failed
+            # registration exists inside the three-invocation pair-stage
+            # window (the production default of 3 is exercised by the R1A §2
+            # regressions and is not changed here).
+            slice_rec = SliceRecorder(engine)
+            rec = CrossRecorder(engine)
+            rec.fail_reactive = True
+            engine.notify_new_pools(reg_pools[:8])
+            # block 100: batch start — registrations seed ahead of ranked
+            # universe seeds; the pair stage defers (reactive failure); the
+            # first registration's slice fails terminally.
+            slice_rec.fail_next = 1
+            engine.process(100, touched_pools=frozenset({P1}))
+            # block 101: deferral again; the second registration is searched.
+            engine.process(101, touched_pools=frozenset({P1}))
+            # block 102: the third registration is touched — the reactive
+            # scan successfully covers it (skipped, not lost); the fourth is
+            # searched; the pending bound terminates the batch.
+            engine.process(102, touched_pools=frozenset({reg_pools[2]}))
+            done = engine.last_scheduled_batch_info
+            self.assertIsNone(engine._scheduled_batch, "the bound terminated the batch")
+            self.assertTrue(done["failed"])
+            self.assertFalse(done["complete"])
+            self.assertFalse(done["pair_checks_ok"])
+            self.assertEqual(done["status"], "failed")
+            self.assertEqual(done["pair_stage_pending_invocations"], 3)
+            self.assertEqual(done["registration_seeds_total"], 8)
+            self.assertEqual(done["registration_seeds_processed"], 2,
+                             "registrations 2 and 4 were searched successfully")
+            self.assertEqual(done["registration_seeds_failed"], 1,
+                             "registration 1 terminally failed its cycle slice")
+            self.assertEqual(done["registration_seeds_reactive_covered"], 1,
+                             "registration 3 was covered by the reactive scan")
+            self.assertEqual(done["restored_registration_seeds"], reg_pools[4:],
+                             "exactly the unprocessed registrations, in FIFO order")
+            self.assertEqual(done["registration_seeds_restored"], 4)
+            # a NEWER registration arrives after the failure: the restored
+            # seeds must sit AHEAD of it in the staging list.
+            engine.notify_new_pools([newer_registration])
+            staging = engine._notified_new_pools
+            self.assertEqual(staging, reg_pools[4:] + [newer_registration],
+                             "restored registrations ahead of newer pending registrations")
+            self.assertEqual(len(staging), len(set(staging)), "no duplicate staging entries")
+            for p in reg_pools[:4]:
+                self.assertNotIn(p, staging,
+                                 "processed / terminally failed / reactive-covered seeds "
+                                 "are not requeued")
+            self.assertEqual(done["priority_pending"], 0)
+            self.assertEqual(done["retry_pending"], 0)
+            self.assertEqual(done["main_queue_pending"], 7,
+                             "ranked-universe work stays in the main queue accounting, "
+                             "it is not requeued as registrations")
+            # next eligible batch (cadence due again): injection removed —
+            # every restored registration becomes searchable and is searched
+            # exactly once.
+            rec.fail_reactive = False
+            slice_rec.fail_next = 0
+            for block in range(150, 210):
+                engine.process(block, touched_pools=frozenset())
+                if engine.last_scheduled_batch_info.get("complete"):
+                    break
+            done2 = engine.last_scheduled_batch_info
+            self.assertTrue(done2["complete"], "the next batch completes")
+            self.assertFalse(done2["failed"])
+            self.assertTrue(done2["pair_checks_ok"])
+            new_bookings = [s for b, s in slice_rec.events if b >= 150]
+            for p in reg_pools[4:] + [newer_registration]:
+                self.assertEqual(new_bookings.count(p), 1,
+                                 f"restored registration {p} searched exactly once")
+            self.assertEqual(engine._notified_new_pools, [], "staging fully consumed")
+
+    def test_mid_batch_arrivals_restored_from_priority_and_retry_front(self):
+        """Registrations arriving during an active batch join the priority
+        queue. One is booked and processed, one is booked but its cycle slice
+        FAILS (re-queued to retry_front with retry budget remaining — not
+        terminally failed), one stays queued in priority. The bound
+        terminates the batch: the processed seed is not restored; the
+        retry_front and priority registrations are restored in FIFO order and
+        each searched exactly once by the next eligible batch."""
+        arrival = [_addr(800 + i) for i in range(3)]
+        g = build_profitable_graph()
+        g.recently_registered.drain()  # steady state: only explicit notifications count
+        with patch_quote_path():
+            engine = self._both_detector_engine(g)
+            slice_rec = SliceRecorder(engine)
+            rec = CrossRecorder(engine)
+            rec.fail_reactive = True
+            # block 100: batch starts on the ranked universe (no backlog);
+            # P3 is touched too, so the reactive scan covers it and the main
+            # queue holds only P2; the pair stage defers; P2 is searched.
+            engine.process(100, touched_pools=frozenset({P1, P3}))
+            # mid-batch: three searchable pools register and join priority.
+            for i, p in enumerate(arrival):
+                add_v2_pool(g, p, _token(800 + i), WETH, 2.0)
+            engine.notify_new_pools(arrival)
+            # block 101: arrivals consumed into priority; the first is booked
+            # and searched successfully (priority slot).
+            engine.process(101, touched_pools=frozenset({P1}))
+            # block 102: the main queue is exhausted, so the priority drain
+            # books the second arrival — but the cycle slice FAILS: it is
+            # re-queued to retry_front (budget remaining, NOT terminally
+            # failed); the pending bound terminates the batch with the third
+            # arrival still queued in priority.
+            slice_rec.fail_next = 1
+            engine.process(102, touched_pools=frozenset({P1}))
+            done = engine.last_scheduled_batch_info
+            self.assertIsNone(engine._scheduled_batch)
+            self.assertTrue(done["failed"])
+            self.assertFalse(done["complete"])
+            self.assertFalse(done["pair_checks_ok"])
+            self.assertEqual(done["pair_stage_pending_invocations"], 3)
+            self.assertEqual(done["registration_seeds_total"], 3)
+            self.assertEqual(done["registration_seeds_processed"], 1,
+                             "the first arrival was searched successfully")
+            self.assertEqual(done["registration_seeds_failed"], 0,
+                             "the failed slice still had retry budget — not terminal")
+            self.assertEqual(done["restored_registration_seeds"], arrival[1:],
+                             "retry_front + priority registrations restored in FIFO order")
+            self.assertEqual(done["registration_seeds_restored"], 2)
+            staging = engine._notified_new_pools
+            self.assertEqual(staging, arrival[1:])
+            self.assertEqual(len(staging), len(set(staging)), "no duplicate staging entries")
+            self.assertNotIn(arrival[0], staging, "the processed seed is not requeued")
+            self.assertEqual(done["priority_pending"], 1, "the third arrival was still queued")
+            self.assertEqual(done["retry_pending"], 1, "the second arrival was still queued")
+            # next eligible batch: each restored registration exactly once.
+            rec.fail_reactive = False
+            slice_rec.fail_next = 0
+            for block in range(150, 210):
+                engine.process(block, touched_pools=frozenset())
+                if engine.last_scheduled_batch_info.get("complete"):
+                    break
+            done2 = engine.last_scheduled_batch_info
+            self.assertTrue(done2["complete"])
+            self.assertFalse(done2["failed"])
+            new_bookings = [s for b, s in slice_rec.events if b >= 150]
+            for p in arrival[1:]:
+                self.assertEqual(new_bookings.count(p), 1,
+                                 f"restored registration {p} searched exactly once")
+            self.assertEqual(engine._notified_new_pools, [], "staging fully consumed")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # R1A1 §4 — failure visibility: addresses, truncation indicator, full summary
 # ═════════════════════════════════════════════════════════════════════════════
 

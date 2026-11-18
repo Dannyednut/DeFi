@@ -249,6 +249,46 @@ class OpportunityEngine:
         self._notified_new_pools = searchable[len(kept):]
         return kept
 
+    def _restore_unprocessed_registrations(self, batch: dict) -> list[str]:
+        """R1A4 §1: a terminal batch failure must not lose registrations that
+        already left the lossless backlog.
+
+        Registration-origin seeds held by the batch (batch["registration_seeds"]
+        — FIFO across batch creation and mid-batch priority consumption) that
+        were never successfully searched are restored to the FRONT of the
+        ``_notified_new_pools`` staging list, ahead of newer pending
+        registrations, preserving FIFO order. Excluded from restoration:
+
+        - seeds already searched successfully (batch["processed"]);
+        - seeds successfully covered by reactive-overlap suppression
+          (batch["reactive_covered_seeds"] — the reactive scan searched them,
+          so their discovery work is done);
+        - seeds already moved into terminal ``failed_seeds`` (their bounded
+          retry budget is exhausted; restoring them would bypass the bound).
+
+        Ranked-universe seeds are NOT restored: the next ranked-universe
+        batch can select them again from the graph. Addresses are
+        case-normalized; the staging list never gains duplicate entries (an
+        address already staged again through re-registration keeps its
+        existing position instead of being inserted twice). No second
+        registration queue, scheduler or retry abstraction is introduced.
+        """
+        processed = {(a or "").lower() for a in batch["processed"]}
+        covered = {(a or "").lower() for a in batch.get("reactive_covered_seeds", set())}
+        failed = {(a or "").lower() for a in batch["failed_seeds"]}
+        restored: list[str] = []
+        seen: set[str] = set()
+        for addr in batch.get("registration_seeds", []):
+            a = (addr or "").lower()
+            if not a or a in processed or a in covered or a in failed or a in seen:
+                continue
+            seen.add(a)
+            restored.append(a)
+        if restored:
+            staged = set(self._notified_new_pools)
+            self._notified_new_pools[:0] = [a for a in restored if a not in staged]
+        return restored
+
     @staticmethod
     def _tag_scheduled(found, reason: str) -> None:
         for opp in found or []:
@@ -361,11 +401,17 @@ class OpportunityEngine:
             # block are skipped (R1A1 §3: only on actual reactive success).
             new_seeds = self._consume_new_pool_seeds()
             seeds: list[str] = []
+            # R1A4 §1: registration-origin seeds tracked SEPARATELY from
+            # ranked-universe seeds, in original FIFO order (batch-creation
+            # consumption first, mid-batch priority consumption appended) so
+            # a terminal batch failure can restore the unprocessed ones.
+            registration_seeds: list[str] = []
             seen: set[str] = set()
             for s in new_seeds:
                 if s not in seen and not (suppress_reactive_overlap and s in touched_lower):
                     seen.add(s)
                     seeds.append(s)
+                    registration_seeds.append(s)
             for s in universe.seed_pools():
                 if len(seeds) >= self.bounded_config.max_seed_pools:
                     break
@@ -442,6 +488,12 @@ class OpportunityEngine:
                 "seeds_skipped": 0,
                 "seeds_deduped": 0,
                 "processed": set(),
+                # R1A4 §1: registration-origin seeds held by this batch (FIFO,
+                # across creation and mid-batch arrivals) + the seeds already
+                # successfully covered by reactive-overlap suppression — the
+                # restoration rule excludes both from terminal requeueing.
+                "registration_seeds": registration_seeds,
+                "reactive_covered_seeds": set(),
                 # R1A §1: per-slot alternation between registrations and
                 # ranked-universe seeds; persisted across invocations.
                 "last_slot": "priority",
@@ -483,6 +535,10 @@ class OpportunityEngine:
                 if taken:
                     batch["priority"].extend(taken)
                     batch["priority_consumed"] += len(taken)
+                    # R1A4 §1: mid-batch arrivals keep their FIFO position in
+                    # the registration-origin tracking (appended after the
+                    # batch-creation registrations).
+                    batch["registration_seeds"].extend(taken)
             # R1A §2 / R1A1 §3 / R1A2 §2: a failed pair-check stage is
             # retried once per invocation while the batch is active —
             # bounded, visible (pair_checks_ok in the status), never
@@ -549,6 +605,12 @@ class OpportunityEngine:
             # scheduled work (dedup handles overlapping candidates).
             if (suppress_reactive_overlap and cand in touched_lower) or cand in slice_seeds:
                 batch["seeds_skipped"] += 1
+                if suppress_reactive_overlap and cand in touched_lower:
+                    # R1A4 §1: this candidate was successfully searched by the
+                    # reactive scan this block (suppression only applies on
+                    # actual reactive success) — its discovery work is DONE,
+                    # so a terminal batch failure must not restore it.
+                    batch["reactive_covered_seeds"].add((cand or "").lower())
                 return False
             if cand in batch["processed"]:
                 batch["seeds_deduped"] += 1  # already searched earlier in this batch
@@ -725,6 +787,14 @@ class OpportunityEngine:
         if batch is not None and not batch["pair_checks_ok"]:
             batch["pair_stage_pending_invocations"] += 1
             if batch["pair_stage_pending_invocations"] >= max(1, int(self._max_pair_stage_pending)):
+                # R1A4 §1: registrations that already left the lossless
+                # backlog but were never searched are restored BEFORE the
+                # batch is discarded — terminal failure must not lose them.
+                restored = self._restore_unprocessed_registrations(batch)
+                reg_seeds = [(a or "").lower() for a in batch.get("registration_seeds", [])]
+                processed_l = {(a or "").lower() for a in batch["processed"]}
+                covered_l = {(a or "").lower() for a in batch.get("reactive_covered_seeds", set())}
+                failed_l = {(a or "").lower() for a in batch["failed_seeds"]}
                 self._last_batch_summary = {
                     "complete": False,
                     "failed": True,
@@ -737,6 +807,21 @@ class OpportunityEngine:
                     "anchor_stage_covered": batch["anchor_stage_covered"],
                     "pair_stage_pending_invocations": batch["pair_stage_pending_invocations"],
                     "pair_stage_deferrals": batch["pair_stage_deferrals"],
+                    # R1A4 §1: registration-retention accounting. Restored
+                    # addresses keep their original FIFO order and are listed
+                    # in full — never silently truncated.
+                    "registration_seeds_total": len(set(reg_seeds)),
+                    "registration_seeds_processed": sum(1 for a in reg_seeds if a in processed_l),
+                    "registration_seeds_reactive_covered": sum(1 for a in reg_seeds if a in covered_l),
+                    "registration_seeds_failed": sum(1 for a in reg_seeds if a in failed_l),
+                    "registration_seeds_restored": len(restored),
+                    "restored_registration_seeds": restored,
+                    # R1A4 §1: remaining work by queue, distinguishing the
+                    # restored registration seeds from ranked-universe work
+                    # that the next ranked-universe batch re-selects anyway.
+                    "main_queue_pending": max(0, len(batch["seeds"]) - batch["cursor"]),
+                    "priority_pending": len(batch["priority"]),
+                    "retry_pending": len(batch.get("retry_front", [])),
                     "start_block": batch["start_block"],
                     "end_block": int(block_number),
                     "reason": batch["reason"],
@@ -759,9 +844,10 @@ class OpportunityEngine:
                 get_logger("opportunity_engine").error(
                     "[SCHEDULED-BATCH] FAILED pair-check stage unresolved for %d invocations "
                     "(deferrals=%d scheduled_attempts=%d) start_block=%s end_block=%s — batch "
-                    "terminated, NOT reported complete",
+                    "terminated, NOT reported complete; unprocessed registrations restored=%d",
                     batch["pair_stage_pending_invocations"], batch["pair_stage_deferrals"],
                     batch["pair_checks_attempted"], batch["start_block"], block_number,
+                    len(restored),
                 )
                 self._scheduled_batch = None
         return out

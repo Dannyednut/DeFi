@@ -116,7 +116,23 @@ class CycleDetector(BaseDetector):
 
     
 
-    def on_block(self, block_number: int, touched_pools: set[str] = None) -> list[Opportunity]:
+    def on_block(self, block_number: int, touched_pools: set[str] = None,
+                 scheduled_seeds: set[str] = None) -> list[Opportunity]:
+        """Reactive event-gated scan, plus the MI-102B scheduled mode.
+
+        ``touched_pools`` (reactive): pools whose state actually changed in
+        this block -- the Spec 3.3 smart targeted scan below.
+
+        ``scheduled_seeds`` (MI-102B): bounded search origins supplied by the
+        OpportunityEngine's periodic event-independent pass (anchor +
+        TVL-ranked universe venues, plus newly registered pools). These are
+        NOT synthetic events: no pool state is fabricated and nothing is
+        pretended to have emitted an event -- the identical
+        ``find_cycles(must_include_pool=...)`` search simply runs from the
+        given origins against whatever state the graph currently holds.
+
+        ``touched_pools`` always takes precedence when non-empty.
+        """
         if self.graph.pool_count < 2:
             return []
 
@@ -141,10 +157,11 @@ class CycleDetector(BaseDetector):
 
         # cycles = []
 
-        if touched_pools: # Only scan if there was actual volatility
+        scan_pools = touched_pools if touched_pools else scheduled_seeds
+        if scan_pools: # Reactive: actual volatility. Scheduled: bounded universe seeds.
             seen_cycles = set()
             all_cycles = []
-            for pool_addr in touched_pools:
+            for pool_addr in scan_pools:
                 pool_cycles = self.graph.find_cycles(must_include_pool=pool_addr, min_profit_ratio=0.0005,)
 
                 # cycles.extend(pool_cycles)
@@ -163,7 +180,7 @@ class CycleDetector(BaseDetector):
             if not all_cycles:
                 return []
 
-            log.debug(f"Block {block_number}: {len(all_cycles)} unique cycles from {len(touched_pools)} pools")
+            log.debug(f"Block {block_number}: {len(all_cycles)} unique cycles from {len(scan_pools)} pools")
 
             # for c in all_cycles:
             #     log.debug(f"Cycle: pools={c.pools}, dexes={c.dexes}, tokens={c.tokens}, fees={c.fees}, log_weight={c.log_weight_sum}")

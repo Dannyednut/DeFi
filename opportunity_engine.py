@@ -40,6 +40,12 @@ class OpportunityEngine:
     # slices. Beyond this the seed moves to failed_seeds (visible; never
     # reported as processed) — no unbounded hidden retry loops.
     _max_cycle_retries: int = 3
+    # R1A3 §1: bound on invocations that END with the pair-check stage still
+    # unresolved (INCLUDING the invocation that first leaves it pending)
+    # before the batch terminates visibly failed. Keeps a permanently
+    # failing pair stage from staying active indefinitely, local to this
+    # stage — no generic retry framework.
+    _max_pair_stage_pending: int = 3
     bounded_config: BoundedDiscoveryConfig = field(default_factory=BoundedDiscoveryConfig)
     pair_universe: RankedPairUniverse | None = None
     _last_scheduled_block: int | None = None
@@ -197,6 +203,12 @@ class OpportunityEngine:
                 "pair_checks_ok": batch["pair_checks_ok"],
                 "pair_checks_attempted": batch["pair_checks_attempted"],
                 "anchor_stage_covered": batch["anchor_stage_covered"],
+                # R1A3 §1: pending-recovery visibility — how many invocations
+                # have ended with the pair-check stage still unresolved
+                # (bound: _max_pair_stage_pending) and how many of those were
+                # pure reactive-failure deferrals (no scheduled pair call).
+                "pair_stage_pending_invocations": batch["pair_stage_pending_invocations"],
+                "pair_stage_deferrals": batch["pair_stage_deferrals"],
                 "main_pending": len(batch["seeds"]) - batch["cursor"],
                 "priority_pending": len(batch["priority"]),
                 "slices": batch["slices"],
@@ -388,8 +400,10 @@ class OpportunityEngine:
             pair_checks_ok = True
             pair_checks_attempted = 0
             pair_check_ms = 0.0
+            pair_stage_deferrals = 0
             if reactive_cross_ok is False:
                 pair_checks_ok = False
+                pair_stage_deferrals = 1
                 get_logger("opportunity_engine").info(
                     "[SCHEDULED-BATCH] pair-check stage deferred: reactive cross-protocol "
                     "invocation failed this block; stage stays pending (pair_checks_ok=False)")
@@ -436,6 +450,9 @@ class OpportunityEngine:
                 "failed_seeds": [],
                 "pair_checks_ok": pair_checks_ok,
                 "pair_checks_attempted": pair_checks_attempted,
+                # R1A3 §1: bounded pending pair-stage policy counters.
+                "pair_stage_pending_invocations": 0,
+                "pair_stage_deferrals": pair_stage_deferrals,
                 "slices": 0,
                 "slice_ms": [],
                 "seeds_processed": 0,
@@ -482,6 +499,7 @@ class OpportunityEngine:
                 if touched_lower and reactive_cross_ok is True:
                     batch["anchor_stage_covered"] = True
                 if reactive_cross_ok is False:
+                    batch["pair_stage_deferrals"] += 1
                     get_logger("opportunity_engine").info(
                         "[SCHEDULED-BATCH] pair-check stage deferred: reactive cross-protocol "
                         "invocation failed this block; stage stays pending (pair_checks_ok=False)")
@@ -595,20 +613,30 @@ class OpportunityEngine:
                         )
         if slice_seeds and not detector_failed:
             batch["processed"].update(slice_seeds)
-        batch["slices"] += 1
+        if slice_seeds:
+            # R1A3 §1: only non-empty passes count as cycle-search slices —
+            # a batch kept alive purely for pending pair-check recovery runs
+            # no cycle-search work and must not inflate the slice count or
+            # the slice-ms statistics.
+            batch["slices"] += 1
         if not detector_failed:
             batch["seeds_processed"] += len(slice_seeds)
         batch["retry_front"] = retry_front
-        batch["slice_ms"].append(round((time.time() - t_slice) * 1000.0, 3))
+        if slice_seeds:
+            batch["slice_ms"].append(round((time.time() - t_slice) * 1000.0, 3))
 
         batch_incomplete = bool(batch["priority"]) or bool(batch.get("retry_front", [])) \
             or batch["cursor"] < len(batch["seeds"])
-        if not batch_incomplete:
+        if not batch_incomplete and batch["pair_checks_ok"]:
             # R1A §2: a batch is only COMPLETE when every seed was searched
             # and the pair-check stage succeeded. A terminal batch with
             # failed seeds or failed pair checks reports an explicit failed
             # state instead of a misleading complete=True — the affected
             # seeds are enumerated in the summary.
+            # R1A3 §1: a pending pair-check stage does NOT reach this
+            # terminal branch — exhausting the cycle seeds must not discard
+            # the stage; the batch stays active for the bounded recovery
+            # policy at the end of this invocation.
             ok = batch["pair_checks_ok"] and not batch["failed_seeds"]
             self._last_batch_summary = {
                 "complete": True,
@@ -625,6 +653,8 @@ class OpportunityEngine:
                 # fallback completed it; the old *covered_reactively* name
                 # could read as true via the scheduled fallback alone.
                 "anchor_stage_covered": batch["anchor_stage_covered"],
+                "pair_stage_pending_invocations": batch["pair_stage_pending_invocations"],
+                "pair_stage_deferrals": batch["pair_stage_deferrals"],
                 "start_block": batch["start_block"],
                 "end_block": int(block_number),
                 "reason": batch["reason"],
@@ -676,6 +706,64 @@ class OpportunityEngine:
                 len(batch["seeds"]) - batch["cursor"], len(batch["priority"]),
                 len(batch.get("retry_front", [])), len(batch["failed_seeds"]),
             )
+
+        # ── R1A3 §1: bounded pending pair-stage policy ──
+        # An invocation that ENDS with the pair-check stage still unresolved
+        # counts against an explicit bound of three such invocations,
+        # INCLUDING the invocation that first leaves the stage pending (a
+        # reactive deferral at batch start, a failed scheduled attempt, or a
+        # mid-batch retry failure). While the bound is not reached, a pending
+        # stage keeps the batch alive even when every cycle seed, priority
+        # seed and retry seed is exhausted, so the stage receives its next
+        # safe recovery opportunity on a subsequent invocation (R1A2
+        # sequencing unchanged: reactive success → supplementary only;
+        # reactive not invoked → anchors + supplementary; reactive failed →
+        # defer, no scheduled anchor repetition in the same block). Past the
+        # bound the batch terminates VISIBLY failed — a permanently failing
+        # stage must neither report success nor stay active indefinitely.
+        batch = self._scheduled_batch
+        if batch is not None and not batch["pair_checks_ok"]:
+            batch["pair_stage_pending_invocations"] += 1
+            if batch["pair_stage_pending_invocations"] >= max(1, int(self._max_pair_stage_pending)):
+                self._last_batch_summary = {
+                    "complete": False,
+                    "failed": True,
+                    "status": "failed",
+                    "failed_seeds": len(batch["failed_seeds"]),
+                    "failed_seed_list": list(batch["failed_seeds"]),
+                    "failed_seed_list_truncated": False,
+                    "pair_checks_ok": False,
+                    "pair_checks_attempted": batch["pair_checks_attempted"],
+                    "anchor_stage_covered": batch["anchor_stage_covered"],
+                    "pair_stage_pending_invocations": batch["pair_stage_pending_invocations"],
+                    "pair_stage_deferrals": batch["pair_stage_deferrals"],
+                    "start_block": batch["start_block"],
+                    "end_block": int(block_number),
+                    "reason": batch["reason"],
+                    "seeds_total": len(batch["seeds"]) + batch["priority_consumed"],
+                    "seeds_processed": batch["seeds_processed"],
+                    "seeds_skipped_reactive_overlap": batch["seeds_skipped"],
+                    "seeds_deduped": batch["seeds_deduped"],
+                    "slices": batch["slices"],
+                    "slice_ms_median": round(statistics.median(batch["slice_ms"]), 3) if batch["slice_ms"] else 0.0,
+                    "slice_ms_p95": self._p95(batch["slice_ms"]),
+                    "slice_ms_max": max(batch["slice_ms"], default=0.0),
+                    "batch_ms": round(sum(batch["slice_ms"]), 3),
+                    "startup_ms": round(batch.get("startup_ms", 0.0), 3),
+                    "pair_check_ms": round(batch.get("pair_check_ms", 0.0), 3),
+                    "total_ms_incl_startup": round(sum(batch["slice_ms"]) + batch.get("startup_ms", 0.0)
+                                                   + batch.get("pair_check_ms", 0.0), 3),
+                    "new_pool_seeds": batch["new_pool_seeds"],
+                    "additional_pairs": len(batch["additional_pairs"]),
+                }
+                get_logger("opportunity_engine").error(
+                    "[SCHEDULED-BATCH] FAILED pair-check stage unresolved for %d invocations "
+                    "(deferrals=%d scheduled_attempts=%d) start_block=%s end_block=%s — batch "
+                    "terminated, NOT reported complete",
+                    batch["pair_stage_pending_invocations"], batch["pair_stage_deferrals"],
+                    batch["pair_checks_attempted"], batch["start_block"], block_number,
+                )
+                self._scheduled_batch = None
         return out
 
     @staticmethod

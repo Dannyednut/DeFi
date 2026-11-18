@@ -482,18 +482,22 @@ class TestReactiveFailureHandoff(unittest.TestCase):
 
             calls_before = len(counter.calls)
             engine.process(100, touched_pools=frozenset({P1}))  # batch start
-            reactive_calls = len(counter.calls) - calls_before
+            attempted = len(counter.calls) - calls_before
             live = engine.last_scheduled_batch_info
-            # the reactive invocation reached and checked exactly two anchor
-            # pairs before the injected exception
-            self.assertEqual(reactive_calls, 2,
-                             "reactive detector checked two anchor pairs, then failed")
+            # R1A3 §3: the reactive invocation issued THREE pair-lookup
+            # invocations — two completed successfully, the third raised
+            # mid-anchor-list. Budget assertions count ATTEMPTS.
+            self.assertEqual(attempted, 3,
+                             "two successful anchor lookups + one failing invocation "
+                             "= three attempted all_edges_for_pair invocations")
+            self.assertEqual(len(counter.completed), 2,
+                             "exactly two lookups completed successfully")
             checked = set(counter.calls)
             self.assertTrue(checked <= set(anchor_pairs(1)),
                             "the partial progress was inside the anchor list")
-            # combined block budget: reactive partial + deferred scheduled = 2 <= 30
-            self.assertLessEqual(reactive_calls, 30,
-                                 "combined actual pair calls in the invocation within budget")
+            # combined block budget: reactive partial + deferred scheduled = 3 <= 30
+            self.assertLessEqual(attempted, 30,
+                                 "combined attempted pair calls in the invocation within budget")
             # the scheduled fallback did NOT repeat the full anchor list
             self.assertEqual(rec.scheduled_calls, [],
                              "no scheduled anchor repetition after the partial reactive failure")
@@ -559,6 +563,209 @@ class TestReactiveFailureHandoff(unittest.TestCase):
         self.assertTrue(done["complete"])
         self.assertEqual(done["seeds_processed"] + done["seeds_skipped_reactive_overlap"]
                          + done["seeds_deduped"], done["seeds_total"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# R1A3 §2 — seed exhaustion: a pending pair-check stage survives and recovers
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestPairStageSeedExhaustion(unittest.TestCase):
+    """R1A3 §2: a pending pair-check stage must NOT be discarded when the
+    cycle seeds run out — the batch stays active for the bounded recovery
+    policy (three unresolved invocations, then a visible terminal failure),
+    and the next safe invocation completes the missing anchor and
+    supplementary stages under the R1A2 sequencing rules."""
+
+    def _graph_with_one_searchable_pool(self):
+        """One searchable pool (the only possible scheduled seed) plus one
+        below the searchability gate (usable as a touched pool without
+        adding universe seeds)."""
+        from tvl import set_graph_ref
+        g = TokenGraph(chain_id=1)
+        init_prices(2000.0, WETH, [USDC])
+        add_v2_pool(g, P1, WETH, A, 2.0)                            # searchable seed
+        add_v2_pool(g, _addr(901), _token(9), _token(10), 2.0, tvl=100.0)  # below the gate
+        set_graph_ref(g)
+        return g
+
+    def _graph_with_no_searchable_pools(self):
+        """Every pool below the searchability TVL gate — the ranked universe
+        and the registration queue can provide ZERO cycle-search seeds."""
+        from tvl import set_graph_ref
+        g = TokenGraph(chain_id=1)
+        init_prices(2000.0, WETH, [USDC])
+        add_v2_pool(g, P1, WETH, A, 2.0, tvl=100.0)
+        add_v2_pool(g, P2, A, _token(11), 2.0, tvl=100.0)
+        set_graph_ref(g)
+        return g
+
+    def _engine(self, g):
+        return make_engine(
+            g, detectors=[CycleDetector(StubW3(), g, None, None, 1),
+                          CrossProtocolDetector(StubW3(), g, None, None, 1)])
+
+    def test_zero_seed_batch_survives_pending_pair_stage(self):
+        """R1A3 §2.1: zero cycle-search seeds (universe and registration
+        queue both provide nothing) + reactive CrossProtocol failure at
+        batch start. The batch remains active with pair_checks_ok=False,
+        then recovers on the next safe invocation and completes only after
+        anchors AND supplementary pairs are checked."""
+        from bounded_discovery import anchor_pairs
+        g = self._graph_with_no_searchable_pools()
+        with patch_quote_path():
+            engine = self._engine(g)
+            rec = CrossRecorder(engine)
+            rec.fail_reactive = True
+            counter = _PairCountingGraph(g)
+            engine.detectors[1].graph = counter
+            engine.process(100, touched_pools=frozenset({P1}))
+            live = engine.last_scheduled_batch_info
+            self.assertEqual(live["seeds_total"], 0, "universe + queue provided zero seeds")
+            self.assertEqual(live["main_pending"], 0, "no cycle queue to exhaust")
+            self.assertFalse(live["complete"])
+            self.assertFalse(live["pair_checks_ok"])
+            self.assertFalse(live["anchor_stage_covered"])
+            self.assertEqual(live["pair_stage_pending_invocations"], 1,
+                             "the batch-start invocation is the first unresolved one")
+            self.assertEqual(live["pair_stage_deferrals"], 1,
+                             "the reactive failure deferred the scheduled stage")
+            self.assertIsNotNone(engine._scheduled_batch,
+                                 "seed exhaustion must not discard the pending pair stage")
+            self.assertEqual(rec.scheduled_calls, [],
+                             "no scheduled anchor repetition in the failing block")
+            rec.fail_reactive = False
+            engine.process(101, touched_pools=frozenset())
+            live2 = engine.last_scheduled_batch_info
+            self.assertTrue(live2["complete"], "the recovery invocation completed the batch")
+            self.assertTrue(live2["pair_checks_ok"])
+            self.assertTrue(live2["anchor_stage_covered"])
+            self.assertEqual(rec.scheduled_calls, [(101, True)],
+                             "the next safe invocation checks anchors + supplementary")
+            self.assertEqual(live2["slices"], 0, "no cycle-search work existed")
+        checked = set(counter.calls)
+        for a in anchor_pairs(1):
+            self.assertIn(a, checked, f"anchor pair {a} must be checked before completion")
+
+    def test_single_seed_exhaustion_preserves_pending_pair_stage(self):
+        """R1A3 §2.2: exactly ONE scheduled seed with slice size one; the
+        reactive CrossProtocol failure defers pair checks in the SAME
+        invocation that exhausts the only seed. Exhausting the seed must
+        not discard the pending stage; the next safe invocation recovers it."""
+        from bounded_discovery import anchor_pairs
+        g = self._graph_with_one_searchable_pool()
+        touched_gate = _addr(901)
+        with patch_quote_path():
+            engine = self._engine(g)
+            rec = CrossRecorder(engine)
+            rec.fail_reactive = True
+            counter = _PairCountingGraph(g)
+            engine.detectors[1].graph = counter
+            engine.process(100, touched_pools=frozenset({touched_gate}))
+            live = engine.last_scheduled_batch_info
+            self.assertEqual(live["seeds_total"], 1, "exactly one scheduled seed")
+            self.assertEqual(live["seeds_processed"], 1,
+                             "the only seed was searched in the batch-start invocation")
+            self.assertEqual(live["main_pending"], 0, "cycle queue exhausted")
+            self.assertFalse(live["pair_checks_ok"])
+            self.assertEqual(live["pair_stage_pending_invocations"], 1)
+            self.assertEqual(live["pair_stage_deferrals"], 1)
+            self.assertIsNotNone(engine._scheduled_batch,
+                                 "exhausting the only seed must not discard the pending stage")
+            self.assertEqual(rec.scheduled_calls, [],
+                             "no scheduled anchor repetition in the failing block")
+            rec.fail_reactive = False
+            engine.process(101, touched_pools=frozenset())
+            live2 = engine.last_scheduled_batch_info
+            self.assertTrue(live2["complete"])
+            self.assertTrue(live2["pair_checks_ok"])
+            self.assertTrue(live2["anchor_stage_covered"])
+            self.assertEqual(rec.scheduled_calls, [(101, True)])
+        checked = set(counter.calls)
+        for a in anchor_pairs(1):
+            self.assertIn(a, checked, f"anchor pair {a} must be checked before completion")
+
+    def test_scheduled_pair_failure_on_final_slice_is_retained(self):
+        """R1A3 §2.3: the scheduled CrossProtocol call fails on the
+        invocation where the cycle queue is exhausted. The pending stage is
+        retained for its bounded retry opportunity — the batch is NOT
+        cleared — and a later invocation completes it."""
+        from bounded_discovery import anchor_pairs
+        g = self._graph_with_one_searchable_pool()
+        touched_gate = _addr(901)
+        with patch_quote_path():
+            engine = self._engine(g)
+            rec = CrossRecorder(engine)
+            rec.fail_reactive = True
+            counter = _PairCountingGraph(g)
+            engine.detectors[1].graph = counter
+            engine.process(100, touched_pools=frozenset({touched_gate}))  # defer + exhaust
+            self.assertIsNotNone(engine._scheduled_batch)
+            rec.fail_reactive = False
+            rec.fail_next = 1
+            engine.process(101, touched_pools=frozenset())                # scheduled retry fails
+            live = engine.last_scheduled_batch_info
+            self.assertFalse(live["complete"])
+            self.assertFalse(live["pair_checks_ok"])
+            self.assertEqual(live["pair_checks_attempted"], 1,
+                             "exactly one scheduled pair-check attempt was issued")
+            self.assertEqual(live["pair_stage_pending_invocations"], 2)
+            self.assertEqual(live["pair_stage_deferrals"], 1)
+            self.assertIsNotNone(engine._scheduled_batch,
+                                 "a scheduled failure on the final slice must retain the "
+                                 "pending stage for its bounded retry, not clear the batch")
+            self.assertEqual(rec.scheduled_calls, [(101, True)])
+            engine.process(102, touched_pools=frozenset())                # recovery
+            live2 = engine.last_scheduled_batch_info
+            self.assertTrue(live2["complete"])
+            self.assertTrue(live2["pair_checks_ok"])
+            self.assertTrue(live2["anchor_stage_covered"])
+            self.assertEqual(rec.scheduled_calls, [(101, True), (102, True)])
+        checked = set(counter.calls)
+        for a in anchor_pairs(1):
+            self.assertIn(a, checked, f"anchor pair {a} must be checked before completion")
+
+    def test_persistent_pair_stage_failure_terminates_within_bound(self):
+        """R1A3 §2.4: repeated reactive deferrals AND scheduled pair-check
+        failures must respect the explicit three-unresolved-invocation
+        bound (including the invocation that first leaves the stage
+        pending): the batch reaches a terminal failed state, never reports
+        successful completion and does not stay active indefinitely."""
+        g = self._graph_with_one_searchable_pool()
+        touched_gate = _addr(901)
+        with patch_quote_path():
+            engine = self._engine(g)
+            rec = CrossRecorder(engine)
+            counter = _PairCountingGraph(g)
+            engine.detectors[1].graph = counter
+            # invocation 1: reactive failure defers the stage at batch start
+            rec.fail_reactive = True
+            engine.process(100, touched_pools=frozenset({touched_gate}))
+            self.assertEqual(engine.last_scheduled_batch_info["pair_stage_pending_invocations"], 1)
+            # invocation 2: the scheduled recovery attempt fails
+            rec.fail_reactive = False
+            rec.fail_next = 10 ** 6
+            engine.process(101, touched_pools=frozenset())
+            self.assertEqual(engine.last_scheduled_batch_info["pair_stage_pending_invocations"], 2)
+            self.assertIsNotNone(engine._scheduled_batch)
+            # invocation 3: another reactive deferral — the bound is reached
+            rec.fail_next = 0
+            rec.fail_reactive = True
+            engine.process(102, touched_pools=frozenset({touched_gate}))
+            done = engine.last_scheduled_batch_info
+            self.assertIsNone(engine._scheduled_batch, "the bound terminates the batch")
+            self.assertTrue(done["failed"])
+            self.assertFalse(done["complete"])
+            self.assertFalse(done["pair_checks_ok"])
+            self.assertEqual(done["pair_stage_pending_invocations"], 3,
+                             "exactly three unresolved invocations, then termination")
+            self.assertEqual(done["pair_stage_deferrals"], 2)
+            self.assertEqual(done["seeds_processed"], 1)
+            # a later invocation cannot resurrect it or report success
+            engine.process(103, touched_pools=frozenset())
+            done2 = engine.last_scheduled_batch_info
+            self.assertFalse(done2["complete"])
+            self.assertTrue(done2["failed"])
+            self.assertFalse(done2["pair_checks_ok"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -631,18 +838,30 @@ class _PairCountingGraph:
 
 class _FailingPairGraph(_PairCountingGraph):
     """_PairCountingGraph with injectable PARTIAL failure: when
-    ``fail_after`` is set to N, the first N all_edges_for_pair calls
-    succeed and every later call raises — simulating a reactive detector
-    that made real pair-check progress and then failed mid-anchor-list."""
+    ``fail_after`` is set to N, the first N all_edges_for_pair invocations
+    succeed and every later invocation raises — simulating a reactive
+    detector that made real pair-check progress and then failed
+    mid-anchor-list.
+
+    R1A3 §3: EVERY invocation is recorded as an ATTEMPT in ``calls`` BEFORE
+    delegating or raising — the failing invocation is a real pair-lookup
+    invocation the detector issued, so per-block budget assertions count
+    attempts, not just successful returns. Successful delegated completions
+    are additionally recorded in ``completed``, keeping the
+    attempted-versus-completed distinction available."""
 
     def __init__(self, inner):
         super().__init__(inner)
-        self.fail_after = None
+        self.fail_after = None   # raise on the (N+1)-th invocation
+        self.completed = []      # successful delegated lookups only
 
     def all_edges_for_pair(self, a, b):
-        if self.fail_after is not None and len(self.calls) >= self.fail_after:
+        self.calls.append(normalize_pair(a, b))
+        if self.fail_after is not None and len(self.calls) > self.fail_after:
             raise RuntimeError("injected partial pair-check failure")
-        return super().all_edges_for_pair(a, b)
+        result = self._inner.all_edges_for_pair(a, b)
+        self.completed.append(self.calls[-1])
+        return result
 
 
 class TestPairCheckCallBudget(unittest.TestCase):

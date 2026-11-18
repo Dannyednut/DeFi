@@ -211,6 +211,11 @@ class OpportunityTracker:
                 if is_filled:
                     metadata["outcome"] = "FILLED_BY_COMPETITOR"
                     metadata["tx_hash"] = filled_pools[matched_pool]
+                    # DSS-WO-MI-103 §6: preserve the overlap evidence itself —
+                    # WHICH pool was touched by a mined transaction. The label
+                    # remains an observed overlap heuristic, never proof of
+                    # confirmed competitor capture.
+                    metadata["overlap_matched_pool"] = matched_pool
                 else:
                     metadata["outcome"] = "EXPIRED"
     
@@ -321,6 +326,18 @@ class OpportunityTracker:
     # ═══════════════════════════════════════════════════════════════════════════════
     
     def _write_lifecycle(self, evt: LifecycleEvent) -> None:
+        # DSS-WO-MI-103 §2/§3: terminal CLOSE events flow into the shadow
+        # validation record through this ONE central lifecycle-write path
+        # (both closure paths — process_block() and close_executed() —
+        # converge here). Purely observational; failures never disturb the
+        # tracker.
+        if evt.status == "CLOSED":
+            try:
+                from shadow.recorder import get_recorder
+                get_recorder().record_terminal(evt)
+            except Exception:
+                pass
+
         import json
         from pathlib import Path
         from config import LOG_DIR

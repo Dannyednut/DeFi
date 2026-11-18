@@ -233,6 +233,17 @@ class OpportunityEngine:
             )
         except Exception:
             pass
+        # DSS-WO-MI-103 §2/§3: shadow-validation DETECTION record — the ONE
+        # shared recording point for block and mempool origins, capturing
+        # EVERY candidate leaving the pipeline (execution-ready or not) with
+        # detection-time evidence only. Purely observational: failures must
+        # never disturb the pipeline.
+        try:
+            from shadow.recorder import get_recorder
+            get_recorder().record_detections(
+                candidates, block_number=block_number, block_hash=bh, engine=self)
+        except Exception:
+            pass
         return PipelineResult(tuple(candidates), tuple(ready), tuple(rejected))
 
     def process(self, block_number: int, *, touched_pools: set[str] | None = None, block_context=None) -> PipelineResult:

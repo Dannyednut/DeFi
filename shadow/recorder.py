@@ -98,8 +98,10 @@ class ShadowRecorder:
         self._session_id = session_id or uuid.uuid4().hex[:12]
         self._process_start_unix = time.time()
         self._pid = os.getpid()
-        self._capacity = max(64, int(state_capacity))
-        # fingerprint -> lifecycle state; bounded, insertion-ordered.
+        self._capacity = max(1, int(state_capacity))
+        self._overflow_warned = False
+        # fingerprint -> lifecycle state; bounded for CLOSED tombstones only —
+        # OPEN lifecycles are never evicted (R1 §6B).
         self._lifecycles: "collections.OrderedDict[str, _LifecycleState]" = collections.OrderedDict()
         self._seq = 0
         self.stats = {
@@ -107,6 +109,8 @@ class ShadowRecorder:
             "duplicate_closes_suppressed": 0, "unmatched_closes": 0,
             "restart_scanned_records": 0, "restart_continued_lifecycles": 0,
             "append_failures": 0,
+            "open_state_capacity_exceeded": 0,
+            "restart_scan_bytes_read": 0,
         }
         if self.enabled:
             try:
@@ -119,24 +123,65 @@ class ShadowRecorder:
     # Restart reconstruction (work order §4.4) — bounded scan of the JSONL tail
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def _reconstruct_from_tail(self, tail_scan_lines: int) -> None:
-        """Rebuild open lifecycles and the monotone sequence from the recorder's
-        own JSONL tail. Bounded: only the last ``tail_scan_lines`` lines are
-        read. A fingerprint whose latest detection record is an OPEN/UPDATE
-        continues its lifecycle in this process (no duplicate OPEN); a
-        fingerprint whose latest terminal record is a CLOSE starts fresh on
-        the next detection. Lifecycles opened BEFORE the scanned window are
-        continued with ``open_seq=None`` (the OPEN record itself is outside
-        the scan) — still continued, never duplicated."""
+    _TAIL_CHUNK_BYTES = 64 * 1024
+
+    def _read_tail_lines(self, tail_scan_lines: int) -> list:
+        """Read only the LAST ``tail_scan_lines`` lines by seeking BACKWARD
+        from EOF in fixed chunks (R1 §7) — startup work does not scale with
+        the historical file and no whole-file buffer is retained. Handles an
+        empty file, a final line without a trailing newline, malformed lines
+        (skipped by the parse loop) and files with fewer records than
+        requested. When the backward scan stops at a chunk boundary mid-line,
+        the leading partial line is dropped: it belongs to a record older
+        than the requested window, and the +1 newline slack keeps the
+        requested line count complete."""
         try:
             if not self.path.exists():
-                return
-            lines = []
-            with open(self.path, "r", encoding="utf-8") as f:
-                for line in f:
-                    lines.append(line)
-                    if len(lines) > max(0, int(tail_scan_lines)):
-                        lines.pop(0)
+                return []
+            size = self.path.stat().st_size
+            if size <= 0:
+                return []
+            max_lines = max(0, int(tail_scan_lines))
+            with open(self.path, "rb") as f:
+                if size <= self._TAIL_CHUNK_BYTES:
+                    self.stats["restart_scan_bytes_read"] += size
+                    return f.read().decode("utf-8", errors="replace").split("\n")
+                needed = max_lines + 1  # slack for the boundary-partial line
+                buf = b""
+                pos = size
+                while pos > 0 and buf.count(b"\n") <= needed:
+                    step = min(self._TAIL_CHUNK_BYTES, pos)
+                    pos -= step
+                    f.seek(pos)
+                    chunk = f.read(step)
+                    self.stats["restart_scan_bytes_read"] += step
+                    buf = chunk + buf
+            lines = buf.decode("utf-8", errors="replace").split("\n")
+            if pos > 0 and lines:
+                lines = lines[1:]  # partial line cut at the chunk boundary
+            if max_lines and len(lines) > max_lines:
+                lines = lines[-max_lines:]
+            return lines
+        except Exception as exc:
+            log.warning(f"shadow recorder tail read failed (continuing fresh): {exc}")
+            return []
+
+    def _reconstruct_from_tail(self, tail_scan_lines: int) -> None:
+        """Rebuild open lifecycles and the monotone sequence from the
+        recorder's own JSONL tail. BOUNDED: the tail is located by seeking
+        backward from EOF (``_read_tail_lines``) — the historical file is
+        neither read nor retained. A fingerprint whose latest detection
+        record is an OPEN/UPDATE continues its lifecycle in this process (no
+        duplicate OPEN); a fingerprint whose latest terminal record is a
+        CLOSE starts fresh on the next detection; and an OPEN observed AFTER
+        a CLOSE within the same scanned tail starts a FRESH lifecycle with
+        the new OPEN's sequence — the previous lifecycle's open_seq, update
+        count and matched status are NOT retained (R1 §6A). Lifecycles opened
+        BEFORE the scanned window are continued with ``open_seq=None`` (the
+        OPEN record itself is outside the scan) — still continued, never
+        duplicated, without fabricating the missing opening evidence."""
+        try:
+            lines = self._read_tail_lines(tail_scan_lines)
             for line in lines:
                 line = line.strip()
                 if not line:
@@ -167,6 +212,17 @@ class ShadowRecorder:
                     continue
                 if rtype == "detection" and event in ("OPEN", "UPDATE"):
                     st = self._lifecycles.get(fp)
+                    if event == "OPEN" and st is not None and not st.open:
+                        # R1 §6A: a closed fingerprint starts a FRESH lifecycle
+                        # — new OPEN sequence, reset counters and matched
+                        # status; the previous lifecycle's open_seq is not
+                        # retained. Still a previous-session continuation.
+                        self._lifecycles[fp] = _LifecycleState(
+                            int(rec.get("seq") or 0), open=True, matched="open",
+                            continued=True)
+                        self._lifecycles.move_to_end(fp)
+                        self.stats["restart_continued_lifecycles"] += 1
+                        continue
                     if st is None:
                         # any lifecycle reconstructed from the tail scan
                         # belongs to a PREVIOUS session: an OPEN seen in the
@@ -180,6 +236,8 @@ class ShadowRecorder:
                     else:
                         st.open = True
                         st.continued = True
+                        if event == "UPDATE":
+                            st.updates += 1
                         if event == "OPEN" and st.open_seq is None:
                             st.open_seq = int(rec.get("seq") or 0)
                         self._lifecycles.move_to_end(fp)
@@ -219,7 +277,22 @@ class ShadowRecorder:
         self._lifecycles[fp] = state
         self._lifecycles.move_to_end(fp)
         while len(self._lifecycles) > self._capacity:
-            self._lifecycles.popitem(last=False)
+            # R1 §6B: evict only CLOSED tombstones. An OPEN lifecycle is never
+            # silently discarded — discarding one would let a later detection
+            # append a second OPEN for a lifecycle that was never closed. If
+            # every tracked lifecycle is open, retain them all (idempotency
+            # first) and expose the capacity condition explicitly.
+            tombstone = next((k for k, st in self._lifecycles.items() if not st.open), None)
+            if tombstone is None:
+                if not self._overflow_warned:
+                    self._overflow_warned = True
+                    log.warning(
+                        f"shadow recorder open-lifecycle population ({len(self._lifecycles)}) "
+                        f"exceeds state capacity ({self._capacity}); open lifecycles are "
+                        f"retained for idempotency — no duplicate OPEN will be emitted")
+                self.stats["open_state_capacity_exceeded"] += 1
+                break
+            del self._lifecycles[tombstone]
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Integration point 1 — OpportunityEngine.process_candidates() exit
@@ -258,7 +331,12 @@ class ShadowRecorder:
                     record = self._detection_record(
                         opp, meta, fp, event, seq, state, block_number, block_hash, now, graph,
                         continued)
-                self._append(record)
+                    # R1 §5: sequence allocation, lifecycle transition, record
+                    # construction and append ordering share ONE critical
+                    # section — the physical file order always matches the
+                    # allocated sequence order. _append contains its own
+                    # exception handling; the outer try guards construction.
+                    self._append(record)
             except Exception as exc:
                 log.warning(f"shadow detection recording failed: {exc}")
 
@@ -517,7 +595,10 @@ class ShadowRecorder:
                     self.stats["unmatched_closes"] += 1
                     matched = "unmatched"
                 record = self._terminal_record(evt, meta, fp, outcome, seq, matched)
-            self._append(record)
+                # R1 §5: same single critical section as detection records —
+                # the terminal CLOSE is physically ordered with its allocated
+                # sequence and cannot overtake the OPEN it closes.
+                self._append(record)
         except Exception as exc:
             log.warning(f"shadow terminal recording failed: {exc}")
 

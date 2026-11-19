@@ -103,9 +103,19 @@ class TestRestartedDiscoveryEndToEnd(unittest.TestCase):
             quiet = engine.process(block_number=100, touched_pools=frozenset())
             result = engine.process(block_number=101, touched_pools=frozenset({P3}))
 
-        # Scheduler semantics intact: event-gated detector skips the no-event block.
-        self.assertEqual(len(quiet.candidates), 0)
-        # Restored graph + rotated long-tail-rooted cycle -> one candidate.
+        # Scheduler semantics (updated by DSS-WO-MI-102B): the event-gated
+        # reactive detector still skips the no-event block, but the engine's
+        # bounded scheduled pass now runs on the first block (cadence due)
+        # and discovers the route WITHOUT any pool having emitted an event --
+        # exactly the F-01 gap MI-102B closes. The candidate carries
+        # scheduled-pass provenance.
+        self.assertEqual(len(quiet.candidates), 1)
+        q = quiet.candidates[0]
+        self.assertEqual(q.metadata.get("discovery_mode"), "scheduled")
+        self.assertTrue(q.metadata.get("scheduled_pass"))
+        self.assertEqual({p.lower() for p in q.pools}, {P1, P2, P3})
+        # Restored graph + rotated long-tail-rooted cycle -> one candidate,
+        # now through the preserved reactive path.
         self.assertEqual(len(result.candidates), 1)
         opp = result.candidates[0]
         self.assertEqual({p.lower() for p in opp.pools}, {P1, P2, P3})

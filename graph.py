@@ -18,6 +18,7 @@ from cache import PoolCache
 
 from log import get_logger
 from config import MAX_HOPS, MIN_POOL_LIQUIDITY_USD
+from bounded_discovery import RecentlyRegistered
 from utils.multicall3 import multicall3_bulk_refresh, MULTICALL_CHUNK
 from tvl import _WETH_ADDRS, STABLE_TOKEN_SETS, token_decimals, token_price, _NATIVE_PRICE_USD
 
@@ -312,6 +313,12 @@ class TokenGraph:
         self.total_cycles_found = 0
         self.last_scan_time = 0
 
+        # MI-102B §5: bounded ring of pools newly registered into the graph.
+        # Every registration source funnels through upsert_pool_edges; new
+        # pools recorded here become eligible for the engine's next scheduled
+        # discovery pass without waiting for their first swap event.
+        self.recently_registered = RecentlyRegistered()
+
         # Long-lived ProtocolRegistry, reused across every best_rate_for_amount()
         # call. Previously best_rate_for_amount() constructed a fresh
         # ProtocolRegistry(self.w3) inline on every single call — since
@@ -337,6 +344,10 @@ class TokenGraph:
         token directions for one pool contract. Pool identity is the contract,
         while edges are derived views of that pool.
         """
+        # MI-102B §5: record first-time registrations so the engine can seed
+        # the next scheduled discovery pass with genuinely new pools (updated
+        # upserts of known pools are not re-recorded).
+        is_new_pool = bool(edges) and edges[0].pool_address not in self._pool_index
         for edge in edges:
             if self.chain_id and edge.chain_id not in (0, self.chain_id):
                 raise ValueError(f"cross-chain pool rejected: edge={edge.chain_id}, graph={self.chain_id}")
@@ -400,6 +411,9 @@ class TokenGraph:
                     break
             else:
                 pair_edges.append(edge)
+
+        if is_new_pool:
+            self.recently_registered.record(edges[0].pool_address)
 
     def update_token_metadata(self, token: str, metadata: dict) -> None:
         """Update metadata for a token (e.g. from TheGraph)."""

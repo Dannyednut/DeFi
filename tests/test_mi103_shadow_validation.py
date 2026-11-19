@@ -588,6 +588,79 @@ class TestRestartReconstruction(RecorderTestBase):
         self.assertEqual(rec_empty.stats["restart_scanned_records"], 0)
         self.assertEqual(rec_empty._seq, 1)
 
+    def test_small_file_tail_limit(self):
+        """R2 §3A: the configured line limit applies to the small-file path as
+        well as the backward-seeking path; ``tail_scan_lines=0`` reconstructs
+        nothing; OPENs outside the requested tail do not reappear in recorder
+        state; zero, one and fewer-than-limit counts are exercised."""
+        small = Path(self.tmp) / "limit.jsonl"
+        lines = [json.dumps({
+            "record_type": "detection", "event": "OPEN", "schema_version": 1,
+            "seq": i + 1, "fingerprint": f"pad{i:03d}", "session": {},
+        }, separators=(",", ":")) for i in range(30)]
+        small.write_text("\n".join(lines))  # final line without trailing newline
+
+        rec = ShadowRecorder(small, tail_scan_lines=10)
+        self.assertEqual(rec.stats["restart_scanned_records"], 10,
+                         "only the requested tail is reconstructed on a small file")
+        self.assertEqual(rec._seq - 1, 30, "the maximum sequence is still correct")
+        self.assertIsNone(rec._lifecycles.get("pad000"),
+                          "an OPEN outside the tail leaves no recorder state")
+        self.assertIsNone(rec._lifecycles.get("pad019"))
+        self.assertIsNotNone(rec._lifecycles.get("pad020"))
+        self.assertIsNotNone(rec._lifecycles.get("pad029"))
+
+        rec0 = ShadowRecorder(small, tail_scan_lines=0)
+        self.assertEqual(rec0.stats["restart_scanned_records"], 0)
+        self.assertEqual(rec0._seq, 1, "zero limit reconstructs nothing")
+        self.assertEqual(len(rec0._lifecycles), 0)
+
+        rec1 = ShadowRecorder(small, tail_scan_lines=1)
+        self.assertEqual(rec1.stats["restart_scanned_records"], 1)
+        self.assertIsNotNone(rec1._lifecycles.get("pad029"))
+        self.assertIsNone(rec1._lifecycles.get("pad028"))
+
+        rec_all = ShadowRecorder(small, tail_scan_lines=100)
+        self.assertEqual(rec_all.stats["restart_scanned_records"], 30,
+                         "fewer records than the limit → all are reconstructed")
+
+    def test_initial_orphan_update_counted(self):
+        """R2 §3B: a tail that begins with UPDATE records and no OPEN for the
+        fingerprint reconstructs an open lifecycle with ``open_seq=None``,
+        counts ALL orphan UPDATEs, and a subsequent live detection continues
+        that lifecycle as an UPDATE (never a new OPEN)."""
+        from tracker import _fingerprint as _fp
+        orphan_fp = _fp(_opp([P1, P2], [WETH, A, WETH]))
+        orphan_path = Path(self.tmp) / "orphan.jsonl"
+        lines = [json.dumps({
+            "record_type": "detection", "event": "UPDATE", "schema_version": 1,
+            "seq": i + 1, "fingerprint": orphan_fp, "session": {},
+        }, separators=(",", ":")) for i in range(2)]
+        # the recorder itself always ends every append with a newline, so a
+        # real log ends with one; the fixture must match before a live append
+        orphan_path.write_text("\n".join(lines) + "\n")
+
+        rec = ShadowRecorder(orphan_path, tail_scan_lines=100)
+        st = rec._lifecycles.get(orphan_fp)
+        self.assertIsNotNone(st)
+        self.assertTrue(st.open)
+        self.assertIsNone(st.open_seq,
+                          "honest outside-recorded-history: no fabricated OPEN")
+        self.assertEqual(st.updates, 2,
+                         "the initial orphan UPDATE is counted as the first update")
+        self.assertTrue(st.continued)
+
+        # a live detection continues the reconstructed lifecycle as an UPDATE
+        shadow_rec.set_recorder(rec)
+        _engine(_graph()).process_candidates([_opp([P1, P2], [WETH, A, WETH])], 110)
+        live = [r for r in rec.read_records() if r.get("record_type") == "detection"]
+        self.assertEqual([r["event"] for r in live], ["UPDATE", "UPDATE", "UPDATE"],
+                         "two orphan UPDATEs + one live UPDATE — no duplicate OPEN")
+        self.assertEqual(live[-1]["lifecycle"]["update_count"], 3,
+                         "the live UPDATE counts on top of the reconstructed ones")
+        self.assertIsNone(live[-1]["lifecycle"]["open_seq"])
+        self.assertEqual(live[-1]["lifecycle"]["continued_from_previous_session"], True)
+
 
 class TestConcurrency(RecorderTestBase):
     """R1 §5: sequence allocation, lifecycle transition, record construction
@@ -744,9 +817,9 @@ class TestOfflineReplay(RecorderTestBase, _ReplayTestMixin):
         # B: the later snapshot carries both directions; only the FORWARD
         # (inverted) one may be used → no longer profitable
         self.assertEqual(by_fp["b" * 16]["outcome"], self.replay.OUTCOME_GONE)
-        # C: no later state anywhere
+        # C: no coherent later state anywhere
         self.assertEqual(by_fp["c" * 16]["outcome"], self.replay.OUTCOME_MISSING)
-        self.assertIn("no later state", by_fp["c" * 16]["reason"])
+        self.assertIn("no coherent common anchor", by_fp["c" * 16]["reason"])
         # E: beyond-window state flagged, never skipped
         e = by_fp["e" * 16]
         self.assertEqual(e["outcome"], self.replay.OUTCOME_STILL)
@@ -921,7 +994,7 @@ class TestOfflineReplay(RecorderTestBase, _ReplayTestMixin):
         })
         self.assertEqual(r["outcome"], self.replay.OUTCOME_MISSING)
         self.assertIn(PB.lower(), r["reason"])
-        self.assertIn("common-anchor", r["reason"])
+        self.assertIn("common anchor", r["reason"])
 
         # case 3: one pool outside the permitted common-anchor window → rejected
         _h, r = run_case({
@@ -931,19 +1004,188 @@ class TestOfflineReplay(RecorderTestBase, _ReplayTestMixin):
         self.assertEqual(r["outcome"], self.replay.OUTCOME_MISSING)
         self.assertIn(PB.lower(), r["reason"])
 
-        # case 4: different heights within the window, with an UNRELATED newer
-        # pool in the cache — the graph-wide maximum (2000) must NOT set the
-        # anchor or the freshness of the route's own pools
+        # case 4 (R2 §1 case 2): different heights within the window, with an
+        # UNRELATED pool at a MUCH newer block in the cache — the graph-wide
+        # maximum (50000) must NOT set the anchor, gate eligibility or
+        # contribute state for the route's own pools
         _h, r = run_case({
             PA: (WETH, A, PA_R[0], PA_R[1], 500),
             PB: (WETH, A, PB_R[1], PB_R[0], 450),
-            P1: (WETH, A, 1000 * 10**18, 1000 * 10**18, 2000),
+            P1: (WETH, A, 1000 * 10**18, 1000 * 10**18, 50000),
         })
         self.assertEqual(r["outcome"], self.replay.OUTCOME_STILL)
         self.assertEqual(r["common_anchor_block"], 500,
                          "anchor comes from the route's OWN pools, not the graph-wide max")
         lags = r["later_state_lag_from_anchor"]
         self.assertEqual(lags[f"{PB.lower()}:{A}->{WETH}"], 50)
+        self.assertTrue(all(v >= 0 for v in lags.values()),
+                        "reported lags are always non-negative")
+
+    def test_mixed_recorded_cache_common_anchor(self):
+        """R2 §1 case 1: one leg's state is RECORDED at block 150, the other
+        leg's exact-direction state is a warmed-cache observation at 160. The
+        resolver must establish anchor 160 — the highest candidate from the
+        route's OWN observations — and prove every leg valid relative to it.
+        It must never report anchor 150 while using state 160, and never a
+        negative lag."""
+        b = _ShadowLogBuilder()
+        b.det("m" * 16, [PA, PB], [WETH, A, WETH], 100, 100,
+              [(10**18, 2 * 10**18), (2 * 10**18, int(1.9 * 10**18))])
+        # later snapshot RECORDED for leg 0 (PA WETH→A) at block 150 only;
+        # leg 1 (PB A→WETH) has NO recorded later state — it comes from the
+        # exact-direction warmed cache at block 160
+        b.seq += 1
+        mixed = {
+            "record_type": "detection", "event": "UPDATE", "schema_version": 1,
+            "seq": b.seq, "session": {"session_id": "fixture"}, "recorded_at_unix": 1.0,
+            "fingerprint": "m" * 16,
+            "identity": {"chain_id": 1, "origin": "block", "pool_addresses": [PA, PB],
+                         "ordered_token_path": [WETH, A, WETH]},
+            "detection": {"block_number": 150, "block_hash": STATE_HASH, "state_block": 150},
+            "market_inputs": {"edges": [{
+                "pool": PA, "token_in": WETH, "token_out": A, "version": 2,
+                "fee_bps": 30, "state_block": 150, "state_block_hash": STATE_HASH,
+                "reserve_in": 1000 * 10**18, "reserve_out": 2000 * 10**18}]},
+            "size_and_profit": {"trade_size_amount_in": 10**18,
+                                "gross_quote_profit_wei": 1000},
+        }
+        b.records.append(mixed)
+        b.write(self.shadow_path)
+        cache_dir = self._cache_cycle_fixture({
+            PB: (WETH, A, 1900 * 10**18, 2000 * 10**18, 160),
+        })
+        evaluation_path = Path(self.tmp) / "eval.jsonl"
+        self.replay.evaluate(self.shadow_path, evaluation_path, str(cache_dir),
+                             chain_id=1, catchup_window=1000, rerun=False)
+        r = list(_evals_by_fp_open_seq(evaluation_path).values())[0]
+        self.assertEqual(r["outcome"], self.replay.OUTCOME_STILL)
+        self.assertEqual(r["common_anchor_block"], 160,
+                         "the anchor is the highest route-own candidate, not the recorded block")
+        blocks = r["later_state_blocks"]
+        lags = r["later_state_lag_from_anchor"]
+        self.assertEqual(blocks[f"{PA.lower()}:{WETH}->{A}"], 150,
+                         "leg 0 uses its recorded state at 150")
+        self.assertEqual(blocks[f"{PB.lower()}:{A}->{WETH}"], 160,
+                         "leg 1 uses its exact-direction cache state at 160")
+        self.assertEqual(lags[f"{PA.lower()}:{WETH}->{A}"], 10)
+        self.assertEqual(lags[f"{PB.lower()}:{A}->{WETH}"], 0)
+        self.assertTrue(all(v >= 0 for v in lags.values()),
+                         "no negative lag is ever reported")
+        # the mixed-state profit equals the independent calculation over the
+        # ACTUAL selected states (PA recorded@150, PB cache@160)
+        out = _indep_v2_out(_indep_v2_out(10**18, 1000 * 10**18, 2000 * 10**18),
+                            2000 * 10**18, 1900 * 10**18)
+        self.assertEqual(r["recomputed_gross_profit_wei"], out - 10**18)
+
+    def test_route_leg_older_than_detection_rejected(self):
+        """R2 §1 case 3: a required leg whose only exact-direction state is
+        older than the detection block is rejected — it is named, and no
+        profitability value is produced."""
+        b = _ShadowLogBuilder()
+        b.det("o" * 16, [PA, PB], [WETH, A, WETH], 100, 100,
+              [(10**18, 2 * 10**18), (2 * 10**18, int(1.9 * 10**18))])
+        b.write(self.shadow_path)
+        cache_dir = self._cache_cycle_fixture({
+            PA: (WETH, A, 1000 * 10**18, 2000 * 10**18, 500),
+            PB: (WETH, A, 1900 * 10**18, 2000 * 10**18, 50),  # predates detection
+        })
+        evaluation_path = Path(self.tmp) / "eval.jsonl"
+        self.replay.evaluate(self.shadow_path, evaluation_path, str(cache_dir),
+                             chain_id=1, catchup_window=1000, rerun=False)
+        r = list(_evals_by_fp_open_seq(evaluation_path).values())[0]
+        self.assertEqual(r["outcome"], self.replay.OUTCOME_MISSING)
+        self.assertIn(PB.lower(), r["reason"])
+        self.assertIn("not later than the detection block", r["reason"])
+        self.assertIsNone(r["recomputed_gross_profit_wei"])
+
+    def test_route_leg_exceeding_anchor_lag_rejected(self):
+        """R2 §1 case 4: a leg whose state exceeds the permitted common-anchor
+        lag is rejected and named; the route is never evaluated on a mixed
+        anchor."""
+        b = _ShadowLogBuilder()
+        b.det("p" * 16, [PA, PB], [WETH, A, WETH], 100, 100,
+              [(10**18, 2 * 10**18), (2 * 10**18, int(1.9 * 10**18))])
+        b.write(self.shadow_path)
+        cache_dir = self._cache_cycle_fixture({
+            PA: (WETH, A, 1000 * 10**18, 2000 * 10**18, 2000),
+            PB: (WETH, A, 1900 * 10**18, 2000 * 10**18, 900),  # lag 1100 > window
+        })
+        evaluation_path = Path(self.tmp) / "eval.jsonl"
+        self.replay.evaluate(self.shadow_path, evaluation_path, str(cache_dir),
+                             chain_id=1, catchup_window=1000, rerun=False)
+        r = list(_evals_by_fp_open_seq(evaluation_path).values())[0]
+        self.assertEqual(r["outcome"], self.replay.OUTCOME_MISSING)
+        self.assertIn(PB.lower(), r["reason"])
+        self.assertIn("common anchor", r["reason"])
+        self.assertIsNone(r["recomputed_gross_profit_wei"])
+
+    def test_unknown_pool_version_fails_closed(self):
+        """R2 §2: only an explicit V2 permits the constant-product recompute;
+        an explicit V3 keeps the not-evaluable quoter classification; a
+        missing, null, zero, malformed or otherwise unknown version is NEVER
+        defaulted to V2 — no profitability value, and the evaluation output
+        retains the affected leg and reason."""
+        leg = (P6.lower(), WETH, A)
+
+        def _resolved(raw_version):
+            edge = {"pool": P6, "token_in": WETH, "token_out": A, "fee_bps": 30,
+                    "reserve_in": 1000 * 10**18, "reserve_out": 2000 * 10**18}
+            if raw_version is not ...:
+                edge["version"] = raw_version
+            return {0: {"block": 150, "edge": edge, "source": "recorded",
+                        "state_lag_from_anchor": 0}}
+
+        # explicit V2 → the independent constant-product calculation passes
+        out = _indep_v2_out(10**18, 1000 * 10**18, 2000 * 10**18)
+        rec = self.replay.recompute_route_profit(10**18, [leg], _resolved(2))
+        self.assertTrue(rec["evaluable"])
+        self.assertEqual(rec["profit_wei"], out - 10**18)
+        # explicit V3 → not evaluable, quoter reason
+        rec = self.replay.recompute_route_profit(10**18, [leg], _resolved(3))
+        self.assertFalse(rec["evaluable"])
+        self.assertIsNone(rec["profit_wei"])
+        self.assertIn("quoter", rec["reason"])
+        self.assertEqual(rec["affected_leg"]["pool"], P6.lower())
+        # missing / null / zero / malformed / unknown → never defaulted to V2
+        for raw in (..., None, "", 0, "v2", 1, 4, "2.5", True):
+            rec = self.replay.recompute_route_profit(10**18, [leg], _resolved(raw))
+            self.assertFalse(rec["evaluable"], f"version {raw!r} must not evaluate")
+            self.assertIsNone(rec["profit_wei"])
+            self.assertIn("never", rec["reason"])
+            self.assertIn("V2", rec["reason"])
+            self.assertEqual(rec["affected_leg"]["pool"], P6.lower())
+
+        # end-to-end: the evaluation output retains the affected leg + reason
+        b = _ShadowLogBuilder()
+        b.det("v" * 16, [P6], [WETH, A], 100, 100, [(1000 * 10**18, 2000 * 10**18)])
+        b.seq += 1
+        later = {
+            "record_type": "detection", "event": "UPDATE", "schema_version": 1,
+            "seq": b.seq, "session": {"session_id": "fixture"}, "recorded_at_unix": 1.0,
+            "fingerprint": "v" * 16,
+            "identity": {"chain_id": 1, "origin": "block", "pool_addresses": [P6],
+                         "ordered_token_path": [WETH, A]},
+            "detection": {"block_number": 150, "block_hash": STATE_HASH, "state_block": 150},
+            "market_inputs": {"edges": [{
+                "pool": P6, "token_in": WETH, "token_out": A,
+                "fee_bps": 30, "state_block": 150, "state_block_hash": STATE_HASH,
+                "reserve_in": 1000 * 10**18, "reserve_out": 2000 * 10**18}]},
+            "size_and_profit": {"trade_size_amount_in": 10**18,
+                                "gross_quote_profit_wei": 1000},
+        }
+        b.records.append(later)
+        b.write(self.shadow_path)
+        evaluation_path = Path(self.tmp) / "eval.jsonl"
+        (Path(self.tmp) / "cache").mkdir()
+        self.replay.evaluate(self.shadow_path, evaluation_path, str(Path(self.tmp) / "cache"),
+                             chain_id=1, catchup_window=1000, rerun=False)
+        r = list(_evals_by_fp_open_seq(evaluation_path).values())[0]
+        self.assertEqual(r["outcome"], self.replay.OUTCOME_MISSING)
+        self.assertIn("version", r["reason"])
+        self.assertIn(f"{P6.lower()} {WETH}->{A}", r["reason"])
+        self.assertIsNone(r["recomputed_gross_profit_wei"])
+        self.assertEqual(r["route_leg_affected"]["pool"], P6.lower())
+        self.assertEqual(r["route_leg_affected"]["later_state_block"], 150)
 
     def test_replay_evaluates_distinct_lifecycles_separately(self):
         """R1 §8: two OPEN lifecycles of the same fingerprint are TWO
@@ -1000,7 +1242,7 @@ class TestOfflineReplay(RecorderTestBase, _ReplayTestMixin):
         self.assertEqual(r["lifecycle"]["open_evidence"], "outside_recorded_history")
         self.assertEqual(r["outcome"], self.replay.OUTCOME_MISSING,
                          "no later state after the orphan snapshot → declared, not inferred")
-        self.assertIn("no later state", r["reason"])
+        self.assertIn("no coherent common anchor", r["reason"])
 
 
 class TestAggregatesAndEvidence(RecorderTestBase, _ReplayTestMixin):

@@ -337,96 +337,85 @@ def _cache_entry_directed(graph, pool: str, token_in: str, token_out: str) -> Op
 def resolve_later_states(legs: list, detected_block: int, timeline: dict,
                          graph, cache_state_block,
                          window: int = DEFAULT_CATCHUP_WINDOW) -> tuple:
-    """Resolve ONE COHERENT later-state snapshot for the route's EXACT ordered
-    legs (R1 §2 + §4). Every leg must be satisfied by its direction-specific
-    state; an explicit COMMON ANCHOR is resolved and EVERY selected state —
-    recorded OR warmed-cache — must be (a) later than the detection block and
-    (b) within ``window`` blocks of the anchor. A graph-wide maximum block
-    never establishes freshness for an individual pool.
+    """Resolve ONE COHERENT COMMON ANCHOR for the route's EXACT ordered legs
+    (R1 §2 + §4, R2 §1). Candidate anchors come ONLY from the route's OWN
+    directed-leg observations — recorded direction-specific entries and
+    exact-direction warmed-cache states — never from unrelated pools and
+    never from the graph-wide maximum cache block (``cache_state_block`` is
+    accepted for reporting compatibility only; it plays NO role in
+    eligibility).
 
-    Resolution order:
-    1. exact coherent recorded snapshot — the LATEST block where EVERY leg has
-       a recorded direction-specific observation AT that block;
-    2. windowed coherent recorded snapshot — the latest anchor where every leg
-       has a recorded observation within the runtime's own catch-up window
-       below the anchor (cache fallback per leg allowed under the same rule);
-    3. coherent cache-only fallback — every leg resolved from the warmed cache
-       (MI-102A TVL restore), anchored at the MAXIMUM of the legs' OWN cache
-       state blocks, each later than detection and inside the window.
+    A candidate anchor satisfies the route when EVERY leg has an eligible
+    state with::
+
+        state_block >  detected_block
+        state_block <= common_anchor
+        0 <= common_anchor - state_block <= catchup_window   # non-negative lag
+
+    The HIGHEST satisfying anchor is chosen and each leg is resolved with its
+    LATEST eligible state at or below that anchor — a state newer than the
+    anchor can never be selected (lag is non-negative by construction). If no
+    candidate anchor satisfies every leg, the candidate is not evaluable and
+    the affected leg(s) and reasons are reported. Chain isolation and
+    direction-specific edge selection are preserved (legs are exact
+    (pool, token_in, token_out) keys; the cache lookup is direction-exact).
 
     Returns (resolved: {leg_index: entry}, reason: str | None, anchor: int | None).
-    Each entry carries ``state_lag_from_anchor``.
+    Each entry carries ``state_lag_from_anchor`` >= 0.
     """
-    leg_entries = []
+    leg_observations = []
     for (pool, tin, tout) in legs:
-        entries = sorted(
+        obs = sorted(
             (e for k, e in (timeline.get(str(pool).lower()) or {}).items()
              if k[2] == tin and k[3] == tout and e["block"] > detected_block),
             key=lambda e: (e["block"], e.get("block_hash") or ""))
-        leg_entries.append(entries)
+        ce = _cache_entry_directed(graph, pool, tin, tout)
+        if ce is not None:
+            obs = obs + [ce]
+        leg_observations.append(obs)
 
     def _lagged(i: int, entry: dict, anchor: int) -> dict:
         e = dict(entry)
-        e["state_lag_from_anchor"] = anchor - e["block"]
+        e["state_lag_from_anchor"] = anchor - e["block"]  # >= 0 by eligibility
         return e
 
-    def _pick(anchor: int):
+    def _resolve_at(anchor: int):
         resolved = {}
-        for i, (pool, tin, tout) in enumerate(legs):
-            cand = [e for e in leg_entries[i]
-                    if e["block"] <= anchor and anchor - e["block"] <= window]
-            if cand:
-                resolved[i] = _lagged(i, cand[-1], anchor)
-                continue
-            # cache fallback for this leg — same common-anchor discipline:
-            # the pool's OWN cache state must be later than detection and
-            # within the window of the anchor (R1 §4).
-            if cache_state_block and abs(anchor - cache_state_block) <= window:
-                ce = _cache_entry_directed(graph, pool, tin, tout)
-                if ce and ce["block"] > detected_block \
-                        and anchor - ce["block"] <= window:
-                    resolved[i] = _lagged(i, ce, anchor)
-                    continue
-            return None
+        for i, obs in enumerate(leg_observations):
+            elig = [e for e in obs
+                    if e["block"] > detected_block
+                    and e["block"] <= anchor
+                    and 0 <= anchor - e["block"] <= window]
+            if not elig:
+                return None
+            resolved[i] = _lagged(i, elig[-1], anchor)  # latest eligible <= anchor
         return resolved
 
-    anchors = sorted({e["block"] for entries in leg_entries for e in entries},
-                     reverse=True)
-    for anchor in anchors:
-        if all(any(e["block"] == anchor for e in leg_entries[i])
-               for i in range(len(legs))):
-            resolved = {}
-            for i in range(len(legs)):
-                exact = [e for e in leg_entries[i] if e["block"] == anchor][-1]
-                resolved[i] = _lagged(i, exact, anchor)
-            return resolved, None, anchor
-        resolved = _pick(anchor)
+    for anchor in sorted({e["block"] for obs in leg_observations for e in obs},
+                         reverse=True):
+        resolved = _resolve_at(anchor)
         if resolved is not None:
             return resolved, None, anchor
 
-    # coherent cache-only fallback (no recorded later snapshot at all):
-    # anchor = the MAXIMUM of the legs' OWN cache state blocks — never a
-    # graph-wide maximum (R1 §4).
-    cache_cands = []
-    for (pool, tin, tout) in legs:
-        ce = _cache_entry_directed(graph, pool, tin, tout)
-        if not ce:
-            return {}, (f"coherent cache fallback failed: the warmed cache has no "
-                        f"state for the exact directed leg {pool} {tin}->{tout}; the "
-                        "reverse direction or an unrelated pool edge is never "
-                        "substituted"), None
-        cache_cands.append(ce)
-    anchor = max(e["block"] for e in cache_cands)
-    stale = [f"{legs[i][0]} {legs[i][1]}->{legs[i][2]} (state block {e['block']})"
-             for i, e in enumerate(cache_cands)
-             if e["block"] <= detected_block or anchor - e["block"] > window]
-    if stale:
-        return {}, ("coherent cache fallback rejected by the common-anchor rule: "
-                    + "; ".join(stale)
-                    + f" (detection block {detected_block}, anchor {anchor}, "
-                      f"window {window})"), anchor
-    resolved = {i: _lagged(i, e, anchor) for i, e in enumerate(cache_cands)}
-    return resolved, None, anchor
+    # No candidate anchor satisfies every leg: name the affected leg(s).
+    affected = []
+    for i, (pool, tin, tout) in enumerate(legs):
+        blocks = sorted({e["block"] for e in leg_observations[i]})
+        if not blocks:
+            why = ("no exact-direction recorded or warmed-cache state later than "
+                   "detection; the reverse direction or an unrelated pool edge is "
+                   "never substituted")
+        elif all(b <= detected_block for b in blocks):
+            why = (f"its exact-direction state block(s) {blocks} are not later than "
+                   f"the detection block {detected_block}")
+        else:
+            why = (f"its exact-direction state block(s) {blocks} cannot share a "
+                   f"common anchor with the other legs' states within the "
+                   f"{window}-block window")
+        affected.append(f"leg {i} {pool} {tin}->{tout}: {why}")
+    return {}, ("no coherent common anchor satisfies every route leg "
+                f"(detection block {detected_block}, catchup window {window}); "
+                "affected: " + "; ".join(affected)), None
 
 
 def detect_reorg_evidence(det_record: dict, involved_pools: list, timeline: dict,
@@ -486,9 +475,13 @@ def recompute_route_profit(amount_in, legs: list, resolved: dict) -> dict:
     """Recompute the route profit at the later state over EXACTLY the ordered
     route legs (R1 §2): one leg per hop, exact direction, evaluated exactly
     once per pool. A missing directed edge makes the candidate not evaluable —
-    the reverse direction or an unrelated pool edge is never substituted. V3
-    legs stay explicitly not-evaluable (no concentrated-liquidity
-    approximation)."""
+    the reverse direction or an unrelated pool edge is never substituted.
+    Pool versions FAIL CLOSED (R2 §2): only an explicit version 2 permits the
+    constant-product calculation; an explicit V3 keeps the not-evaluable
+    classification (the offline concentrated-liquidity quoter is unavailable);
+    a missing, null, zero, malformed or otherwise unknown version is NEVER
+    defaulted to V2 — the leg is declared not evaluable with an explicit
+    unknown/unavailable-version reason and no profitability value."""
     if amount_in is None or int(amount_in) <= 0:
         return {"evaluable": False, "profit_wei": None,
                 "reason": "no recorded trade size; profitability not inferred from missing data",
@@ -503,21 +496,56 @@ def recompute_route_profit(amount_in, legs: list, resolved: dict) -> dict:
                                f"{pool} {tin}->{tout}; the exact directed edge is "
                                "required and the reverse direction or an unrelated "
                                "pool edge is never substituted"),
-                    "legs": leg_evidence}
+                    "legs": leg_evidence,
+                    "affected_leg": {"leg": i, "pool": pool, "token_in": tin,
+                                     "token_out": tout}}
         le = later["edge"]
-        version = int(le.get("version") or 2)
+        raw_version = le.get("version")
+        try:
+            version = int(raw_version)
+        except (TypeError, ValueError):
+            version = None
+        if raw_version is None or raw_version == "" or raw_version == 0 or version is None:
+            return {"evaluable": False, "profit_wei": None,
+                    "reason": (f"pool version for directed route leg {i} "
+                               f"{pool} {tin}->{tout} is {raw_version!r} (missing, null, "
+                               "zero, malformed or otherwise unknown); the leg is never "
+                               "defaulted to constant-product V2 and no profitability "
+                               "is fabricated"),
+                    "legs": leg_evidence,
+                    "affected_leg": {"leg": i, "pool": pool, "token_in": tin,
+                                     "token_out": tout,
+                                     "later_state_block": later["block"]}}
+        if version == 3:
+            return {"evaluable": False, "profit_wei": None,
+                    "reason": (f"directed route leg {i} {pool} {tin}->{tout} is V3 and "
+                               "requires the on-chain quoter; offline recompute is not "
+                               "attempted rather than approximating concentrated-"
+                               "liquidity mathematics"),
+                    "legs": leg_evidence,
+                    "affected_leg": {"leg": i, "pool": pool, "token_in": tin,
+                                     "token_out": tout,
+                                     "later_state_block": later["block"]}}
         if version != 2:
             return {"evaluable": False, "profit_wei": None,
-                    "reason": ("V3 leg requires the on-chain quoter; offline recompute is "
-                               "not attempted rather than approximating "
-                               "concentrated-liquidity mathematics"),
-                    "legs": leg_evidence}
+                    "reason": (f"pool version for directed route leg {i} "
+                               f"{pool} {tin}->{tout} is {raw_version!r}, which is not a "
+                               "known constant-product V2 or quoter-backed V3 version; the "
+                               "leg is never defaulted to V2 and no profitability is "
+                               "fabricated"),
+                    "legs": leg_evidence,
+                    "affected_leg": {"leg": i, "pool": pool, "token_in": tin,
+                                     "token_out": tout,
+                                     "later_state_block": later["block"]}}
         r_in, r_out = le.get("reserve_in"), le.get("reserve_out")
         if not r_in or not r_out:
             return {"evaluable": False, "profit_wei": None,
                     "reason": (f"later state for directed leg {i} "
                                f"{pool} {tin}->{tout} lacks reserves"),
-                    "legs": leg_evidence}
+                    "legs": leg_evidence,
+                    "affected_leg": {"leg": i, "pool": pool, "token_in": tin,
+                                     "token_out": tout,
+                                     "later_state_block": later["block"]}}
         amt = _v2_amount_out(amt, int(r_in), int(r_out), le.get("fee_bps"))
         leg_evidence.append({
             "leg": i,
@@ -735,7 +763,8 @@ def _evaluate_impl(shadow_path: Path, evaluation_path: Path, cache_dir: str,
                                "recomputed_gross_profit_wei": None,
                                "state_lag_blocks": None,
                                "beyond_catchup_window": False,
-                               "route_legs": recompute["legs"] or None})
+                               "route_legs": recompute["legs"] or None,
+                               "route_leg_affected": recompute.get("affected_leg")})
             else:
                 lag = (anchor - det_block) if anchor is not None else None
                 rec_profit = (det.get("size_and_profit") or {}).get("gross_quote_profit_wei")

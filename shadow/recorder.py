@@ -131,10 +131,12 @@ class ShadowRecorder:
         the historical file and no whole-file buffer is retained. Handles an
         empty file, a final line without a trailing newline, malformed lines
         (skipped by the parse loop) and files with fewer records than
-        requested. When the backward scan stops at a chunk boundary mid-line,
-        the leading partial line is dropped: it belongs to a record older
-        than the requested window, and the +1 newline slack keeps the
-        requested line count complete."""
+        requested. The configured line limit applies to the small-file path
+        as well as the backward-seeking path, and ``tail_scan_lines=0``
+        reconstructs nothing (R2 §3A). When the backward scan stops at a
+        chunk boundary mid-line, the leading partial line is dropped: it
+        belongs to a record older than the requested window, and the +1
+        newline slack keeps the requested line count complete."""
         try:
             if not self.path.exists():
                 return []
@@ -142,10 +144,15 @@ class ShadowRecorder:
             if size <= 0:
                 return []
             max_lines = max(0, int(tail_scan_lines))
+            if max_lines == 0:
+                return []  # configured to scan nothing — reconstruct nothing
             with open(self.path, "rb") as f:
                 if size <= self._TAIL_CHUNK_BYTES:
                     self.stats["restart_scan_bytes_read"] += size
-                    return f.read().decode("utf-8", errors="replace").split("\n")
+                    lines = f.read().decode("utf-8", errors="replace").split("\n")
+                    if len(lines) > max_lines:
+                        lines = lines[-max_lines:]  # R2 §3A: the limit applies here too
+                    return lines
                 needed = max_lines + 1  # slack for the boundary-partial line
                 buf = b""
                 pos = size
@@ -179,7 +186,9 @@ class ShadowRecorder:
         count and matched status are NOT retained (R1 §6A). Lifecycles opened
         BEFORE the scanned window are continued with ``open_seq=None`` (the
         OPEN record itself is outside the scan) — still continued, never
-        duplicated, without fabricating the missing opening evidence."""
+        duplicated, without fabricating the missing opening evidence; an
+        orphan UPDATE that starts such a reconstructed lifecycle is counted
+        as its first update (R2 §3B)."""
         try:
             lines = self._read_tail_lines(tail_scan_lines)
             for line in lines:
@@ -228,10 +237,17 @@ class ShadowRecorder:
                         # belongs to a PREVIOUS session: an OPEN seen in the
                         # tail opens it with its seq; an UPDATE without a seen
                         # OPEN continues one opened before the scanned window
-                        # (open_seq unknown). Both are continuations.
+                        # (open_seq unknown). Both are continuations. R2 §3B:
+                        # the INITIAL orphan UPDATE belongs to the
+                        # reconstructed lifecycle and is counted as its first
+                        # update; subsequent UPDATEs keep counting (the else
+                        # branch below). open_seq stays None — the honest
+                        # outside-recorded-history classification.
                         open_seq = int(rec.get("seq") or 0) if event == "OPEN" else None
-                        self._lifecycles[fp] = _LifecycleState(open_seq, open=True,
-                                                               continued=True)
+                        fresh = _LifecycleState(open_seq, open=True, continued=True)
+                        if event == "UPDATE":
+                            fresh.updates = 1
+                        self._lifecycles[fp] = fresh
                         self.stats["restart_continued_lifecycles"] += 1
                     else:
                         st.open = True

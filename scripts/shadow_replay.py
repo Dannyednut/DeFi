@@ -352,26 +352,46 @@ def resolve_later_states(legs: list, detected_block: int, timeline: dict,
         state_block <= common_anchor
         0 <= common_anchor - state_block <= catchup_window   # non-negative lag
 
-    The HIGHEST satisfying anchor is chosen and each leg is resolved with its
-    LATEST eligible state at or below that anchor — a state newer than the
-    anchor can never be selected (lag is non-negative by construction). If no
-    candidate anchor satisfies every leg, the candidate is not evaluable and
-    the affected leg(s) and reasons are reported. Chain isolation and
-    direction-specific edge selection are preserved (legs are exact
-    (pool, token_in, token_out) keys; the cache lookup is direction-exact).
+    For each leg the recorded and exact-direction warmed-cache observations
+    are MERGED into one deterministically ordered list — chronological by
+    state block, with equal blocks tie-broken recorded-before-cache and then
+    by block hash (R3 §1) — and the HIGHEST satisfying anchor is chosen with
+    each leg resolved by the observation with the GREATEST eligible state
+    block at or below that anchor: a stale cache observation can never
+    replace a newer recorded state merely because it was appended last, and
+    a state newer than the anchor can never be selected (lag is non-negative
+    by construction). Same-block observations with distinct non-null hashes
+    are conflicting state evidence: that block is never silently selected as
+    equivalent state — a lower anchor that does not rely on it may still
+    coherently satisfy the route, otherwise the conflict is named in the
+    failure reason. If no candidate anchor satisfies every leg, the candidate
+    is not evaluable and the affected leg(s) and reasons are reported. Chain
+    isolation and direction-specific edge selection are preserved (legs are
+    exact (pool, token_in, token_out) keys; the cache lookup is
+    direction-exact; unrelated pools never participate).
 
-    Returns (resolved: {leg_index: entry}, reason: str | None, anchor: int | None).
-    Each entry carries ``state_lag_from_anchor`` >= 0.
+    Returns (resolved: {leg_index: entry}, reason: str | None,
+    anchor: int | None, hash_conflicts: list) — ``hash_conflicts`` reports
+    the same-block conflicting-hash evidence encountered at anchors above the
+    selected one, if any. Each entry carries ``state_lag_from_anchor`` >= 0.
     """
     leg_observations = []
     for (pool, tin, tout) in legs:
-        obs = sorted(
-            (e for k, e in (timeline.get(str(pool).lower()) or {}).items()
-             if k[2] == tin and k[3] == tout and e["block"] > detected_block),
-            key=lambda e: (e["block"], e.get("block_hash") or ""))
+        recorded = [e for k, e in (timeline.get(str(pool).lower()) or {}).items()
+                    if k[2] == tin and k[3] == tout and e["block"] > detected_block]
         ce = _cache_entry_directed(graph, pool, tin, tout)
-        if ce is not None:
-            obs = obs + [ce]
+        # R3 §1: MERGE the recorded and exact-direction warmed-cache
+        # observations FIRST, then order the combined list deterministically
+        # by state block. The cache observation is never merely appended
+        # after the sorted recorded entries: appending it last made the
+        # "latest eligible" selection pick stale cache reserves even when a
+        # newer recorded state existed for the exact same leg. Equal blocks
+        # tie-break deterministically: recorded evidence before warmed-cache
+        # evidence, then by block hash.
+        obs = sorted(recorded + ([ce] if ce is not None else []),
+                     key=lambda e: (e["block"],
+                                    0 if e.get("source") == "recorded" else 1,
+                                    e.get("block_hash") or ""))
         leg_observations.append(obs)
 
     def _lagged(i: int, entry: dict, anchor: int) -> dict:
@@ -380,6 +400,10 @@ def resolve_later_states(legs: list, detected_block: int, timeline: dict,
         return e
 
     def _resolve_at(anchor: int):
+        """Select, per leg, the observation with the GREATEST eligible state
+        block at or below ``anchor`` from the deterministically ordered
+        combined observations. Returns (resolved, conflict) where ``conflict``
+        names a same-block hash conflict that made the block unusable."""
         resolved = {}
         for i, obs in enumerate(leg_observations):
             elig = [e for e in obs
@@ -387,15 +411,45 @@ def resolve_later_states(legs: list, detected_block: int, timeline: dict,
                     and e["block"] <= anchor
                     and 0 <= anchor - e["block"] <= window]
             if not elig:
-                return None
-            resolved[i] = _lagged(i, elig[-1], anchor)  # latest eligible <= anchor
-        return resolved
+                return None, None
+            best_block = elig[-1]["block"]  # ordered → the greatest eligible block
+            at_best = [e for e in elig if e["block"] == best_block]
+            # R3 §1: deterministic same-block handling. Distinct non-null
+            # block hashes for the SAME (pool, direction, block) are
+            # conflicting state evidence — they are never silently treated
+            # as equivalent state, and that block is never selected.
+            hashes = sorted({e.get("block_hash") for e in at_best
+                             if e.get("block_hash")})
+            if len(hashes) > 1:
+                return None, (i, best_block, hashes,
+                              sorted({str(e.get("source") or "unknown")
+                                      for e in at_best}))
+            # Equivalent observations (compatible hashes): the deterministic
+            # order already puts recorded evidence before warmed-cache
+            # evidence at the same block.
+            resolved[i] = _lagged(i, at_best[0], anchor)
+        return resolved, None
 
+    conflict_by_leg = {}
+    hash_conflicts = []
     for anchor in sorted({e["block"] for obs in leg_observations for e in obs},
                          reverse=True):
-        resolved = _resolve_at(anchor)
+        resolved, conflict = _resolve_at(anchor)
+        if conflict is not None:
+            ci, cblock, chashes, csources = conflict
+            conflict_by_leg.setdefault(ci, (cblock, chashes, csources))
+            if not any(c["leg"] == ci and c["block"] == cblock
+                       for c in hash_conflicts):
+                hash_conflicts.append({
+                    "leg": ci, "pool": legs[ci][0], "token_in": legs[ci][1],
+                    "token_out": legs[ci][2], "block": cblock,
+                    "observed_hashes": chashes, "sources": csources,
+                })
+            # the conflicted block is never silently selected; a LOWER anchor
+            # that does not rely on it may still coherently satisfy the route
+            continue
         if resolved is not None:
-            return resolved, None, anchor
+            return resolved, None, anchor, hash_conflicts
 
     # No candidate anchor satisfies every leg: name the affected leg(s).
     affected = []
@@ -412,10 +466,16 @@ def resolve_later_states(legs: list, detected_block: int, timeline: dict,
             why = (f"its exact-direction state block(s) {blocks} cannot share a "
                    f"common anchor with the other legs' states within the "
                    f"{window}-block window")
+        if i in conflict_by_leg:
+            cblock, chashes, csources = conflict_by_leg[i]
+            why += (f"; conflicting state-hash evidence at block {cblock} "
+                    f"({', '.join(csources)} sources, hashes {chashes}) — the "
+                    "observations are NOT equivalent state and the block is never "
+                    "silently selected")
         affected.append(f"leg {i} {pool} {tin}->{tout}: {why}")
     return {}, ("no coherent common anchor satisfies every route leg "
                 f"(detection block {detected_block}, catchup window {window}); "
-                "affected: " + "; ".join(affected)), None
+                "affected: " + "; ".join(affected)), None, hash_conflicts
 
 
 def detect_reorg_evidence(det_record: dict, involved_pools: list, timeline: dict,
@@ -476,12 +536,19 @@ def recompute_route_profit(amount_in, legs: list, resolved: dict) -> dict:
     route legs (R1 §2): one leg per hop, exact direction, evaluated exactly
     once per pool. A missing directed edge makes the candidate not evaluable —
     the reverse direction or an unrelated pool edge is never substituted.
-    Pool versions FAIL CLOSED (R2 §2): only an explicit version 2 permits the
-    constant-product calculation; an explicit V3 keeps the not-evaluable
-    classification (the offline concentrated-liquidity quoter is unavailable);
-    a missing, null, zero, malformed or otherwise unknown version is NEVER
-    defaulted to V2 — the leg is declared not evaluable with an explicit
-    unknown/unavailable-version reason and no profitability value."""
+    Pool versions FAIL CLOSED under a STRICT INTEGER schema (R2 §2, R3 §2):
+    only an explicit integer version 2 permits the constant-product
+    calculation, and an explicit integer version 3 only returns the existing
+    V3 not-evaluable classification. Booleans, floats (including 2.0 and
+    non-integral values such as 2.5), strings, null, zero, malformed values
+    and unsupported integer versions are NEVER defaulted or coerced into a
+    supported version — integer coercion is forbidden, so ``2.5`` and
+    ``"2"`` cannot become V2. The native representations are already
+    integral everywhere they are produced (``GraphEdge.version`` is a
+    declared ``int``; the shadow detection records and the PoolCache
+    serialize it as a JSON integer), so nothing legitimate requires
+    coercion. Unknown/unavailable versions carry no profitability value and
+    retain the affected leg with its exact pool, direction and raw version."""
     if amount_in is None or int(amount_in) <= 0:
         return {"evaluable": False, "profit_wei": None,
                 "reason": "no recorded trade size; profitability not inferred from missing data",
@@ -501,21 +568,10 @@ def recompute_route_profit(amount_in, legs: list, resolved: dict) -> dict:
                                      "token_out": tout}}
         le = later["edge"]
         raw_version = le.get("version")
-        try:
-            version = int(raw_version)
-        except (TypeError, ValueError):
-            version = None
-        if raw_version is None or raw_version == "" or raw_version == 0 or version is None:
-            return {"evaluable": False, "profit_wei": None,
-                    "reason": (f"pool version for directed route leg {i} "
-                               f"{pool} {tin}->{tout} is {raw_version!r} (missing, null, "
-                               "zero, malformed or otherwise unknown); the leg is never "
-                               "defaulted to constant-product V2 and no profitability "
-                               "is fabricated"),
-                    "legs": leg_evidence,
-                    "affected_leg": {"leg": i, "pool": pool, "token_in": tin,
-                                     "token_out": tout,
-                                     "later_state_block": later["block"]}}
+        # R3 §2: STRICT integer schema — no integer coercion. ``bool`` is a
+        # subclass of ``int`` in Python and is explicitly excluded.
+        version = raw_version if isinstance(raw_version, int) \
+            and not isinstance(raw_version, bool) else None
         if version == 3:
             return {"evaluable": False, "profit_wei": None,
                     "reason": (f"directed route leg {i} {pool} {tin}->{tout} is V3 and "
@@ -524,18 +580,19 @@ def recompute_route_profit(amount_in, legs: list, resolved: dict) -> dict:
                                "liquidity mathematics"),
                     "legs": leg_evidence,
                     "affected_leg": {"leg": i, "pool": pool, "token_in": tin,
-                                     "token_out": tout,
+                                     "token_out": tout, "raw_version": raw_version,
                                      "later_state_block": later["block"]}}
         if version != 2:
             return {"evaluable": False, "profit_wei": None,
                     "reason": (f"pool version for directed route leg {i} "
-                               f"{pool} {tin}->{tout} is {raw_version!r}, which is not a "
-                               "known constant-product V2 or quoter-backed V3 version; the "
-                               "leg is never defaulted to V2 and no profitability is "
-                               "fabricated"),
+                               f"{pool} {tin}->{tout} is {raw_version!r} (missing, null, "
+                               "zero, boolean, non-integral numeric, string, malformed or "
+                               "otherwise unsupported under the strict integer version "
+                               "schema); the leg is never defaulted or coerced to "
+                               "constant-product V2 and no profitability is fabricated"),
                     "legs": leg_evidence,
                     "affected_leg": {"leg": i, "pool": pool, "token_in": tin,
-                                     "token_out": tout,
+                                     "token_out": tout, "raw_version": raw_version,
                                      "later_state_block": later["block"]}}
         r_in, r_out = le.get("reserve_in"), le.get("reserve_out")
         if not r_in or not r_out:
@@ -716,9 +773,9 @@ def _evaluate_impl(shadow_path: Path, evaluation_path: Path, cache_dir: str,
         legs = route_legs(det)
         amount_in = (det.get("size_and_profit") or {}).get("trade_size_amount_in")
 
-        later, resolve_reason, anchor = ({}, None, None)
+        later, resolve_reason, anchor, hash_conflicts = ({}, None, None, [])
         if legs is not None:
-            later, resolve_reason, anchor = resolve_later_states(
+            later, resolve_reason, anchor, hash_conflicts = resolve_later_states(
                 legs, det_block, timeline, graph, cache_state_block, catchup_window)
         relevant_blocks = {det_block} | {e["block"] for e in later.values()}
         if (det.get("detection") or {}).get("state_block") is not None:
@@ -737,6 +794,7 @@ def _evaluate_impl(shadow_path: Path, evaluation_path: Path, cache_dir: str,
             "later_state_hashes": {
                 f"{legs[i][0]}:{legs[i][1]}->{legs[i][2]}": e.get("block_hash")
                 for i, e in later.items() if e.get("block_hash")} if legs is not None else None,
+            "state_hash_conflicts": hash_conflicts or None,
         })
 
         if reorg["invalidated"]:

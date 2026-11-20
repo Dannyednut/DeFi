@@ -1119,12 +1119,239 @@ class TestOfflineReplay(RecorderTestBase, _ReplayTestMixin):
         self.assertIn("common anchor", r["reason"])
         self.assertIsNone(r["recomputed_gross_profit_wei"])
 
+    def test_latest_state_selection_prefers_newer_recorded_over_older_cache(self):
+        """R3 §1 cases 1+4: a route leg RECORDED at block 150 with an
+        exact-direction warmed-cache observation at block 120 — the resolver
+        merges the observations, orders them chronologically and selects the
+        genuinely latest eligible state (recorded@150); the stale cache
+        observation can never replace it, and the recomputed profit equals
+        the independent constant-product calculation over the SELECTED
+        states' reserves (deliberately different at the competing blocks)."""
+        b = _ShadowLogBuilder()
+        b.det("n" * 16, [PA, PB], [WETH, A, WETH], 100, 100,
+              [(10**18, 2 * 10**18), (2 * 10**18, int(1.9 * 10**18))])
+        # later snapshot RECORDED for leg 0 (PA WETH→A) at block 150 with
+        # distinctive reserves; leg 1 (PB A→WETH) has no recorded later state
+        b.seq += 1
+        b.records.append({
+            "record_type": "detection", "event": "UPDATE", "schema_version": 1,
+            "seq": b.seq, "session": {"session_id": "fixture"}, "recorded_at_unix": 1.0,
+            "fingerprint": "n" * 16,
+            "identity": {"chain_id": 1, "origin": "block", "pool_addresses": [PA, PB],
+                         "ordered_token_path": [WETH, A, WETH]},
+            "detection": {"block_number": 150, "block_hash": STATE_HASH,
+                          "state_block": 150},
+            "market_inputs": {"edges": [{
+                "pool": PA, "token_in": WETH, "token_out": A, "version": 2,
+                "fee_bps": 30, "state_block": 150, "state_block_hash": STATE_HASH,
+                "reserve_in": 1000 * 10**18, "reserve_out": 2000 * 10**18}]},
+            "size_and_profit": {"trade_size_amount_in": 10**18,
+                                "gross_quote_profit_wei": 1000},
+        })
+        b.write(self.shadow_path)
+        # a STALE exact-direction cache observation for the SAME leg at an
+        # older block, with deliberately different reserves
+        cache_dir = self._cache_cycle_fixture({
+            PA: (WETH, A, 1500 * 10**18, 3000 * 10**18, 120),
+            PB: (WETH, A, 1900 * 10**18, 2000 * 10**18, 150),
+        })
+        evaluation_path = Path(self.tmp) / "eval.jsonl"
+        self.replay.evaluate(self.shadow_path, evaluation_path, str(cache_dir),
+                             chain_id=1, catchup_window=1000, rerun=False)
+        r = list(_evals_by_fp_open_seq(evaluation_path).values())[0]
+        self.assertEqual(r["outcome"], self.replay.OUTCOME_STILL)
+        self.assertEqual(r["common_anchor_block"], 150)
+        self.assertEqual(r["later_state_blocks"][f"{PA.lower()}:{WETH}->{A}"], 150,
+                         "the genuinely latest eligible state (recorded@150) is "
+                         "selected, not the stale cache observation")
+        self.assertEqual(r["later_state_blocks"][f"{PB.lower()}:{A}->{WETH}"], 150)
+        lags = r["later_state_lag_from_anchor"]
+        self.assertEqual(lags[f"{PA.lower()}:{WETH}->{A}"], 0)
+        self.assertEqual(lags[f"{PB.lower()}:{A}->{WETH}"], 0)
+        self.assertTrue(all(v >= 0 for v in lags.values()))
+        legs_ev = r["recompute_legs"]
+        self.assertEqual(legs_ev[0]["state_source"], "recorded")
+        self.assertEqual(legs_ev[1]["state_source"], "cache_warm_graph")
+        # independent profitability over the SELECTED reserves
+        out = _indep_v2_out(_indep_v2_out(10**18, 1000 * 10**18, 2000 * 10**18),
+                            2000 * 10**18, 1900 * 10**18)
+        self.assertEqual(r["recomputed_gross_profit_wei"], out - 10**18)
+        # ...and NOT the result the stale cache reserves would produce
+        stale = _indep_v2_out(_indep_v2_out(10**18, 1500 * 10**18, 3000 * 10**18),
+                              2000 * 10**18, 1900 * 10**18)
+        self.assertNotEqual(r["recomputed_gross_profit_wei"], stale - 10**18,
+                            "stale cache reserves must not replace the recorded state")
+
+    def test_multiple_observations_select_latest_eligible(self):
+        """R3 §1 case 3: one route leg carries several recorded observations
+        and an exact-direction cache observation at different blocks — the
+        latest eligible observation at or below the selected anchor is always
+        chosen."""
+        b = _ShadowLogBuilder()
+        b.det("q" * 16, [PA, PB], [WETH, A, WETH], 100, 100,
+              [(10**18, 2 * 10**18), (2 * 10**18, int(1.9 * 10**18))])
+
+        def update(block, edges):
+            b.seq += 1
+            b.records.append({
+                "record_type": "detection", "event": "UPDATE", "schema_version": 1,
+                "seq": b.seq, "session": {"session_id": "fixture"},
+                "recorded_at_unix": 1.0, "fingerprint": "q" * 16,
+                "identity": {"chain_id": 1, "origin": "block",
+                             "pool_addresses": [PA, PB],
+                             "ordered_token_path": [WETH, A, WETH]},
+                "detection": {"block_number": block, "block_hash": STATE_HASH,
+                              "state_block": block},
+                "market_inputs": {"edges": edges},
+                "size_and_profit": {"trade_size_amount_in": 10**18,
+                                    "gross_quote_profit_wei": 1000},
+            })
+
+        update(120, [{"pool": PA, "token_in": WETH, "token_out": A, "version": 2,
+                      "fee_bps": 30, "state_block": 120,
+                      "state_block_hash": STATE_HASH,
+                      "reserve_in": 1100 * 10**18, "reserve_out": 2200 * 10**18}])
+        update(135, [{"pool": PA, "token_in": WETH, "token_out": A, "version": 2,
+                      "fee_bps": 30, "state_block": 135,
+                      "state_block_hash": STATE_HASH,
+                      "reserve_in": 1200 * 10**18, "reserve_out": 2400 * 10**18}])
+        update(150, [{"pool": PB, "token_in": A, "token_out": WETH, "version": 2,
+                      "fee_bps": 30, "state_block": 150,
+                      "state_block_hash": STATE_HASH,
+                      "reserve_in": 2000 * 10**18, "reserve_out": 1900 * 10**18}])
+        b.write(self.shadow_path)
+        cache_dir = self._cache_cycle_fixture({
+            PA: (WETH, A, 1300 * 10**18, 2600 * 10**18, 148),
+        })
+        evaluation_path = Path(self.tmp) / "eval.jsonl"
+        self.replay.evaluate(self.shadow_path, evaluation_path, str(cache_dir),
+                             chain_id=1, catchup_window=1000, rerun=False)
+        r = list(_evals_by_fp_open_seq(evaluation_path).values())[0]
+        self.assertEqual(r["outcome"], self.replay.OUTCOME_STILL)
+        self.assertEqual(r["common_anchor_block"], 150,
+                         "the highest route-own candidate anchor wins")
+        blocks = r["later_state_blocks"]
+        lags = r["later_state_lag_from_anchor"]
+        self.assertEqual(blocks[f"{PA.lower()}:{WETH}->{A}"], 148,
+                         "the cache observation at 148 is the greatest eligible "
+                         "block at or below the anchor — not 135, not 120")
+        self.assertEqual(blocks[f"{PB.lower()}:{A}->{WETH}"], 150)
+        self.assertEqual(lags[f"{PA.lower()}:{WETH}->{A}"], 2)
+        self.assertEqual(lags[f"{PB.lower()}:{A}->{WETH}"], 0)
+        self.assertTrue(all(v >= 0 for v in lags.values()))
+        out = _indep_v2_out(_indep_v2_out(10**18, 1300 * 10**18, 2600 * 10**18),
+                            2000 * 10**18, 1900 * 10**18)
+        self.assertEqual(r["recomputed_gross_profit_wei"], out - 10**18,
+                         "profit uses the selected @148 reserves")
+        older = _indep_v2_out(_indep_v2_out(10**18, 1200 * 10**18, 2400 * 10**18),
+                              2000 * 10**18, 1900 * 10**18)
+        self.assertNotEqual(r["recomputed_gross_profit_wei"], older - 10**18,
+                            "the @135 observation was not selected")
+
+    def test_same_block_recorded_cache_hash_handling(self):
+        """R3 §1 case 5: recorded and cache observations at the SAME block
+        are handled deterministically — equivalent observations (compatible
+        hashes) prefer the recorded evidence; conflicting block hashes are
+        NOT silently treated as equivalent state: the block is never selected
+        and the candidate is declared not evaluable naming the conflict and
+        both hashes."""
+        # (a) equivalent: same block, same hash → the RECORDED entry is used
+        b = _ShadowLogBuilder()
+        b.det("s" * 16, [PA, PB], [WETH, A, WETH], 100, 100,
+              [(10**18, 2 * 10**18), (2 * 10**18, int(1.9 * 10**18))])
+        b.seq += 1
+        b.records.append({
+            "record_type": "detection", "event": "UPDATE", "schema_version": 1,
+            "seq": b.seq, "session": {"session_id": "fixture"},
+            "recorded_at_unix": 1.0, "fingerprint": "s" * 16,
+            "identity": {"chain_id": 1, "origin": "block",
+                         "pool_addresses": [PA, PB],
+                         "ordered_token_path": [WETH, A, WETH]},
+            "detection": {"block_number": 150, "block_hash": STATE_HASH,
+                          "state_block": 150},
+            "market_inputs": {"edges": [{
+                "pool": PA, "token_in": WETH, "token_out": A, "version": 2,
+                "fee_bps": 30, "state_block": 150, "state_block_hash": STATE_HASH,
+                "reserve_in": 1000 * 10**18, "reserve_out": 2000 * 10**18}]},
+            "size_and_profit": {"trade_size_amount_in": 10**18,
+                                "gross_quote_profit_wei": 1000},
+        })
+        b.write(self.shadow_path)
+        cache_dir = self._cache_cycle_fixture({
+            PA: (WETH, A, 1500 * 10**18, 3000 * 10**18, 150),  # same block+hash
+            PB: (WETH, A, 1900 * 10**18, 2000 * 10**18, 150),
+        })
+        evaluation_path = Path(self.tmp) / "eval.jsonl"
+        self.replay.evaluate(self.shadow_path, evaluation_path, str(cache_dir),
+                             chain_id=1, catchup_window=1000, rerun=False)
+        r = list(_evals_by_fp_open_seq(evaluation_path).values())[0]
+        self.assertEqual(r["outcome"], self.replay.OUTCOME_STILL)
+        self.assertEqual(r["recompute_legs"][0]["state_source"], "recorded",
+                         "deterministic preference: recorded evidence over the "
+                         "equivalent same-block cache observation")
+        out = _indep_v2_out(_indep_v2_out(10**18, 1000 * 10**18, 2000 * 10**18),
+                            2000 * 10**18, 1900 * 10**18)
+        self.assertEqual(r["recomputed_gross_profit_wei"], out - 10**18,
+                         "the recorded reserves (not the same-block cache "
+                         "reserves) are used")
+
+        # (b) conflicting: same block, DIFFERENT hashes → never equivalent
+        self.shadow_path.unlink()
+        recorded_hash = "0x" + "aa" * 32
+        b = _ShadowLogBuilder()
+        b.det("t" * 16, [PA, PB], [WETH, A, WETH], 100, 100,
+              [(10**18, 2 * 10**18), (2 * 10**18, int(1.9 * 10**18))])
+        b.seq += 1
+        b.records.append({
+            "record_type": "detection", "event": "UPDATE", "schema_version": 1,
+            "seq": b.seq, "session": {"session_id": "fixture"},
+            "recorded_at_unix": 1.0, "fingerprint": "t" * 16,
+            "identity": {"chain_id": 1, "origin": "block",
+                         "pool_addresses": [PA, PB],
+                         "ordered_token_path": [WETH, A, WETH]},
+            "detection": {"block_number": 150, "block_hash": recorded_hash,
+                          "state_block": 150},
+            "market_inputs": {"edges": [{
+                "pool": PA, "token_in": WETH, "token_out": A, "version": 2,
+                "fee_bps": 30, "state_block": 150,
+                "state_block_hash": recorded_hash,
+                "reserve_in": 1000 * 10**18, "reserve_out": 2000 * 10**18}]},
+            "size_and_profit": {"trade_size_amount_in": 10**18,
+                                "gross_quote_profit_wei": 1000},
+        })
+        b.write(self.shadow_path)
+        cache_dir2 = self._cache_cycle_fixture({
+            PA: (WETH, A, 1500 * 10**18, 3000 * 10**18, 150),  # hash STATE_HASH
+            PB: (WETH, A, 1900 * 10**18, 2000 * 10**18, 150),
+        })
+        evaluation_path2 = Path(self.tmp) / "eval2.jsonl"
+        self.replay.evaluate(self.shadow_path, evaluation_path2, str(cache_dir2),
+                             chain_id=1, catchup_window=1000, rerun=False)
+        r2 = list(_evals_by_fp_open_seq(evaluation_path2).values())[0]
+        self.assertEqual(r2["outcome"], self.replay.OUTCOME_MISSING)
+        self.assertIn("conflicting state-hash evidence", r2["reason"])
+        self.assertIn(recorded_hash, r2["reason"], "the recorded hash is named")
+        self.assertIn(STATE_HASH, r2["reason"], "the cache hash is named")
+        self.assertIn(f"{PA.lower()} {WETH}->{A}", r2["reason"],
+                      "the affected leg is named")
+        self.assertIsNone(r2["recomputed_gross_profit_wei"])
+        conflicts = r2["state_hash_conflicts"]
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["block"], 150)
+        self.assertEqual(conflicts[0]["pool"], PA.lower())
+        self.assertEqual(conflicts[0]["observed_hashes"],
+                         sorted([recorded_hash, STATE_HASH]))
+        self.assertEqual(conflicts[0]["sources"], ["cache_warm_graph", "recorded"])
+
     def test_unknown_pool_version_fails_closed(self):
-        """R2 §2: only an explicit V2 permits the constant-product recompute;
-        an explicit V3 keeps the not-evaluable quoter classification; a
-        missing, null, zero, malformed or otherwise unknown version is NEVER
-        defaulted to V2 — no profitability value, and the evaluation output
-        retains the affected leg and reason."""
+        """R2 §2 + R3 §2: only an explicit INTEGER V2 permits the
+        constant-product recompute; an explicit integer V3 keeps the
+        not-evaluable quoter classification; booleans, floats (including
+        2.0 and non-integral 2.5), strings, null, zero, malformed values and
+        unsupported integer versions are NEVER defaulted or coerced to V2 —
+        no profitability value, and the evaluation output retains the
+        affected leg with its exact pool, direction, raw version and
+        reason."""
         leg = (P6.lower(), WETH, A)
 
         def _resolved(raw_version):
@@ -1135,25 +1362,30 @@ class TestOfflineReplay(RecorderTestBase, _ReplayTestMixin):
             return {0: {"block": 150, "edge": edge, "source": "recorded",
                         "state_lag_from_anchor": 0}}
 
-        # explicit V2 → the independent constant-product calculation passes
+        # explicit integer V2 → the independent constant-product calculation passes
         out = _indep_v2_out(10**18, 1000 * 10**18, 2000 * 10**18)
         rec = self.replay.recompute_route_profit(10**18, [leg], _resolved(2))
         self.assertTrue(rec["evaluable"])
         self.assertEqual(rec["profit_wei"], out - 10**18)
-        # explicit V3 → not evaluable, quoter reason
+        # explicit integer V3 → not evaluable, quoter reason
         rec = self.replay.recompute_route_profit(10**18, [leg], _resolved(3))
         self.assertFalse(rec["evaluable"])
         self.assertIsNone(rec["profit_wei"])
         self.assertIn("quoter", rec["reason"])
         self.assertEqual(rec["affected_leg"]["pool"], P6.lower())
-        # missing / null / zero / malformed / unknown → never defaulted to V2
-        for raw in (..., None, "", 0, "v2", 1, 4, "2.5", True):
+        self.assertEqual(rec["affected_leg"]["raw_version"], 3)
+        # strict matrix: bools, floats (2.0 included), strings, null, zero,
+        # malformed and unsupported integer versions → unknown, never coerced
+        for raw in (..., None, "", 0, "v2", "2", 1, 4, True, False, 2.0, 2.5, "2.5"):
             rec = self.replay.recompute_route_profit(10**18, [leg], _resolved(raw))
             self.assertFalse(rec["evaluable"], f"version {raw!r} must not evaluate")
             self.assertIsNone(rec["profit_wei"])
             self.assertIn("never", rec["reason"])
+            self.assertIn("coerced", rec["reason"])
             self.assertIn("V2", rec["reason"])
             self.assertEqual(rec["affected_leg"]["pool"], P6.lower())
+            self.assertEqual(rec["affected_leg"]["raw_version"],
+                             None if raw is ... else raw)
 
         # end-to-end: the evaluation output retains the affected leg + reason
         b = _ShadowLogBuilder()
@@ -1186,6 +1418,8 @@ class TestOfflineReplay(RecorderTestBase, _ReplayTestMixin):
         self.assertIsNone(r["recomputed_gross_profit_wei"])
         self.assertEqual(r["route_leg_affected"]["pool"], P6.lower())
         self.assertEqual(r["route_leg_affected"]["later_state_block"], 150)
+        self.assertIsNone(r["route_leg_affected"]["raw_version"],
+                          "the missing version is retained as null, never implied")
 
     def test_replay_evaluates_distinct_lifecycles_separately(self):
         """R1 §8: two OPEN lifecycles of the same fingerprint are TWO

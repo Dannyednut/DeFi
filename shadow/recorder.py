@@ -725,6 +725,26 @@ def _default_enabled() -> bool:
     return os.environ.get(ENABLED_ENV, "true").strip().lower() != "false"
 
 
+def describe_startup_state() -> dict:
+    """Startup diagnostic (DSS-WO-MI-104 §3): the recorder's enabled state and
+    effective file path WITHOUT instantiating the lazy singleton — the
+    recorder keeps initializing on the first candidate reaching the recording
+    hook, never at process start. Reports whether a collection file already
+    exists (size only; the historical file is never read here, so the bounded
+    tail-scan behaviour is untouched). No secrets: the returned path is an
+    operator-configured log location, never a credential or endpoint."""
+    path = _default_path()
+    try:
+        existing_bytes = path.stat().st_size
+    except OSError:
+        existing_bytes = None  # no collection file yet
+    return {
+        "enabled": _default_enabled(),
+        "path": str(path),
+        "existing_bytes": existing_bytes,
+    }
+
+
 def get_recorder() -> ShadowRecorder:
     """Lazy process-wide recorder (append-only file under the configured log
     directory; disable with SHADOW_VALIDATION_ENABLED=false)."""

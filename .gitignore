@@ -12,3 +12,13 @@ graph_data.json
 
 # Solidity toolchain (DSS-WO-ENG-002): npm-installed compiler deps
 node_modules/
+
+# DSS-WO-MI-104: shadow-mode collection and offline tooling outputs stay
+# local. Basename patterns match at ANY depth, so a custom LOG_DIR or a
+# custom SHADOW_VALIDATION_PATH / evaluation output location is covered too.
+shadow_validation.jsonl
+shadow_evaluation.jsonl
+shadow_aggregates.json
+shadow_aggregates.csv
+logs/detailed/
+logs/reports/

@@ -491,6 +491,28 @@ def main():
     log.info("=" * 60)
 
     rpc_configs = get_rpc_configs()
+
+    # DSS-WO-MI-104 §3: minimal shadow-recorder startup diagnostic. The
+    # recorder is lazy — it initializes on the first candidate reaching the
+    # recording hook — so a missing or empty log file can NEVER be read as
+    # evidence that no opportunities were found. This one line reveals the
+    # enabled state and the effective file path without instantiating the
+    # recorder and without exposing secrets. Later write failures surface as
+    # "shadow recorder append failed" warnings in this same log.
+    try:
+        from shadow.recorder import describe_startup_state
+        _shadow = describe_startup_state()
+        if _shadow["enabled"]:
+            _extra = (f" (existing collection: {_shadow['existing_bytes']} bytes)"
+                      if _shadow["existing_bytes"] is not None else
+                      " (no collection file yet — it is created on the first "
+                      "recorded candidate)")
+            log.info(f"Shadow validation: ENABLED — file {_shadow['path']}{_extra}")
+        else:
+            log.info("Shadow validation: DISABLED (SHADOW_VALIDATION_ENABLED=false)")
+    except Exception as exc:
+        log.warning(f"Shadow validation startup diagnostic failed: {exc}")
+
     rpc_manager = MultiRPCManager.from_config(rpc_configs)
 
     w3 = rpc_manager.get_failover_web3(ws=False)

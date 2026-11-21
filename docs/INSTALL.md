@@ -125,3 +125,180 @@ pip-tools 7.6.2 on 2026-11-04 (DSS-WO-ENG-001A).
   `npm ci --prefix contracts && python scripts/exec_build.py`
   (`--check` verifies the committed `executor/exec_abi.json` against a fresh
   compilation without writing).
+
+## 8. Shadow-mode collection runbook (DSS-WO-MI-104)
+
+Passive shadow observation only. Every command below uses the EXISTING
+runtime; no execution, signing or submission is involved in this phase.
+The purpose is real, traceable observation — it is not evidence of profit.
+
+### 8.1 Select and verify the chain (do not rely on the default)
+
+`CHAIN_ID` defaults to `1` (Ethereum mainnet) when the variable is absent.
+Configured chains: `1` (Ethereum), `56` (BSC), `137` (Polygon), `8453`
+(Base), `42161` (Arbitrum), `324` (zkSync Era), `11155111` (Sepolia).
+Set it explicitly in the process environment (or `.env`) and verify the
+startup banner line `Chain: <NAME> (id=<CHAIN_ID>)` after starting — the
+banner prints the resolved value, not the raw environment string.
+
+### 8.2 RPC configuration and credential safety
+
+Each chain has built-in `DEFAULT_RPCS` (multi-provider failover, WS+HTTP).
+Overrides (evaluated for the selected `CHAIN_ID` only):
+
+- `RPC_HTTP` — replaces the primary HTTP endpoint.
+- `RPC_WS` — replaces the primary WS endpoint.
+- `ALCHEMY_API_KEY` — used by the built-in Alchemy endpoints (default
+  `demo`; a real key is required for meaningful throughput).
+
+Credentials belong in the process environment or a `.env` file (`*.env` is
+git-ignored). Startup and runtime logs never print RPC URLs or keys; do not
+copy endpoint URLs with embedded keys into tickets, screenshots or commits.
+
+### 8.3 Enable shadow recording explicitly
+
+```bash
+export SHADOW_VALIDATION_ENABLED=true      # default is true; set it explicitly anyway
+export SHADOW_VALIDATION_PATH=             # unset: default is used
+export LOG_DIR=./logs                      # recorder default file: $LOG_DIR/shadow_validation.jsonl
+export CACHE_DIR=./cache
+```
+
+`SHADOW_VALIDATION_PATH` overrides the recorder file path when set. The
+recorder is LAZY: it initializes when the first candidate reaches the
+recording hook, so a missing/empty log is NEVER proof that no opportunities
+exist (see 8.7).
+
+### 8.4 Keep execution disabled explicitly
+
+```bash
+export EXECUTE_ONCHAIN=false
+```
+
+`config.execution_enabled()` reads the real process environment at call
+time; anything other than an explicit `true` is disabled. Enforcement is
+layered, not just the banner: the execution router refuses to arm, the
+executor refuses submission at its boundaries, the signer refuses to sign
+and the relay refuses to broadcast — each re-checks the switch
+independently. The startup line
+`Execution: DISABLED (EXECUTE_ONCHAIN) — monitoring only` confirms it.
+
+### 8.5 Start the monitor
+
+```bash
+python main.py
+```
+
+Startup output confirms readiness in this order: the chain banner (8.1);
+`Shadow validation: ENABLED — file <path>` (or `DISABLED` if so
+configured); `Connected via multi-RPC manager | failover enabled with <N>
+providers`; `Latest block: <n>` (live RPC reachable); `Price oracle
+ready`; `Bootstrapping graph...`; `<N> detectors active: [...]`;
+`Canonical OpportunityEngine ready`; `Execution: DISABLED
+(EXECUTE_ONCHAIN) — monitoring only`; `Execution router ready`; `Mempool
+pipeline ready`; `Pool crawler ready`; then per-block `[BLOCK] ...`
+lines.
+
+### 8.6 Stop cleanly
+
+Send `SIGINT`/`SIGTERM` (Ctrl-C once). The handler drains the crawler and
+mempool pipeline, stops the execution router, flushes log file handles and
+saves the pool cache, ending with `Shutdown complete ✓`. Shadow evidence
+is append-only; a clean stop loses nothing.
+
+### 8.7 Locate outputs and interpret the shadow log
+
+- Shadow detection log: `$LOG_DIR/shadow_validation.jsonl`
+  (or `$SHADOW_VALIDATION_PATH`).
+- Runtime text log + per-opportunity JSONL: under `$LOG_DIR`
+  (`<opp_type>.jsonl`, `detailed/`, `executions.jsonl`, `reports/`).
+- Pool cache: `$CACHE_DIR`.
+
+Recorder states — how to distinguish them:
+
+| State | Observable signature |
+|---|---|
+| Recorder disabled | Startup line `Shadow validation: DISABLED (SHADOW_VALIDATION_ENABLED=false)` |
+| Enabled, no candidate reached the hook | Startup line `Shadow validation: ENABLED — file <path> (no collection file yet …)`; no file on disk. This is NOT a zero-candidate result |
+| Candidates recorded | File exists and grows; detection records have monotone `seq` |
+| Initialization / write failure | `shadow recorder ...` / `shadow recorder append failed` warnings in the runtime log; `append_failures` counter on the recorder |
+| Runtime not actually running | No process; no new `recorded_at_unix` values; no `[BLOCK]` lines |
+
+### 8.8 Replay and aggregate the captured collection (explicit paths)
+
+The offline CLIs default to RELATIVE `logs/...` paths, so `--shadow-log`
+must ALWAYS be passed explicitly so the tools read the same collection the
+monitor wrote. The monitor's recorder resolves its effective collection
+path itself: `SHADOW_VALIDATION_PATH` when set to a non-empty value,
+otherwise `$LOG_DIR/shadow_validation.jsonl` (the override takes
+precedence over the default). Resolve it ONCE with the same precedence —
+unset OR empty `SHADOW_VALIDATION_PATH` falls back to the default:
+
+```bash
+SHADOW_LOG="${SHADOW_VALIDATION_PATH:-$LOG_DIR/shadow_validation.jsonl}"
+
+python scripts/shadow_replay.py \
+    --shadow-log "$SHADOW_LOG" \
+    --evaluation-log "$LOG_DIR/shadow_evaluation.jsonl" \
+    --cache-dir "$CACHE_DIR" --chain-id "$CHAIN_ID" \
+    --catchup-window 1000 --no-rerun-detection
+
+python scripts/shadow_aggregate.py \
+    --shadow-log "$SHADOW_LOG" \
+    --evaluation-log "$LOG_DIR/shadow_evaluation.jsonl" \
+    --json-out "$LOG_DIR/shadow_aggregates.json" \
+    --csv-out "$LOG_DIR/shadow_aggregates.csv"
+```
+
+The replay opens the source log read-only (byte-identical afterwards) and
+writes only the evaluation log; aggregation reads both and writes the
+JSON/CSV summaries.
+
+### 8.9 First-run qualification and the initial operational smoke period
+
+Before starting any collection run, verify offline readiness (temporary
+files only, no network):
+
+```bash
+python scripts/qualify_shadow_readiness.py
+```
+
+It verifies: import smoke passes; the shadow test suite passes; the
+recorder initializes with the intended configuration in a temporary
+directory (and honours the enabled flag and `SHADOW_VALIDATION_PATH`);
+detection and lifecycle hooks produce valid records; sequence ordering and
+lifecycle reconstruction work across restart; the replay reads the source
+log without modifying it; aggregation reads the evaluation records; and
+`EXECUTE_ONCHAIN` remains disabled in the environment. Expected final
+line: `QUALIFICATION: PASS`.
+
+Once an owner-approved runtime is available, run a SHORT initial smoke
+period (15–30 minutes) before any longer observation period and verify:
+the process is running; the banner shows the intended chain id; the
+recorder line shows the intended path; records appear when candidates
+reach the hook (an empty file during the smoke window is recorded as
+"no candidates reached the hook", not as "no opportunities"); no
+`shadow recorder append failed` warnings appear; the execution-disabled
+line is present; and the captured file replays cleanly. Only after that
+qualification should the longer observation period begin.
+
+### 8.10 Evidence limitations (keep these with the data)
+
+- An empty or absent shadow log is NOT a zero-candidate or zero-opportunity
+  result: the recorder initializes on the first candidate.
+- A recorded detection is a candidate observation, not a proven profitable
+  opportunity.
+- Pool overlap on terminal records is observed heuristic evidence, NOT
+  confirmed competitor capture.
+- The number of recorded candidates says nothing about complete market
+  coverage: the searched-universe denominator is explicitly unavailable.
+
+### 8.11 Git hygiene
+
+`logs/*.log`, `logs/*.jsonl`, `logs/detailed/`, `logs/reports/`, `cache/`
+and `*.env` are git-ignored, and the shadow collection artifacts
+(`shadow_validation.jsonl`, `shadow_evaluation.jsonl`,
+`shadow_aggregates.json`, `shadow_aggregates.csv`) are ignored by basename
+at any depth — including inside a custom `LOG_DIR` or
+`SHADOW_VALIDATION_PATH` location. If you point any output directory at an
+unusual location, add that path to `.gitignore` before starting the run.

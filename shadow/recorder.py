@@ -40,6 +40,7 @@ from __future__ import annotations
 import collections
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -51,7 +52,23 @@ from tracker import _fingerprint  # DSS-WO-MI-103 §4: reuse the canonical finge
 
 log = get_logger("shadow_recorder")
 
-RECORD_SCHEMA_VERSION = 1
+RECORD_SCHEMA_VERSION = 2
+# schema v2 (DSS-WO-MI-105 WS-B/WS-C, additive + backward compatible):
+# - detection records gain a "validation" object: performed flag (never-
+#   validated vs validated-and-rejected), the actual validation status and
+#   its SANITIZED reason, the validation block number/hash, and the
+#   execution-simulation flag. Execution-support limitations stay separate
+#   in "eligibility" (execution_supported / execution_reason).
+# - "market_inputs.quote_inputs" gains quote_amount_in_raw /
+#   quote_amount_in_denomination / quote_amount_in_mode and "quote_method"
+#   — the ACTUAL input amount the Exec contract selected for its quote
+#   (ad.amountIn from yieldOut), previously discarded. null means no quote
+#   executed; a known amount is never inferred.
+# - "size_and_profit.trade_size_amount_in" carries that same real amount
+#   with "size_selection_method" naming how it was selected (mode 0:
+#   contract_optimal_borrow; mode 1: contract_profit_target).
+# - "validation.reason" is sanitized: whitespace-collapsed, length-capped,
+#   URL credentials and long hex blobs redacted. No other field moved.
 DEFAULT_TAIL_SCAN_LINES = 20_000     # bounded restart-reconstruction scan (§4.4)
 DEFAULT_STATE_CAPACITY = 8_192       # bounded lifecycle bookkeeping per process
 DEFAULT_TAIL_SCAN_LINES_ENV = "SHADOW_TAIL_SCAN_LINES"
@@ -64,12 +81,16 @@ PATH_ENV = "SHADOW_VALIDATION_PATH"
 STRUCTURALLY_UNAVAILABLE = {
     "router_decision": "router/refusal decisions happen after the permitted recording points",
     "builder_tip_tier": "no builder-tip tier is persisted by the runtime",
-    "quote_method": "per-candidate quote method is not persisted by the detectors",
-    "size_selection_method": "size-selection method is not persisted by the detectors",
     "inclusion_block": "inclusion block of an execution bundle is not tracked",
     "bundle_position": "bundle position is not tracked",
     "discovery_provenance": "scheduled/reactive discovery provenance is only supplied by the merged discovery implementation when present",
 }
+# MI-105: "quote_method" and "size_selection_method" were REMOVED from the
+# structurally-unavailable list — the validator now persists the actual
+# Exec-contract quote method and the contract-selected input amount (with
+# its denomination and lender mode) when a quote ran. They are null only
+# when no quote executed, which is a different statement from "never
+# persisted".
 
 
 class _LifecycleState:
@@ -383,6 +404,18 @@ class ShadowRecorder:
         discovery_hash = meta.get("discovery_block_hash") or block_hash or None
         edge_hashes = {e["pool"]: e["state_block_hash"] for e in edge_states if e.get("state_block_hash")}
 
+        # DSS-WO-MI-105 WS-C: real quote-size evidence captured at the
+        # validation boundary (Exec contract's selected input). A known amount
+        # is preserved with its denomination and selection mode; null means no
+        # quote executed — never an inferred or estimated amount.
+        quote_amount_in = meta.get("quote_amount_in_raw")
+        quote_mode = meta.get("quote_amount_in_mode")
+        size_method = None
+        if quote_amount_in is not None:
+            size_method = ("contract_profit_target" if quote_mode == 1
+                           else "contract_optimal_borrow")
+        trade_size = quote_amount_in if quote_amount_in is not None else meta.get("optimal_amount_in")
+
         return {
             "record_type": "detection",
             "event": event,
@@ -439,12 +472,15 @@ class ShadowRecorder:
                     "optimal_amount_in": meta.get("optimal_amount_in"),
                     "amount_in_usd": getattr(opp, "amount_in_usd", None),
                     "arb_data_present": bool(meta.get("arb_data")),
+                    "quote_amount_in_raw": quote_amount_in,
+                    "quote_amount_in_denomination": meta.get("quote_amount_in_denomination"),
+                    "quote_amount_in_mode": quote_mode,
                 },
-                "quote_method": None,
+                "quote_method": meta.get("quote_method"),
             },
             "size_and_profit": {
-                "trade_size_amount_in": meta.get("optimal_amount_in"),
-                "size_selection_method": None,
+                "trade_size_amount_in": trade_size,
+                "size_selection_method": size_method,
                 "gross_quote_profit_wei": meta.get("quote_profit_wei"),
                 "validated_profit_floor_wei": meta.get("validated_profit_floor_wei"),
                 "net_theoretical_profit_usd": getattr(opp, "net_profit_usd", None),
@@ -477,6 +513,21 @@ class ShadowRecorder:
                 "adversarial_reason": meta.get("adversarial_reason"),
                 "router_decision": None,
             },
+            # DSS-WO-MI-105 WS-B: the actual validation outcome and its reason,
+            # kept separately from execution-support limitations (which remain
+            # in "eligibility"). "performed" distinguishes a candidate that was
+            # never validated (no validation_status in metadata) from one that
+            # was validated and rejected — a missing field is never interpreted
+            # as a rejection reason.
+            "validation": {
+                "performed": meta.get("validation_status") is not None,
+                "status": meta.get("validation_status"),
+                "reason": self._sanitize_reason(meta.get("validation_reason")),
+                "validation_block": meta.get("validation_block"),
+                "validation_block_hash": meta.get("validation_block_hash"),
+                "execution_simulated": bool(meta.get("execution_simulated", False)),
+                "economics_profitable": meta.get("economics_profitable") if "economics_profitable" in meta else None,
+            },
             "execution_config_at_decision": self._execution_config(),
             "reorg_evidence": {
                 "discovery_block_hash": discovery_hash,
@@ -484,6 +535,25 @@ class ShadowRecorder:
             },
             "unavailable_fields": sorted(STRUCTURALLY_UNAVAILABLE.keys()),
         }
+
+    _RE_LONG_HEX = re.compile(r"0x[0-9a-fA-F]{64,}")
+    _RE_CRED_URL = re.compile(r"\w+://[^\s/@]+:[^\s/@]+@")
+
+    @staticmethod
+    def _sanitize_reason(reason) -> Optional[str]:
+        """Sanitize a validation/execution reason for the evidence record
+        (MI-105 WS-B): collapse whitespace, redact credential-bearing URLs and
+        long hex blobs, cap the length. The REAL refusal reason is preserved —
+        only potentially sensitive or unbounded payloads are reduced."""
+        if reason is None:
+            return None
+        text = str(reason)
+        text = ShadowRecorder._RE_CRED_URL.sub("<redacted-url>", text)
+        text = ShadowRecorder._RE_LONG_HEX.sub("<redacted-hex>", text)
+        text = " ".join(text.split())
+        if len(text) > 400:
+            text = text[:388] + "…[truncated]"
+        return text or None
 
     def _edge_market_inputs(self, graph, pools: list, tokens: list) -> list:
         """Per-edge market state snapshot from the LOCAL graph — detection-time

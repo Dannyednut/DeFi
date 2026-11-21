@@ -530,11 +530,19 @@ def refresh_pools_batched(
     graph: TokenGraph,
     cache: PoolCache | None,
     addresses: set[str],
+    *,
+    block_identifier: int | None = None,
 ) -> set[str]:
     """Refresh non-V2/V3 pools (Curve, Balancer, SyncSwap, Aerodrome, ...) in
     as few Multicall3 requests as possible, instead of one eth_call sequence
     per pool. Falls back to the sequential update_pool_reserves() path for
     any pool whose adapter doesn't support batched refresh.
+
+    DSS-WO-MI-105 §2: ``block_identifier`` pins the batched adapter reads to a
+    specific block (same semantics as multicall3_bulk_refresh). The sequential
+    fallback still reads latest state — pools refreshed through it inherit the
+    caller's stamp with the caller's pinned block; the residual
+    latest-vs-pinned gap for that fallback subset is a documented limitation.
 
     This is the "curve/balancer/other adapters should build the calls
     instead" fast path — see ProtocolAdapter.build_refresh_calls() /
@@ -591,7 +599,7 @@ def refresh_pools_batched(
     updated: set[str] = set()
     if batchable:
         pairs = [(ref, adapter) for ref, adapter, _, _, _ in batchable]
-        decoded = multicall3_bulk_refresh_adapters(w3, pairs)
+        decoded = multicall3_bulk_refresh_adapters(w3, pairs, block_identifier=block_identifier)
         by_addr = {}
         for ref, adapter, dex_name, protocol, edges in batchable:
             by_addr.setdefault(ref.address, []).append((ref, protocol, dex_name, edges))

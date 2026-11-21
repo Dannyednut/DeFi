@@ -6,6 +6,7 @@ Opportunity lifetime tracking with fingerprinting.
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 import threading
 from dataclasses import dataclass, field
@@ -115,8 +116,26 @@ class OpportunityTracker:
         block_number: int,
         detected: list[Opportunity],
         filled_pools: dict[str, str] = None,
+        *,
+        detector_scheduled: set | None = None,
     ) -> None:
-        """Process detected opportunities for a block."""
+        """Process detected opportunities for a block.
+
+        DSS-WO-MI-105 WS-D: ``detector_scheduled`` is the set of detector
+        names whose ``on_block()`` actually ran in this block (from
+        ``PipelineResult.scheduled_detectors``). Detector schedules are
+        thesis-dependent — a candidate's absence from an invocation where its
+        detector did not run is NOT evidence that the opportunity disappeared.
+        Therefore a non-filled candidate is expired by TTL only when its
+        origin detector was scheduled this block, or once a bounded hard-TTL
+        (``TRACKER_HARD_TTL_BLOCKS``, default 64 — above every detector's
+        ``block_interval`` and the scheduled-pass interval) finally ages it
+        out; mempool-origin candidates are exempt (their trigger transaction
+        is gone with the block, so absence is meaningful). Callers that do not
+        pass the set keep the legacy unconditional-TTL behaviour.
+
+        No CLOSE event is ever fabricated: the outcome basis stays the honest
+        tracker absence/TTL heuristic recorded by the shadow recorder."""
         with self._lock:
             now = time.time()
             filled_pools = filled_pools or {}
@@ -183,19 +202,37 @@ class OpportunityTracker:
             
             # Handle CLOSED (disappeared) or STALE (TTL expired) opportunities
             MAX_STALE_BLOCKS = 5  # evict if not re-detected within 5 blocks
-            
+            # MI-105 WS-D: bounded hard-TTL for candidates whose detector was
+            # NOT scheduled in the absent blocks — eventual (honest) closure
+            # without fabricating disappearance evidence per block. Must stay
+            # above every detector cadence and the scheduled-pass interval.
+            try:
+                hard_ttl = max(MAX_STALE_BLOCKS, int(os.getenv("TRACKER_HARD_TTL_BLOCKS", "64") or 64))
+            except Exception:
+                hard_ttl = 64
+
             for fp, active in list(self._active.items()):
                 if fp in this_block:
                     continue
-                    
+
                 opp = active.opp
-                
+
                 # Check if this opportunity was likely 'filled' by a competitor
                 matched_pool = next((p.lower() for p in opp.pools if p.lower() in filled_pools), None)
                 is_filled = matched_pool is not None
-                
+
+                # MI-105 WS-D: schedule-aware expiry gate (see process_block docstring)
+                if detector_scheduled is None:
+                    schedule_ok = True  # legacy callers: unconditional TTL
+                else:
+                    m = getattr(opp, "metadata", {}) or {}
+                    is_mempool = bool(m.get("is_mempool"))
+                    origin = str(m.get("detector", "") or "")
+                    schedule_ok = is_mempool or (origin in detector_scheduled)
+                ttl_blocks = MAX_STALE_BLOCKS if schedule_ok else hard_ttl
+
                 # Not filled and not stale yet - keep tracking
-                if not is_filled and (block_number - active.last_seen_block) <= MAX_STALE_BLOCKS:
+                if not is_filled and (block_number - active.last_seen_block) <= ttl_blocks:
                     continue
                 
                 # Actually closing this opp - remove from active
@@ -208,6 +245,7 @@ class OpportunityTracker:
                 duration_seconds = active.last_seen_time - active.open_time
                 
                 metadata = opp.metadata.copy()
+                metadata["detector_scheduled_at_close"] = bool(schedule_ok)
                 if is_filled:
                     metadata["outcome"] = "FILLED_BY_COMPETITOR"
                     metadata["tx_hash"] = filled_pools[matched_pool]

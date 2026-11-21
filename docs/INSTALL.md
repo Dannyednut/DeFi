@@ -226,19 +226,25 @@ Recorder states — how to distinguish them:
 
 ### 8.8 Replay and aggregate the captured collection (explicit paths)
 
-The offline CLIs default to RELATIVE `logs/...` paths. If `LOG_DIR` or
-`SHADOW_VALIDATION_PATH` is customized, ALWAYS pass `--shadow-log`
-explicitly so the tools read the same collection the monitor wrote:
+The offline CLIs default to RELATIVE `logs/...` paths, so `--shadow-log`
+must ALWAYS be passed explicitly so the tools read the same collection the
+monitor wrote. The monitor's recorder resolves its effective collection
+path itself: `SHADOW_VALIDATION_PATH` when set to a non-empty value,
+otherwise `$LOG_DIR/shadow_validation.jsonl` (the override takes
+precedence over the default). Resolve it ONCE with the same precedence —
+unset OR empty `SHADOW_VALIDATION_PATH` falls back to the default:
 
 ```bash
+SHADOW_LOG="${SHADOW_VALIDATION_PATH:-$LOG_DIR/shadow_validation.jsonl}"
+
 python scripts/shadow_replay.py \
-    --shadow-log "$LOG_DIR/shadow_validation.jsonl" \
+    --shadow-log "$SHADOW_LOG" \
     --evaluation-log "$LOG_DIR/shadow_evaluation.jsonl" \
     --cache-dir "$CACHE_DIR" --chain-id "$CHAIN_ID" \
     --catchup-window 1000 --no-rerun-detection
 
 python scripts/shadow_aggregate.py \
-    --shadow-log "$LOG_DIR/shadow_validation.jsonl" \
+    --shadow-log "$SHADOW_LOG" \
     --evaluation-log "$LOG_DIR/shadow_evaluation.jsonl" \
     --json-out "$LOG_DIR/shadow_aggregates.json" \
     --csv-out "$LOG_DIR/shadow_aggregates.csv"

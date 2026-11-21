@@ -200,6 +200,8 @@ def multicall3_bulk_refresh(
     cache: "PoolCache",
     pool_addrs: set[str],
     chunk_size: int = MULTICALL_CHUNK,
+    *,
+    block_identifier: int | None = None,
 ) -> None:
     """
     Refresh reserves for all pools using Multicall3.aggregate3.
@@ -209,6 +211,12 @@ def multicall3_bulk_refresh(
 
     allowFailure=True per call means one broken pool won't abort the whole batch.
     Failed individual calls are logged at DEBUG level and skipped.
+
+    DSS-WO-MI-105 §2: ``block_identifier`` pins every eth_call in the batch to
+    a specific block so the stamped ``state_block``/``state_block_hash``
+    identify the state actually read, not merely the event that triggered the
+    read. ``None`` keeps the legacy latest-state read (callers that stamp
+    provenance MUST pass an explicit block).
     """
     if not pool_addrs:
         return
@@ -265,8 +273,14 @@ def multicall3_bulk_refresh(
             continue
 
         try:
-            # aggregate3 is payable — pass value=0 explicitly
-            results = mc.functions.aggregate3(calls).call({"value": 0})
+            # aggregate3 is payable — pass value=0 explicitly. The read is
+            # PINNED to block_identifier when provided (MI-105 §2): the
+            # stamped state provenance then matches the state actually read.
+            if block_identifier is not None:
+                results = mc.functions.aggregate3(calls).call(
+                    {"value": 0}, block_identifier=block_identifier)
+            else:
+                results = mc.functions.aggregate3(calls).call({"value": 0})
         except Exception as e:
             log.warning(f"Multicall3 chunk {chunk_start}–{chunk_start + chunk_size} "
                         f"failed entirely: {e}. Skipping chunk.")
@@ -329,12 +343,17 @@ def multicall3_bulk_refresh_adapters(
     w3: Web3,
     pool_adapter_pairs: list[tuple[Any, Any]],
     chunk_calls: int = MULTICALL_CHUNK,
+    *,
+    block_identifier: int | None = None,
 ) -> dict[str, dict]:
     """Batch-refresh ANY protocol whose adapter implements
     ProtocolAdapter.build_refresh_calls()/decode_refresh_result() — Curve,
     Balancer, SyncSwap, Aerodrome today, more later — into Multicall3
     aggregate3 batches, the same way multicall3_bulk_refresh() above already
     does for native V2/V3 pools.
+
+    DSS-WO-MI-105 §2: ``block_identifier`` pins the batch's eth_calls to a
+    specific block (same semantics as multicall3_bulk_refresh).
 
     Previously these protocols were refreshed one pool at a time via
     individual adapter.load_pool() RPC round-trips (see
@@ -386,7 +405,13 @@ def multicall3_bulk_refresh_adapters(
             continue
 
         try:
-            results = mc.functions.aggregate3(calls).call({"value": 0})
+            # MI-105 §2: pin the adapter batch to the same block the
+            # synchronizer will stamp as state provenance.
+            if block_identifier is not None:
+                results = mc.functions.aggregate3(calls).call(
+                    {"value": 0}, block_identifier=block_identifier)
+            else:
+                results = mc.functions.aggregate3(calls).call({"value": 0})
         except Exception as e:
             log.warning(f"Adapter multicall batch of {len(calls)} calls ({len(spans)} pools) "
                         f"failed entirely: {e}. Skipping batch.")

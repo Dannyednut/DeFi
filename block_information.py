@@ -262,6 +262,12 @@ class ProtocolStateSynchronizer:
         decode_refresh_result() (see registry.refresh_pools_batched and
         protocols/base.py) — previously these were refreshed one pool at a
         time via individual RPC round-trips.
+
+        DSS-WO-MI-105 §2: every eth_call in the refresh batch is PINNED to the
+        triggering block (``ctx.number``), so ``state_block``/``state_block_hash``
+        stamped on refreshed edges identify the state actually read — not
+        merely the event that triggered the read. A read that cannot be served
+        at that block fails and the pool is stamped UNCERTAIN (never FRESH).
         """
         refreshed: set[str] = set()
         v2v3: set[str] = set()
@@ -273,9 +279,11 @@ class ProtocolStateSynchronizer:
             else:
                 other.add(address)
 
+        read_number = int(ctx.number)
+        read_hash = ctx.block_hash or ""
         if v2v3:
             try:
-                done = self._refresh_multicall3(v2v3) or set()
+                done = self._refresh_multicall3(v2v3, block_identifier=read_number) or set()
                 refreshed.update(done)
             except Exception as exc:
                 log.warning("Multicall3 state refresh failed for %d pools: %s", len(v2v3), exc)
@@ -285,7 +293,8 @@ class ProtocolStateSynchronizer:
         if other:
             try:
                 from registry import refresh_pools_batched
-                done = refresh_pools_batched(self.w3, self.graph, self.cache, other)
+                done = refresh_pools_batched(self.w3, self.graph, self.cache, other,
+                                             block_identifier=read_number)
                 refreshed.update(done)
                 for address in other - done:
                     self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_refresh_incomplete")
@@ -294,12 +303,13 @@ class ProtocolStateSynchronizer:
                 for address in other:
                     self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"refresh_error:{type(exc).__name__}")
 
-        # Stamp only pools that actually refreshed. The state block is the block
-        # whose event triggered the refresh, while Multicall3 supplies a single
-        # coherent RPC read context for the batch.
+        # Stamp only pools that actually refreshed. Because the batch reads are
+        # pinned to read_number, the stamped state block/hash identify the
+        # state actually read (MI-105 §2); a successful refresh now also
+        # produces the explicit, truthful FRESH status.
         for address in refreshed:
             protocol = self._protocol(address)
-            self._stamp(address, ctx, protocol)
+            self._stamp(address, read_number, read_hash, protocol)
         return refreshed
 
     def refresh_by_addresses(self, addresses: set[str], ctx: BlockContext | None = None) -> set[str]:
@@ -318,9 +328,11 @@ class ProtocolStateSynchronizer:
             else:
                 other.add(address)
         log.info("refresh_by_addresses: v2v3=%d other=%d", len(v2v3), len(other))
+        read_number = int(ctx.number) if ctx is not None else None
+        read_hash = (ctx.block_hash or "") if ctx is not None else ""
         if v2v3:
             try:
-                done = self._refresh_multicall3(v2v3) or set()
+                done = self._refresh_multicall3(v2v3, block_identifier=read_number) or set()
                 refreshed.update(done)
             except Exception as exc:
                 log.warning("Multicall3 state refresh failed for %d pools: %s", len(v2v3), exc)
@@ -330,7 +342,8 @@ class ProtocolStateSynchronizer:
         if other:
             try:
                 from registry import refresh_pools_batched
-                done = refresh_pools_batched(self.w3, self.graph, self.cache, other)
+                done = refresh_pools_batched(self.w3, self.graph, self.cache, other,
+                                             block_identifier=read_number)
                 refreshed.update(done)
                 for address in other - done:
                     self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_refresh_incomplete")
@@ -339,9 +352,9 @@ class ProtocolStateSynchronizer:
                 for address in other:
                     self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"refresh_error:{type(exc).__name__}")
 
-        # Stamp only pools that actually refreshed. The state block is the block
-        # whose event triggered the refresh, while Multicall3 supplies a single
-        # coherent RPC read context for the batch.
+        # Stamp only pools that actually refreshed — and only when an explicit
+        # block context was supplied (MI-105 §2: no provenance claim without a
+        # pinned read block).
         if ctx is not None:
             for address in refreshed:
                 self._stamp(address, ctx, self._protocol(address))
@@ -355,14 +368,15 @@ class ProtocolStateSynchronizer:
         edges = self.graph._pool_index.get(address.lower(), [])
         return edges[0].protocol if edges else ""
 
-    def _refresh_multicall3(self, addresses: set[str]) -> set[str]:
+    def _refresh_multicall3(self, addresses: set[str], *, block_identifier: int | None = None) -> set[str]:
         """Refresh V2/V3 pools using Multicall3.
 
         Multicall3 is the canonical batch reader for V2/V3 pools.  It is not
         used for other protocols because their state shape is not reducible to
         the V2/V3 reserve ABI.
         """
-        return multicall3_bulk_refresh(self.w3, self.graph, self.cache, addresses) or set()
+        return multicall3_bulk_refresh(self.w3, self.graph, self.cache, addresses,
+                                       block_identifier=block_identifier) or set()
     
     def _refresh_one(self, address: str, ctx: BlockContext) -> None:
         address = address.lower()
@@ -374,7 +388,19 @@ class ProtocolStateSynchronizer:
         from registry import update_pool_reserves
         update_pool_reserves(self.w3, self.graph, address, self.cache)
 
-    def _stamp(self, address: str, ctx: BlockContext, protocol: str) -> None:
+    def _stamp(self, address: str, read_number: int | None, read_hash: str, protocol: str) -> None:
+        """Stamp refreshed edges with the provenance of the state ACTUALLY read.
+
+        DSS-WO-MI-105 §2: the caller pinned every batch eth_call to
+        ``read_number``, so this stamp identifies the read state — and a
+        successful refresh now produces the explicit, truthful FRESH status
+        (previously the prior status, e.g. STALE from a cache load, survived a
+        successful refresh and contradicted the new block/hash stamp). The
+        same state fields are persisted into the pool cache so a reload keeps
+        the truthful provenance instead of falling back to a default.
+        """
+        if read_number is None:
+            return
         edges = self.graph._pool_index.get(address.lower(), [])
         if not edges:
             return
@@ -385,9 +411,22 @@ class ProtocolStateSynchronizer:
         for e in edges:
             stamped.append(replace(
                 e,
-                state_block=ctx.number,
-                state_block_hash=ctx.block_hash,
+                state_block=int(read_number),
+                state_block_hash=read_hash or "",
                 state_source=f"onchain:{protocol}:block_log",
+                state_status="FRESH",
             ))
         if stamped:
             self.graph.upsert_pool_edges(stamped)
+        cache = getattr(self, "cache", None)
+        if cache is not None:
+            try:
+                cache.update_pool_state(
+                    address,
+                    state_block=int(read_number),
+                    state_block_hash=read_hash or "",
+                    state_source=f"onchain:{protocol}:block_log",
+                    state_status="FRESH",
+                )
+            except Exception as exc:
+                log.debug("cache state stamp skipped for %s: %s", address, exc)

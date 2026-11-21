@@ -27,6 +27,17 @@ class ValidationResult:
     gas_estimate: int = 0
     lender_mode: int | None = None
     lender: str = ""
+    # DSS-WO-MI-105 WS-C: the ACTUAL input amount the Exec contract selected
+    # for the quote (ad.amountIn from yieldOut). When the candidate supplies
+    # amount_in == 0 the contract computes the optimal borrow internally and
+    # returns it — previously this real trade-size evidence was discarded.
+    # Denomination is the route's first token (wei base units of that token);
+    # with lender mode 1 the amount is the profit TARGET in that token, not
+    # the trade size, so the mode is preserved alongside the amount.
+    amount_in_raw: int | None = None
+    amount_in_token: str = ""
+    amount_in_mode: int | None = None
+    quote_method: str = ""
 
 
 class OpportunityValidator:
@@ -114,8 +125,17 @@ class OpportunityValidator:
             )
             ad, quote_profit = self.contract.functions.yieldOut(raw).call(block_identifier=context_block)
             quote_profit = int(quote_profit)
+            # MI-105 WS-C: preserve the contract's own selected input amount.
+            # ad[0] is the resolved Data.amountIn: either the caller-supplied
+            # amount or, when the candidate passed 0, the contract-computed
+            # optimal borrow (_determineBorrow in the authoritative Exec.sol).
+            amount_in_raw = int(ad[0]) if ad[0] is not None else None
             if quote_profit <= 0:
-                return ValidationResult(False, "quote_rejected", "yieldOut returned non-positive profit")
+                return ValidationResult(False, "quote_rejected", "yieldOut returned non-positive profit",
+                                        amount_in_raw=amount_in_raw,
+                                        amount_in_token=str(opp.tokens[0]) if opp.tokens else "",
+                                        amount_in_mode=mode,
+                                        quote_method="exec_yieldOut")
 
             # Preserve the contract's own profitability guard while allowing a
             # controlled amount of state drift between quote and full execution.
@@ -156,9 +176,14 @@ class OpportunityValidator:
                 gas_estimate=gas_estimate,
                 lender_mode=mode,
                 lender=lender,
+                amount_in_raw=amount_in_raw,
+                amount_in_token=str(opp.tokens[0]) if opp.tokens else "",
+                amount_in_mode=mode,
+                quote_method="exec_yieldOut",
             )
         except Exception as exc:
-            return ValidationResult(False, "execution_rejected", str(exc))
+            return ValidationResult(False, "execution_rejected", str(exc),
+                                    quote_method="exec_yieldOut")
 
     @staticmethod
     def _reject(reason: str) -> ValidationResult:
@@ -198,6 +223,12 @@ def validate_many(w3, opportunities: list, chain_id: int, *, block_number: int |
             meta["validated_gas_units"] = result.gas_estimate
             meta["validated_lender_mode"] = result.lender_mode
             meta["validated_lender"] = result.lender
+            # DSS-WO-MI-105 WS-C: real quote-size evidence when the quote ran
+            # (None = no quote executed — never an inferred amount).
+            meta["quote_amount_in_raw"] = result.amount_in_raw
+            meta["quote_amount_in_denomination"] = result.amount_in_token or None
+            meta["quote_amount_in_mode"] = result.amount_in_mode
+            meta["quote_method"] = result.quote_method or None
             opp.metadata = meta
             if result.ok:
                 opp.simulated_via_contract = True

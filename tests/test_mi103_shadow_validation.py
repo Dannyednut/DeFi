@@ -355,11 +355,25 @@ class TestDetectionRecording(RecorderTestBase):
         self.assertIsNone(rec["size_and_profit"]["simulation_profit_wei"])
         self.assertIsNone(rec["eligibility"]["router_decision"])
         self.assertIsNone(rec["cost_assumptions"]["builder_tip_tier"])
+        # MI-105 WS-C: quote_method/size_selection_method are no longer
+        # STRUCTURALLY unavailable — the validator persists the actual
+        # Exec-contract quote method and selected amount when a quote ran.
+        # They remain null HERE because no validation ran (null, not fabricated).
         self.assertIsNone(rec["market_inputs"]["quote_method"])
+        self.assertIsNone(rec["size_and_profit"]["size_selection_method"])
         self.assertIsNone(rec["detection"]["mempool_to_open_latency_seconds"])
-        for field in ("router_decision", "builder_tip_tier", "quote_method",
-                      "size_selection_method", "inclusion_block", "bundle_position"):
+        for field in ("router_decision", "builder_tip_tier",
+                      "inclusion_block", "bundle_position"):
             self.assertIn(field, rec["unavailable_fields"])
+        self.assertNotIn("quote_method", rec["unavailable_fields"])
+        self.assertNotIn("size_selection_method", rec["unavailable_fields"])
+        # MI-105 WS-B: this fixture carries validation_status="quote_validated",
+        # so the validation object must reflect an ACTUAL validation outcome
+        # (performed=True); the never-validated distinction is covered in
+        # tests/test_mi105_shadow_evidence.py.
+        self.assertTrue(rec["validation"]["performed"])
+        self.assertEqual(rec["validation"]["status"], "quote_validated")
+        self.assertIsNone(rec["validation"]["reason"])
         self.assertNotIn("provider_url", json.dumps(rec).lower())
         self.assertNotIn("private_key", json.dumps(rec).lower())
 

@@ -219,7 +219,7 @@ class PoolCache:
     
     def mark_below_threshold(self, addr: str) -> None:
         """Mark pool as below liquidity threshold."""
-        entry = self._pools.get(addr.lower())
+        entry = self._pools.get(addr)
         if entry:
             entry["below_threshold"] = True
             entry["r0"] = 0
@@ -229,6 +229,31 @@ class PoolCache:
             entry["last_updated"] = time.time()
             self._dirty_count += 1
             self.save_if_dirty()
+
+    def update_pool_state(
+        self,
+        addr: str,
+        *,
+        state_block: int = 0,
+        state_block_hash: str = "",
+        state_source: str = "",
+        state_status: str = "",
+    ) -> None:
+        """Persist the provenance of the state actually read (MI-105 §2).
+
+        Called by the state synchronizer after a pinned refresh so a cache
+        reload restores the truthful state_block/hash/source/status instead of
+        defaulting every cache-loaded edge to an assumed status."""
+        entry = self._pools.get(addr.lower())
+        if not entry:
+            return
+        entry["state_block"] = int(state_block or 0)
+        entry["state_block_hash"] = state_block_hash or ""
+        entry["state_source"] = state_source or ""
+        entry["state_status"] = state_status or "UNKNOWN"
+        entry["last_updated"] = time.time()
+        self._dirty_count += 1
+        self.save_if_dirty()
     
     def stale_pools(self, min_tvl: float = 0.0) -> list[str]:
         """
@@ -349,7 +374,10 @@ class PoolCache:
                 state_block = int(p.get("state_block", 0) or 0)
                 state_block_hash = p.get("state_block_hash", "") or ""
                 state_source = p.get("state_source", "cache") or "cache"
-                state_status = p.get("state_status", "STALE") or "STALE"
+                # MI-105 §2: absent provenance means UNKNOWN, never an assumed
+                # STALE — a cache reload must not invent staleness for state
+                # whose age the cache simply does not record.
+                state_status = p.get("state_status", "UNKNOWN") or "UNKNOWN"
                 r0 = p.get("r0", 0)
                 r1 = p.get("r1", 0)
                 sqrt = p.get("sqrt_price_x96", 0)

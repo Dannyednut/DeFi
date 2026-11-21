@@ -20,6 +20,11 @@ class PipelineResult:
     candidates: tuple[Opportunity, ...] = ()
     ready: tuple[Opportunity, ...] = ()
     rejected: tuple[Opportunity, ...] = ()
+    # MI-105 WS-D: detector names whose on_block() actually ran in this
+    # invocation. Consumers (the tracker's lifecycle-expiry gate) use it to
+    # distinguish "the candidate's detector searched and did not find it"
+    # from "the detector was not scheduled, so absence means nothing".
+    scheduled_detectors: tuple[str, ...] = ()
 
 @dataclass
 class OpportunityEngine:
@@ -77,8 +82,34 @@ class OpportunityEngine:
         opp.metadata = meta
         return opp
 
-    def _discover(self, block_number: int, touched_pools: set[str] | None = None, block_context=None) -> list[Opportunity]:
+    @staticmethod
+    def aggregate_route_status(route_statuses: set) -> str:
+        """Truthful route-level state-status aggregation (MI-105 §2).
+
+        UNKNOWN is not evidence of staleness and is never reported as STALE;
+        mixed statuses are UNCERTAIN; INVALID dominates; only a uniform
+        status passes through as itself."""
+        if "INVALID" in route_statuses:
+            return "INVALID"
+        if "UNCERTAIN" in route_statuses:
+            return "UNCERTAIN"
+        if "UNKNOWN" in route_statuses:
+            return "UNKNOWN"
+        if route_statuses == {"FRESH"}:
+            return "FRESH"
+        if route_statuses == {"STALE"}:
+            return "STALE"
+        return "UNCERTAIN"
+
+    def _discover(self, block_number: int, touched_pools: set[str] | None = None, block_context=None) -> tuple[list[Opportunity], tuple[str, ...]]:
+        """Run discovery for one block.
+
+        Returns ``(candidates, invoked_detectors)`` — MI-105 WS-D: the invoked
+        detector names let the tracker distinguish a genuine absence (the
+        candidate's detector searched and did not find it) from a
+        scheduling gap (the detector simply did not run this block)."""
         candidates = []
+        invoked: list[str] = []
         if block_context is not None:
             bh = block_context.block_hash
             state_block = block_context.number
@@ -104,8 +135,9 @@ class OpportunityEngine:
                     if edges:
                         route_blocks = [int(e.state_block) for e in edges if int(e.state_block) > 0]
                         route_statuses = {getattr(e, "state_status", "UNKNOWN") for e in edges}
+                        # MI-105 §2: truthful aggregation (see aggregate_route_status)
+                        canonical.metadata["route_state_status"] = self.aggregate_route_status(route_statuses)
                         canonical.metadata["route_state_block"] = min(route_blocks) if route_blocks else 0
-                        canonical.metadata["route_state_status"] = "INVALID" if "INVALID" in route_statuses else ("UNCERTAIN" if "UNCERTAIN" in route_statuses else ("FRESH" if "FRESH" in route_statuses else "STALE"))
                         canonical.metadata["route_state_source"] = sorted({getattr(e, "state_source", "") for e in edges if getattr(e, "state_source", "")})
                 candidates.append(canonical)
 
@@ -127,6 +159,7 @@ class OpportunityEngine:
                     continue
                 found = detector.on_block(block_number, touched_pools=touched_pools) if detector.name == "cycles" else detector.on_block(block_number)
                 finalize(found, detector.name)
+                invoked.append(name)
                 if name == "cycles":
                     reactive_cycle_ok = True
                 elif name == "cross_proto":
@@ -150,7 +183,7 @@ class OpportunityEngine:
                 reactive_cycle_ok=reactive_cycle_ok, reactive_cross_ok=reactive_cross_ok), None)
         except Exception as exc:
             get_logger("opportunity_engine").error(f"Scheduled discovery pass failed: {exc}", exc_info=True)
-        return self._dedupe(candidates)
+        return self._dedupe(candidates), tuple(dict.fromkeys(invoked))
 
     # ════════════════════════════════════════════════════════════════════════════
     # MI-102B: bounded event-independent discovery
@@ -956,7 +989,7 @@ class OpportunityEngine:
             opp.metadata = meta
         return candidates
 
-    def process_candidates(self, candidates: list[Opportunity], block_number: int, *, rank_ready: bool = True, block_context=None) -> PipelineResult:
+    def process_candidates(self, candidates: list[Opportunity], block_number: int, *, rank_ready: bool = True, block_context=None, invoked_detectors: tuple[str, ...] = ()) -> PipelineResult:
         if block_context is not None:
             bh = block_context.block_hash
             state_block = block_context.number
@@ -1006,10 +1039,13 @@ class OpportunityEngine:
                 candidates, block_number=block_number, block_hash=bh, engine=self)
         except Exception:
             pass
-        return PipelineResult(tuple(candidates), tuple(ready), tuple(rejected))
+        return PipelineResult(tuple(candidates), tuple(ready), tuple(rejected),
+                              scheduled_detectors=tuple(invoked_detectors))
 
     def process(self, block_number: int, *, touched_pools: set[str] | None = None, block_context=None) -> PipelineResult:
-        return self.process_candidates(self._discover(block_number, touched_pools, block_context), block_number, block_context=block_context)
+        discovered, invoked = self._discover(block_number, touched_pools, block_context)
+        return self.process_candidates(discovered, block_number, block_context=block_context,
+                                       invoked_detectors=invoked)
 
     def scan(self, block_number: int, touched_pools: set[str] | None = None) -> list[Opportunity]:
         return list(self.process(block_number, touched_pools=touched_pools).ready)

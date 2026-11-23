@@ -155,12 +155,96 @@ class TestRefreshProvenance(unittest.TestCase):
             e.protocol = "curve"
         sync = _sync(graph)
         sync._refresh_multicall3 = lambda a, *, block_identifier=None: set()
-        with mock.patch("registry.refresh_pools_batched", return_value=set()):
+        # refresh_pools_batched returns (pinned, unpinned); nothing refreshed
+        with mock.patch("registry.refresh_pools_batched", return_value=(set(), set())):
             refreshed = sync.refresh(_ctx(number=502, pools=(P1,)))
         self.assertEqual(refreshed, set())
         e = graph.get_edges_for_pool(P1)[0]
         self.assertEqual(e.state_status, "UNCERTAIN")
         self.assertEqual(e.state_source, "adapter_refresh_incomplete")
+
+    def _curve_fallback_graph(self):
+        graph = _v2_graph()
+        for e in graph.get_edges_for_pool(P1):
+            e.protocol = "curve"  # not batchable by the v2v3 path → adapter bucket
+        return graph
+
+    def test_unpinned_adapter_fallback_is_never_fresh_refresh(self):
+        """MI-105-R1 WS-A: a successful but UNPINNED sequential fallback keeps
+        the refreshed values yet must NOT be stamped FRESH at the context
+        block — provenance stays explicitly unverified."""
+        import unittest.mock as mock
+        graph = self._curve_fallback_graph()
+        sync = _sync(graph)
+        sync._refresh_multicall3 = lambda a, *, block_identifier=None: set()
+        with mock.patch("registry.refresh_pools_batched",
+                        return_value=(set(), {P1.lower()})):
+            refreshed = sync.refresh(_ctx(number=503, pools=(P1,)))
+        self.assertEqual(refreshed, set())  # not in the FRESH-stamped set
+        e = graph.get_edges_for_pool(P1)[0]
+        self.assertEqual(e.state_status, "UNCERTAIN")
+        self.assertEqual(e.state_source, "adapter_fallback_unpinned")
+        self.assertEqual(e.state_block, 100)  # no false block provenance attached
+
+    def test_unpinned_adapter_fallback_by_addresses_is_never_fresh(self):
+        """MI-105-R1 WS-A: same semantics through refresh_by_addresses."""
+        import unittest.mock as mock
+        graph = self._curve_fallback_graph()
+        sync = _sync(graph)
+        sync._refresh_multicall3 = lambda a, *, block_identifier=None: set()
+        with mock.patch("registry.refresh_pools_batched",
+                        return_value=(set(), {P1.lower()})):
+            refreshed = sync.refresh_by_addresses({P1}, _ctx(number=504, pools=(P1,)))
+        self.assertEqual(refreshed, set())
+        e = graph.get_edges_for_pool(P1)[0]
+        self.assertEqual(e.state_status, "UNCERTAIN")
+        self.assertEqual(e.state_source, "adapter_fallback_unpinned")
+
+    def test_pinned_refresh_by_addresses_stamps_fresh(self):
+        """MI-105-R1 WS-A: a PINNED batch read through refresh_by_addresses is
+        stamped FRESH at the read block (regression for the stale _stamp
+        call-signature the first amendment missed on this path)."""
+        import unittest.mock as mock
+        graph = _v2_graph()
+        sync = _sync(graph)
+        sync._refresh_multicall3 = lambda a, *, block_identifier=None: set(a)
+        with mock.patch("registry.refresh_pools_batched",
+                        return_value=(set(), set())):
+            refreshed = sync.refresh_by_addresses({P1}, _ctx(number=505, pools=(P1,)))
+        self.assertEqual(refreshed, {P1})
+        e = graph.get_edges_for_pool(P1)[0]
+        self.assertEqual(e.state_status, "FRESH")
+        self.assertEqual(e.state_block, 505)
+
+    def test_failed_fallback_by_addresses_stays_uncertain(self):
+        import unittest.mock as mock
+        graph = self._curve_fallback_graph()
+        sync = _sync(graph)
+        sync._refresh_multicall3 = lambda a, *, block_identifier=None: set()
+        with mock.patch("registry.refresh_pools_batched",
+                        side_effect=RuntimeError("provider down")):
+            refreshed = sync.refresh_by_addresses({P1}, _ctx(number=506, pools=(P1,)))
+        self.assertEqual(refreshed, set())
+        e = graph.get_edges_for_pool(P1)[0]
+        self.assertEqual(e.state_status, "UNCERTAIN")
+        self.assertIn("refresh_error", e.state_source)
+
+    def test_registry_separates_pinned_batch_from_unpinned_fallback(self):
+        """MI-105-R1 WS-A: refresh_pools_batched must never report a
+        sequential-fallback (latest-state) refresh as pinned."""
+        import unittest.mock as mock
+        import registry as registry_mod
+        graph = _v2_graph()
+        for e in graph.get_edges_for_pool(P1):
+            e.protocol = "curve"  # not batchable → sequential fallback path
+        with mock.patch("protocols.ProtocolRegistry") as reg_cls, \
+             mock.patch("registry.update_pool_reserves") as upr:
+            reg_cls.return_value.get.return_value = None  # no adapter → fallback
+            pinned, unpinned = registry_mod.refresh_pools_batched(
+                T.StubW3(), graph, None, {P1}, block_identifier=55)
+        self.assertEqual(pinned, set())
+        self.assertEqual(unpinned, {P1.lower()})
+        upr.assert_called_once()  # the fallback refresh DID run (values kept)
 
     def test_batched_reads_are_pinned_to_the_given_block(self):
         captured = {}
@@ -350,6 +434,7 @@ class RecorderBase(unittest.TestCase):
 class TestValidationEvidence(RecorderBase):
     REJECT_META = {
         "validation_status": "rejected",
+        "validation_performed": True,   # explicit signal: the validator DID run
         "validation_reason": "state moved from candidate block 100 to head 105",
         "validation_block": 100,
         "validation_block_hash": "0x" + "aa" * 32,
@@ -418,19 +503,68 @@ class TestValidationEvidence(RecorderBase):
         self.assertEqual(reason, reason.strip())
 
 
+class TestDiscoveryVsValidationDistinction(RecorderBase):
+    """MI-105-R1 WS-B: pipeline-level distinction between a DISCOVERED
+    candidate and an actually-VALIDATED one. The discovery-time status value
+    is never interpreted as evidence that validation ran."""
+
+    def test_unsupported_route_is_excluded_before_the_validator(self):
+        import unittest.mock as mock
+        engine = T._engine(T._graph())
+        opp = T._opp([P1, P2], [WETH, A, WETH], meta={
+            "validation_status": "discovered",
+            "execution_supported": False,
+            "execution_reason": "route contains an unsupported venue",
+        })
+        with mock.patch("validation.validate_many") as vm:
+            engine.process_candidates([opp], 100)
+            vm.assert_not_called()  # the validator was never invoked
+        det = [r for r in self.records() if r.get("record_type") == "detection"][0]
+        self.assertFalse(det["validation"]["performed"])   # validation NOT performed
+        # discovery status semantics unchanged; support limitation separate
+        self.assertEqual(det["eligibility"]["validation_status"], "discovered")
+        self.assertFalse(det["eligibility"]["execution_supported"])
+        self.assertEqual(det["eligibility"]["execution_reason"],
+                         "route contains an unsupported venue")
+        self.assertFalse(det["market_inputs"]["quote_inputs"]["quote_attempted"])
+
+    def test_entered_validation_without_quote_still_not_performed(self):
+        """A candidate that reaches validate_many but fails a pre-check
+        (offline: no ArbExec/sender) never performed a quote either."""
+        import unittest.mock as mock
+        engine = T._engine(T._graph())
+        opp = T._opp([P1, P2], [WETH, A, WETH], meta={
+            "validation_status": None,
+            "execution_supported": True,
+        })
+        with mock.patch("validation.validate_many", wraps=__import__("validation").validate_many) as vm:
+            engine.process_candidates([opp], 100)
+            vm.assert_called()  # validation stage entered
+        det = [r for r in self.records() if r.get("record_type") == "detection"][0]
+        self.assertFalse(det["validation"]["performed"])   # but no quote ran
+        self.assertFalse(det["market_inputs"]["quote_inputs"]["quote_attempted"])
+        self.assertIsNotNone(det["validation"]["reason"])  # the pre-check reason is kept
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # WS-C — real quote-size evidence
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestQuoteSizeEvidence(RecorderBase):
-    def _validator(self, ad_amount_in, profit, fail_estimate=False):
-        import validation.opportunity as vo
+    """MI-105-R1 WS-C: quote evidence preserved at the point it becomes
+    available, per the authoritative Exec.sol semantics (Data.amountIn; mode 0
+    = trade input in tokens[0], mode 1 = borrowed route amount in tokens[1])."""
 
+    AD_TOKENS = [WETH, A, WETH]
+    AD_POOLS = [P1, P2]
+    AD_FEES = [3000, 3000]
+
+    def _validator(self, *, ad_amount_in=2_500_000, profit=750_000,
+                   quote_raises=None, fail_estimate=False, fail_sim_call=False):
         captured = {}
-
-        class FakeTxBuilder:
-            def build_transaction(self, kwargs):
-                return {"from": kwargs.get("from"), "chainId": kwargs.get("chainId")}
+        ad_tokens = list(self.AD_TOKENS)
+        ad_pools = list(self.AD_POOLS)
+        ad_fees = list(self.AD_FEES)
 
         class FakeFunctions:
             def yieldOut(self, raw):
@@ -440,8 +574,10 @@ class TestQuoteSizeEvidence(RecorderBase):
                 class Pending:
                     def call(self, *, block_identifier=None):
                         captured["block"] = block_identifier
-                        return ((ad_amount_in, 0, (), (), (),
-                                 "0x" + "11" * 20, 0), profit)
+                        if quote_raises is not None:
+                            raise quote_raises
+                        return ((ad_amount_in, 0, ad_tokens, ad_pools,
+                                 ad_fees, ad_tokens[0], 0), profit)
 
                 return Pending()
 
@@ -468,6 +604,8 @@ class TestQuoteSizeEvidence(RecorderBase):
                 return 123_456
 
             def call(self, tx, block_identifier=None):
+                if fail_sim_call:
+                    raise RuntimeError("simulation reverted")
                 return b""
 
         class FakeW3:
@@ -483,43 +621,64 @@ class TestQuoteSizeEvidence(RecorderBase):
         validator.contract = FakeContract()
         return validator, captured
 
-    def test_validator_preserves_contract_selected_amount(self):
+    def _validated_metadata(self, validator, opp, block=100):
         import unittest.mock as mock
-        validator, captured = self._validator(ad_amount_in=2_500_000, profit=750_000)
+        with mock.patch("validation.opportunity.recorded_agent_address",
+                        return_value="0x" + "22" * 20):
+            result = validator.validate(opp, block_number=block)
+        return result
+
+    def _write_meta(self, opp, result, block=100):
+        """Mirror validate_many's metadata write for recorder-level tests."""
+        meta = dict(opp.metadata)
+        meta["validation_status"] = result.status
+        meta["validation_performed"] = bool(result.quote_attempted)
+        meta["validation_stage_failed"] = result.stage_failed or None
+        meta["validation_block"] = block
+        meta["validation_block_hash"] = "0x" + "bb" * 32
+        meta["validation_reason"] = result.reason
+        meta["execution_simulated"] = result.ok
+        meta["quote_attempted"] = bool(result.quote_attempted)
+        meta["quote_returned"] = bool(result.quote_returned)
+        meta["quote_profit_wei"] = result.quote_profit_wei
+        meta["quote_amount_in_raw"] = result.amount_in_raw
+        meta["quote_amount_in_denomination"] = result.amount_in_token or None
+        meta["quote_amount_in_mode"] = result.amount_in_mode
+        meta["quote_method"] = result.quote_method or None
+        meta["validation_mode_attempts"] = (
+            [dict(e) for e in result.mode_attempts] if result.mode_attempts else None)
+        opp.metadata = meta
+
+    def _record(self, engine, opp):
+        import unittest.mock as mock
+        with mock.patch.object(engine, "_apply_validation",
+                               side_effect=lambda c, b: c), \
+             mock.patch.object(engine, "_apply_adversarial",
+                               side_effect=lambda c, b: c):
+            engine.process_candidates([opp], 100)
+        return [r for r in self.records() if r.get("record_type") == "detection"][0]
+
+    def test_mode0_quote_denomination_is_first_returned_token(self):
+        import unittest.mock as mock
+        validator, captured = self._validator()
         opp = T._opp([P1, P2], [WETH, A, WETH], meta={
             "execution_supported": True, "fees_bps": [30, 30]})
         with mock.patch("validation.opportunity.recorded_agent_address",
                         return_value="0x" + "22" * 20):
             result = validator.validate(opp, block_number=100)
         self.assertTrue(result.ok)
+        self.assertTrue(result.quote_attempted and result.quote_returned)
         self.assertEqual(result.amount_in_raw, 2_500_000)
-        self.assertEqual(result.amount_in_token, WETH)
+        # denomination from the RETURNED ad token path (tokens[0] for mode 0)
+        self.assertEqual(result.amount_in_token, self.AD_TOKENS[0])
         self.assertEqual(result.quote_method, "exec_yieldOut")
         self.assertEqual(captured["block"], 100)  # quote pinned to the candidate block
-        # write the evidence into metadata exactly as validate_many does
-        meta = dict(opp.metadata)
-        meta["validation_status"] = result.status
-        meta["validation_reason"] = result.reason
-        meta["validation_block"] = 100
-        meta["validation_block_hash"] = "0x" + "bb" * 32
-        meta["execution_simulated"] = result.ok
-        meta["quote_amount_in_raw"] = result.amount_in_raw
-        meta["quote_amount_in_denomination"] = result.amount_in_token or None
-        meta["quote_amount_in_mode"] = result.amount_in_mode
-        meta["quote_method"] = result.quote_method or None
-        opp.metadata = meta
-        # record through the engine pipeline WITHOUT re-running the engine's
-        # own offline validation pass (which would overwrite the metadata)
-        engine = T._engine(T._graph())
-        with mock.patch.object(engine, "_apply_validation",
-                               side_effect=lambda c, b: c), \
-             mock.patch.object(engine, "_apply_adversarial",
-                               side_effect=lambda c, b: c):
-            engine.process_candidates([opp], 100)
-        det = [r for r in self.records() if r.get("record_type") == "detection"][0]
+        self._write_meta(opp, result)
+        det = self._record(T._engine(T._graph()), opp)
         qi = det["market_inputs"]["quote_inputs"]
         self.assertEqual(qi["quote_amount_in_raw"], 2_500_000)
-        self.assertEqual(qi["quote_amount_in_denomination"], WETH)
+        self.assertEqual(qi["quote_amount_in_denomination"], self.AD_TOKENS[0])
+        self.assertTrue(qi["quote_attempted"] and qi["quote_returned"])
         self.assertEqual(det["market_inputs"]["quote_method"], "exec_yieldOut")
         self.assertEqual(det["size_and_profit"]["trade_size_amount_in"], 2_500_000)
         self.assertEqual(det["size_and_profit"]["size_selection_method"],
@@ -527,20 +686,101 @@ class TestQuoteSizeEvidence(RecorderBase):
         self.assertTrue(det["validation"]["performed"])
         self.assertEqual(det["validation"]["status"], "execution_simulated")
 
-    def test_mode1_amount_is_labelled_profit_target(self):
-        engine = T._engine(T._graph())
+    def test_mode1_amount_is_borrowed_route_amount_in_second_token(self):
+        """MI-105-R1 WS-C: mode 1 is a BORROWED ROUTE AMOUNT denominated in the
+        SECOND route token (Exec.sol `// 0 = borrow token in,
+        1 = borrow other token`) — not a profit target in the first token."""
+        import unittest.mock as mock
+        validator, _ = self._validator()
         opp = T._opp([P1, P2], [WETH, A, WETH], meta={
-            "validation_status": "execution_simulated",
-            "quote_amount_in_raw": 750_000,
-            "quote_amount_in_denomination": WETH,
-            "quote_amount_in_mode": 1,
-            "quote_method": "exec_yieldOut",
-        })
-        engine.process_candidates([opp], 100)
-        det = [r for r in self.records() if r.get("record_type") == "detection"][0]
-        self.assertEqual(det["size_and_profit"]["trade_size_amount_in"], 750_000)
+            "execution_supported": True, "fees_bps": [30, 30]})
+        # make the mode-0 attempt fail at the gas-estimate stage so mode 1 runs
+        est_calls = {"n": 0}
+        orig_est = validator.w3.eth.estimate_gas
+
+        def counting_est(tx, block_identifier=None):
+            est_calls["n"] += 1
+            if est_calls["n"] == 1:
+                raise RuntimeError("mode 0 gas fail")
+            return 123_456
+
+        validator.w3.eth.estimate_gas = counting_est
+        with mock.patch("validation.opportunity.recorded_agent_address",
+                        return_value="0x" + "22" * 20):
+            try:
+                result = validator.validate(opp, block_number=100)
+            finally:
+                validator.w3.eth.estimate_gas = orig_est
+        self.assertTrue(result.ok)
+        self.assertEqual(result.lender_mode, 1)
+        self.assertEqual(result.amount_in_mode, 1)
+        # mode 1 denomination: the SECOND token of the returned ad path
+        self.assertEqual(result.amount_in_token, self.AD_TOKENS[1])
+        # per-mode evidence identifies which stage each attempt failed at
+        self.assertEqual(len(result.mode_attempts), 2)
+        self.assertEqual(result.mode_attempts[0]["stage_failed"], "gas_estimate")
+        self.assertEqual(result.mode_attempts[0]["lender"], "balancer")
+        self.assertEqual(result.mode_attempts[1]["status"], "execution_simulated")
+        self._write_meta(opp, result)
+        det = self._record(T._engine(T._graph()), opp)
+        self.assertEqual(det["size_and_profit"]["trade_size_amount_in"], 2_500_000)
         self.assertEqual(det["size_and_profit"]["size_selection_method"],
-                         "contract_profit_target")
+                         "contract_optimal_borrow")
+        self.assertEqual(det["market_inputs"]["quote_inputs"]["quote_amount_in_denomination"],
+                         self.AD_TOKENS[1])
+        attempts = det["validation"]["mode_attempts"]
+        self.assertEqual(attempts[0]["stage_failed"], "gas_estimate")
+        self.assertEqual(attempts[1]["status"], "execution_simulated")
+
+    def test_quote_call_failure_is_attempted_but_never_obtained(self):
+        """MI-105-R1 WS-C: when yieldOut itself reverts, the quote is
+        ATTEMPTED but not OBTAINED — no amount evidence, no false method claim."""
+        import unittest.mock as mock
+        validator, _ = self._validator(quote_raises=RuntimeError("execution reverted: AmountRequired"))
+        opp = T._opp([P1, P2], [WETH, A, WETH], meta={
+            "execution_supported": True, "fees_bps": [30, 30]})
+        with mock.patch("validation.opportunity.recorded_agent_address",
+                        return_value="0x" + "22" * 20):
+            result = validator.validate(opp, block_number=100)
+        # both lender modes attempted the quote and both reverted → the final
+        # result is "rejected" with per-mode evidence kept
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "rejected")
+        self.assertTrue(result.quote_attempted)   # the quote WAS attempted…
+        self.assertFalse(result.quote_returned)   # …but never OBTAINED
+        self.assertIsNone(result.amount_in_raw)   # no amount evidence
+        self.assertEqual(result.mode_attempts[0]["status"], "quote_rejected")
+        self.assertEqual(result.mode_attempts[0]["stage_failed"], "quote_call")
+        self.assertEqual(result.mode_attempts[1]["status"], "quote_rejected")
+
+    def test_post_quote_simulation_failure_preserves_quote_evidence(self):
+        """MI-105-R1 WS-C: a failure AFTER a returned quote keeps the amount,
+        denomination, mode and quote profit, and names the failed stage."""
+        import unittest.mock as mock
+        validator, _ = self._validator(fail_sim_call=True)
+        opp = T._opp([P1, P2], [WETH, A, WETH], meta={
+            "execution_supported": True, "fees_bps": [30, 30]})
+        with mock.patch("validation.opportunity.recorded_agent_address",
+                        return_value="0x" + "22" * 20):
+            result = validator.validate(opp, block_number=100)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.quote_returned)              # quote WAS obtained
+        self.assertEqual(result.amount_in_raw, 2_500_000)
+        # both modes failed post-quote; the final result carries the MOST
+        # RECENT returned quote (mode 1 → second route token), and the per-mode
+        # attempts keep each mode's own denomination and failed stage
+        self.assertEqual(result.amount_in_token, self.AD_TOKENS[1])
+        self.assertEqual(result.amount_in_mode, 1)
+        self.assertEqual(result.quote_profit_wei, 750_000)
+        self.assertEqual(result.stage_failed, "simulation_call")
+        self.assertEqual(result.mode_attempts[0]["amount_in_token"], self.AD_TOKENS[0])
+        self.assertEqual(result.mode_attempts[0]["stage_failed"], "simulation_call")
+        self._write_meta(opp, result)
+        det = self._record(T._engine(T._graph()), opp)
+        self.assertTrue(det["validation"]["performed"])
+        self.assertEqual(det["validation"]["stage_failed"], "simulation_call")
+        self.assertEqual(det["market_inputs"]["quote_inputs"]["quote_amount_in_raw"], 2_500_000)
+        self.assertEqual(det["size_and_profit"]["trade_size_amount_in"], 2_500_000)
 
     def test_missing_quote_evidence_stays_explicitly_unavailable(self):
         engine = T._engine(T._graph())
@@ -553,6 +793,8 @@ class TestQuoteSizeEvidence(RecorderBase):
         qi = det["market_inputs"]["quote_inputs"]
         self.assertIsNone(qi["quote_amount_in_raw"])
         self.assertIsNone(qi["quote_amount_in_denomination"])
+        self.assertFalse(qi["quote_attempted"])
+        self.assertFalse(qi["quote_returned"])
         self.assertIsNone(det["market_inputs"]["quote_method"])
         self.assertIsNone(det["size_and_profit"]["trade_size_amount_in"])
         self.assertIsNone(det["size_and_profit"]["size_selection_method"])
@@ -563,25 +805,61 @@ class TestQuoteSizeEvidence(RecorderBase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestLifecycleScheduleGate(unittest.TestCase):
+    """MI-105-R1 WS-D: absence is detector-observed ONLY when the candidate's
+    route was inside the invocation's ACTUAL search scope; otherwise the
+    candidate is retained until the bounded hard-TTL, which is recorded as a
+    TIMEOUT — never as proof the opportunity disappeared."""
+
     def setUp(self):
         self.tracker = OpportunityTracker(T._NoopOppLogger())
 
-    def _drive(self, opp, start=100):
-        self.tracker.process_block(start, [opp], detector_scheduled={"cycles"})
+    def _drive(self, opp, start=100, scheduled={"cycles"}, scope={P1.lower(), P2.lower()}):
+        self.tracker.process_block(start, [opp], detector_scheduled=set(scheduled),
+                                   searched_pools=set(scope))
         # absent for 4 blocks with the detector NOT scheduled → must stay open
         for b in range(start + 1, start + 5):
-            self.tracker.process_block(b, [], detector_scheduled=set())
+            self.tracker.process_block(b, [], detector_scheduled=set(),
+                                       searched_pools=set())
 
     def test_absence_without_scheduling_does_not_close(self):
         opp = T._opp([P1, P2], [WETH, A, WETH])
         self._drive(opp)
         self.assertEqual(self.tracker.active_count, 1)
 
-    def test_scheduled_absence_closes_honestly(self):
+    def test_invoked_detector_with_unrelated_scope_does_not_close(self):
+        """MI-105-R1 WS-D: a touched-pool detector may run while the candidate's
+        own pools are NOT in its search scope — that absence is not evidence of
+        disappearance, so the candidate is retained (hard-TTL only)."""
+        opp = T._opp([P1, P2], [WETH, A, WETH])
+        self._drive(opp, scheduled={"cycles"}, scope={P3.lower()})  # unrelated scope
+        self.tracker.process_block(106, [], detector_scheduled={"cycles"},
+                                   searched_pools={P3.lower()})
+        self.assertEqual(self.tracker.active_count, 1)  # retained, not closed
+
+    def test_genuinely_searched_route_absence_closes(self):
+        """MI-105-R1 WS-D: when the route WAS within the searched scope, the
+        detector-observed absence closes the candidate with the honest basis."""
         opp = T._opp([P1, P2], [WETH, A, WETH])
         self._drive(opp)
-        self.tracker.process_block(106, [], detector_scheduled={"cycles"})
+        self.tracker.process_block(106, [], detector_scheduled={"cycles"},
+                                   searched_pools={P1.lower(), P2.lower()})
         self.assertEqual(self.tracker.active_count, 0)
+        self.assertEqual(self.tracker.last_close_metadata.get("tracker_closure_basis"),
+                         "detector_scope_absence")
+
+    def test_hard_ttl_closure_is_a_timeout_not_a_disappearance(self):
+        """MI-105-R1 WS-D: a hard-TTL closure is labelled as a TIMEOUT —
+        distinguishable from an observed disappearance."""
+        opp = T._opp([P1, P2], [WETH, A, WETH])
+        self.tracker.process_block(100, [opp], detector_scheduled={"cycles"},
+                                   searched_pools={P1.lower(), P2.lower()})
+        for b in range(101, 167):
+            self.tracker.process_block(b, [], detector_scheduled=set(),
+                                       searched_pools=set())
+        self.assertEqual(self.tracker.active_count, 0)
+        self.assertEqual(self.tracker.last_close_metadata.get("tracker_closure_basis"),
+                         "tracker_hard_ttl_timeout")
+        self.assertFalse(self.tracker.last_close_metadata.get("detector_scheduled_at_close"))
 
     def test_legacy_callers_keep_unconditional_ttl(self):
         opp = T._opp([P1, P2], [WETH, A, WETH])
@@ -592,24 +870,59 @@ class TestLifecycleScheduleGate(unittest.TestCase):
 
     def test_mempool_origin_expires_by_ttl_without_scheduling(self):
         opp = T._opp([P1, P2], [WETH, A, WETH], is_mempool=True)
-        self.tracker.process_block(100, [opp], detector_scheduled=set())
+        self.tracker.process_block(100, [opp], detector_scheduled=set(),
+                                   searched_pools=set())
         for b in range(101, 107):
-            self.tracker.process_block(b, [], detector_scheduled=set())
+            self.tracker.process_block(b, [], detector_scheduled=set(),
+                                       searched_pools=set())
         self.assertEqual(self.tracker.active_count, 0)
 
     def test_hard_ttl_closes_eventually_without_fabrication(self):
         opp = T._opp([P1, P2], [WETH, A, WETH])
-        self.tracker.process_block(100, [opp], detector_scheduled={"cycles"})
+        self.tracker.process_block(100, [opp], detector_scheduled={"cycles"},
+                                   searched_pools={P1.lower(), P2.lower()})
         for b in range(101, 167):
-            self.tracker.process_block(b, [], detector_scheduled=set())
+            self.tracker.process_block(b, [], detector_scheduled=set(),
+                                       searched_pools=set())
         self.assertEqual(self.tracker.active_count, 0)
 
     def test_competitor_overlap_closes_regardless_of_schedule(self):
         opp = T._opp([P1, P2], [WETH, A, WETH])
-        self.tracker.process_block(100, [opp], detector_scheduled={"cycles"})
+        self.tracker.process_block(100, [opp], detector_scheduled={"cycles"},
+                                   searched_pools={P1.lower(), P2.lower()})
         self.tracker.process_block(101, [], detector_scheduled=set(),
+                                   searched_pools=set(),
                                    filled_pools={P1.lower(): "0x" + "ff" * 32})
         self.assertEqual(self.tracker.active_count, 0)
+        self.assertEqual(self.tracker.last_close_metadata.get("tracker_closure_basis"),
+                         "competitor_overlap")
+
+    def test_scheduled_pass_detector_evidence_not_omitted(self):
+        """MI-105-R1 WS-D: the invoked-detector list must include a scheduled
+        pass that actually ran, and its searched seed pools must be reported
+        as the invocation's scope."""
+        graph = _v2_graph()
+
+        class FakeCyclesDetector:
+            name = "cycles"
+            block_interval = 1
+            requires_touched_pools = False
+
+            def on_block(self, block_number, touched_pools=None, scheduled_seeds=None,
+                         extra_pairs=None, **kw):
+                # scheduled pass calls with scheduled_seeds; reactive with touched
+                if scheduled_seeds is not None:
+                    self.last_scheduled_seeds = set(scheduled_seeds or set())
+                return []
+
+        engine = T._engine(graph)
+        det = FakeCyclesDetector()
+        engine.detectors = [det]
+        engine.scheduled_discovery = True
+        result = engine.process(100, touched_pools=set())
+        # a scheduled slice ran (cadence due at startup) → evidence present
+        self.assertIn("cycles", result.scheduled_detectors)
+        self.assertTrue(result.searched_pools)  # the slice's seed pools
 
     def test_shadow_close_record_exists_for_non_ready_candidate(self):
         rec_path = Path(tempfile.mkdtemp(prefix="mi105_lc_")) / "shadow_validation.jsonl"
@@ -622,8 +935,11 @@ class TestLifecycleScheduleGate(unittest.TestCase):
                          meta={"validation_status": None, "execution_supported": False})
             engine.process_candidates([opp], 100)          # shadow OPEN
             tracker = OpportunityTracker(T._NoopOppLogger())
-            tracker.process_block(100, [opp], detector_scheduled={"cycles"})
-            tracker.process_block(106, [], detector_scheduled={"cycles"})
+            scope = {P1.lower(), P2.lower()}
+            tracker.process_block(100, [opp], detector_scheduled={"cycles"},
+                                  searched_pools=scope)
+            tracker.process_block(106, [], detector_scheduled={"cycles"},
+                                  searched_pools=scope)
             recs = recorder.read_records()
             events = [(r.get("record_type"), r.get("event")) for r in recs]
             self.assertIn(("lifecycle", "CLOSE"), events)  # non-ready candidates close too

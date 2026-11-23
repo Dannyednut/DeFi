@@ -25,6 +25,12 @@ class PipelineResult:
     # distinguish "the candidate's detector searched and did not find it"
     # from "the detector was not scheduled, so absence means nothing".
     scheduled_detectors: tuple[str, ...] = ()
+    # MI-105-R1 WS-D: the pools that were within the invocation's ACTUAL search
+    # scope — reactive: the touched pools whose routes were enumerated; the
+    # scheduled slice: the seed pools actually searched. The tracker's
+    # lifecycle gate uses this to distinguish a genuinely searched-and-absent
+    # route from an invocation that simply did not cover the candidate.
+    searched_pools: tuple[str, ...] = ()
 
 @dataclass
 class OpportunityEngine:
@@ -178,12 +184,19 @@ class OpportunityEngine:
         # as the reactive path; a candidate reachable by both paths carries
         # one executable-route identity and cannot enter the pipeline twice.
         try:
-            finalize(self._scheduled_pass_opportunities(
+            found_scheduled, scheduled_pool_scope = self._scheduled_pass_opportunities(
                 block_number, touched_pools,
-                reactive_cycle_ok=reactive_cycle_ok, reactive_cross_ok=reactive_cross_ok), None)
+                reactive_cycle_ok=reactive_cycle_ok, reactive_cross_ok=reactive_cross_ok)
+            finalize(found_scheduled, None)
+            # MI-105-R1 WS-D: the scheduled pass must not be omitted from the
+            # invoked-detector evidence when it actually ran.
+            invoked.extend(sorted(getattr(self, "_last_scheduled_invoked", ()) or ()))
+            scheduled_scope = scheduled_pool_scope
         except Exception as exc:
             get_logger("opportunity_engine").error(f"Scheduled discovery pass failed: {exc}", exc_info=True)
-        return self._dedupe(candidates), tuple(dict.fromkeys(invoked))
+            scheduled_scope = set()
+        searched = set(touched_pools or ()) | set(scheduled_scope or set())
+        return self._dedupe(candidates), tuple(dict.fromkeys(invoked)), searched
 
     # ════════════════════════════════════════════════════════════════════════════
     # MI-102B: bounded event-independent discovery
@@ -399,9 +412,17 @@ class OpportunityEngine:
         one slice; a batch is never started while a previous one is
         incomplete, and it completes only when the cursor AND the priority
         queue are exhausted (recorded with start AND completion info).
+
+        Returns ``(candidates, searched_pool_scope)`` — MI-105-R1 WS-D: the
+        second element is the set of seed pools the scheduled pass ACTUALLY
+        searched in this invocation (empty when nothing ran), so lifecycle
+        evidence never claims a scope that was not covered. The invoked
+        detector names are recorded on ``self._last_scheduled_invoked``.
         """
+        self._last_scheduled_invoked: set[str] = set()
+        self._last_scheduled_searched_pools: set[str] = set()
         if not self.scheduled_discovery or self.graph is None:
-            return []
+            return [], self._last_scheduled_searched_pools
         touched_lower = {p.lower() for p in (touched_pools or ())}
         # R1A1 §3: duplicate-work suppression applies ONLY to pools the
         # reactive cycle detector actually scanned successfully this block.
@@ -414,7 +435,7 @@ class OpportunityEngine:
             due = self._last_scheduled_block is None or \
                 (int(block_number) - self._last_scheduled_block) >= max(1, int(self.scheduled_pass_interval))
             if not due and not has_pending:
-                return []
+                return [], self._last_scheduled_searched_pools
             reason = "cadence" if due else "new_pools"
 
             universe = self.pair_universe
@@ -499,6 +520,7 @@ class OpportunityEngine:
                             else:
                                 found = detector.on_block(block_number, extra_pairs=universe.additional_pairs())
                             self._tag_scheduled(found, reason)
+                            self._last_scheduled_invoked.add(getattr(detector, "name", "") or "cross_proto")
                             out.extend(found or [])
                             if not anchor_stage_covered:
                                 # the successful call just completed the anchor
@@ -606,6 +628,7 @@ class OpportunityEngine:
                                     found = detector.on_block(
                                         block_number, extra_pairs=batch["additional_pairs"], check_anchors=False)
                                 self._tag_scheduled(found, batch["reason"])
+                                self._last_scheduled_invoked.add(getattr(detector, "name", "") or "cross_proto")
                                 out.extend(found or [])
                                 batch["pair_checks_ok"] = True
                                 if check_anchors:
@@ -688,6 +711,11 @@ class OpportunityEngine:
                         found = detector.on_block(block_number, touched_pools=None,
                                                   scheduled_seeds=set(slice_seeds))
                         self._tag_scheduled(found, batch["reason"])
+                        self._last_scheduled_invoked.add(getattr(detector, "name", "") or "cycles")
+                        # MI-105-R1 WS-D: the slice's seed pools are the scope
+                        # actually searched by this scheduled invocation.
+                        self._last_scheduled_searched_pools.update(
+                            (s or "").lower() for s in slice_seeds)
                         out.extend(found or [])
                     except Exception as exc:
                         detector_failed = True
@@ -883,7 +911,7 @@ class OpportunityEngine:
                     len(restored),
                 )
                 self._scheduled_batch = None
-        return out
+        return out, set(self._last_scheduled_searched_pools)
 
     @staticmethod
     def _identity_key(opp: Opportunity) -> tuple:
@@ -989,7 +1017,7 @@ class OpportunityEngine:
             opp.metadata = meta
         return candidates
 
-    def process_candidates(self, candidates: list[Opportunity], block_number: int, *, rank_ready: bool = True, block_context=None, invoked_detectors: tuple[str, ...] = ()) -> PipelineResult:
+    def process_candidates(self, candidates: list[Opportunity], block_number: int, *, rank_ready: bool = True, block_context=None, invoked_detectors: tuple[str, ...] = (), searched_pools: set | tuple | None = None) -> PipelineResult:
         if block_context is not None:
             bh = block_context.block_hash
             state_block = block_context.number
@@ -1040,12 +1068,13 @@ class OpportunityEngine:
         except Exception:
             pass
         return PipelineResult(tuple(candidates), tuple(ready), tuple(rejected),
-                              scheduled_detectors=tuple(invoked_detectors))
+                              scheduled_detectors=tuple(invoked_detectors),
+                              searched_pools=tuple(sorted({(p or "").lower() for p in (searched_pools or ())})))
 
     def process(self, block_number: int, *, touched_pools: set[str] | None = None, block_context=None) -> PipelineResult:
-        discovered, invoked = self._discover(block_number, touched_pools, block_context)
+        discovered, invoked, searched = self._discover(block_number, touched_pools, block_context)
         return self.process_candidates(discovered, block_number, block_context=block_context,
-                                       invoked_detectors=invoked)
+                                       invoked_detectors=invoked, searched_pools=searched)
 
     def scan(self, block_number: int, touched_pools: set[str] | None = None) -> list[Opportunity]:
         return list(self.process(block_number, touched_pools=touched_pools).ready)

@@ -288,17 +288,21 @@ def process_block(
     if router:
         router.process_results()
     
-    # DSS-WO-MI-105 WS-D: the tracker observes EVERY candidate leaving the
+    # DSS-WO-MI-105 WS-D + R1: the tracker observes EVERY candidate leaving the
     # pipeline (execution-ready or not) so lifecycle CLOSE evidence exists for
     # non-ready candidates too. Router submission stays ready-only.
-    # detector_scheduled (which detectors actually ran this block) prevents
-    # false EXPIRED closures when a candidate's detector was not scheduled.
+    # detector_scheduled (which detectors ran) + searched_pools (the
+    # invocation's ACTUAL search scope) prevent false EXPIRED closures: a
+    # candidate is only expired as detector-observed absence when its own
+    # route was inside the searched scope; otherwise it is retained until the
+    # bounded hard-TTL, with the closure basis recorded either way.
     if opportunity_engine is not None:
         tracker.process_block(
             block_number,
             list(result.candidates),
             filled_pools=filled_pools,
             detector_scheduled=set(result.scheduled_detectors),
+            searched_pools=set(result.searched_pools),
         )
     else:
         tracker.process_block(block_number, all_opps, filled_pools=filled_pools)

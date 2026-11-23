@@ -367,11 +367,13 @@ class TestDetectionRecording(RecorderTestBase):
             self.assertIn(field, rec["unavailable_fields"])
         self.assertNotIn("quote_method", rec["unavailable_fields"])
         self.assertNotIn("size_selection_method", rec["unavailable_fields"])
-        # MI-105 WS-B: this fixture carries validation_status="quote_validated",
-        # so the validation object must reflect an ACTUAL validation outcome
-        # (performed=True); the never-validated distinction is covered in
-        # tests/test_mi105_shadow_evidence.py.
-        self.assertTrue(rec["validation"]["performed"])
+        # MI-105 WS-B + R1: this fixture carries validation_status="quote_validated"
+        # as standalone metadata, but the engine's validation stage EXCLUDES
+        # execution_supported=False candidates before validate_many — the
+        # validator never ran, so the record must say validation was NOT
+        # performed (explicit validation_performed signal, never inferred from
+        # the presence of a status field).
+        self.assertFalse(rec["validation"]["performed"])
         self.assertEqual(rec["validation"]["status"], "quote_validated")
         self.assertIsNone(rec["validation"]["reason"])
         self.assertNotIn("provider_url", json.dumps(rec).lower())

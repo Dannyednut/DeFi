@@ -293,18 +293,23 @@ class ProtocolStateSynchronizer:
         if other:
             try:
                 from registry import refresh_pools_batched
-                done = refresh_pools_batched(self.w3, self.graph, self.cache, other,
-                                             block_identifier=read_number)
-                refreshed.update(done)
-                for address in other - done:
+                pinned, unpinned = refresh_pools_batched(self.w3, self.graph, self.cache, other,
+                                                         block_identifier=read_number)
+                refreshed.update(pinned)
+                for address in other - pinned - unpinned:
                     self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_refresh_incomplete")
+                # MI-105-R1 WS-A: fallback reads are LATEST-state reads. Keep the
+                # refreshed values, but never attach the context block/hash or a
+                # FRESH label to provenance that is not pinned to that block.
+                for address in unpinned:
+                    self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_fallback_unpinned")
             except Exception as exc:
                 log.warning("Batched adapter refresh failed for %d pools: %s", len(other), exc)
                 for address in other:
                     self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"refresh_error:{type(exc).__name__}")
 
-        # Stamp only pools that actually refreshed. Because the batch reads are
-        # pinned to read_number, the stamped state block/hash identify the
+        # Stamp only pools whose read was PINNED to read_number. Because the
+        # batch reads are pinned, the stamped state block/hash identify the
         # state actually read (MI-105 §2); a successful refresh now also
         # produces the explicit, truthful FRESH status.
         for address in refreshed:
@@ -334,6 +339,11 @@ class ProtocolStateSynchronizer:
             try:
                 done = self._refresh_multicall3(v2v3, block_identifier=read_number) or set()
                 refreshed.update(done)
+                if read_number is None:
+                    # MI-105-R1 WS-A: an unpinned latest-state read must not
+                    # leave a prior FRESH label standing over new values.
+                    for address in done:
+                        self.graph.mark_pool_state(address, status="UNCERTAIN", source="multicall_unpinned_latest")
             except Exception as exc:
                 log.warning("Multicall3 state refresh failed for %d pools: %s", len(v2v3), exc)
                 for address in v2v3:
@@ -342,22 +352,27 @@ class ProtocolStateSynchronizer:
         if other:
             try:
                 from registry import refresh_pools_batched
-                done = refresh_pools_batched(self.w3, self.graph, self.cache, other,
-                                             block_identifier=read_number)
-                refreshed.update(done)
-                for address in other - done:
+                pinned, unpinned = refresh_pools_batched(self.w3, self.graph, self.cache, other,
+                                                         block_identifier=read_number)
+                refreshed.update(pinned)
+                for address in other - pinned - unpinned:
                     self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_refresh_incomplete")
+                # MI-105-R1 WS-A: fallback reads are LATEST-state reads — keep the
+                # values, never stamp FRESH provenance for them.
+                for address in unpinned:
+                    self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_fallback_unpinned")
             except Exception as exc:
                 log.warning("Batched adapter refresh failed for %d pools: %s", len(other), exc)
                 for address in other:
                     self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"refresh_error:{type(exc).__name__}")
 
-        # Stamp only pools that actually refreshed — and only when an explicit
-        # block context was supplied (MI-105 §2: no provenance claim without a
-        # pinned read block).
+        # Stamp FRESH only pools whose read was PINNED to the context block —
+        # and only when an explicit block context was supplied (MI-105 §2:
+        # no provenance claim without a pinned read block; MI-105-R1 WS-A:
+        # unpinned fallback pools are refreshed but marked UNCERTAIN above).
         if ctx is not None:
             for address in refreshed:
-                self._stamp(address, ctx, self._protocol(address))
+                self._stamp(address, read_number, read_hash, self._protocol(address))
         return refreshed
 
     def _version(self, address: str) -> int:

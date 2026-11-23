@@ -118,24 +118,32 @@ class OpportunityTracker:
         filled_pools: dict[str, str] = None,
         *,
         detector_scheduled: set | None = None,
+        searched_pools: set | None = None,
     ) -> None:
         """Process detected opportunities for a block.
 
-        DSS-WO-MI-105 WS-D: ``detector_scheduled`` is the set of detector
-        names whose ``on_block()`` actually ran in this block (from
-        ``PipelineResult.scheduled_detectors``). Detector schedules are
-        thesis-dependent — a candidate's absence from an invocation where its
-        detector did not run is NOT evidence that the opportunity disappeared.
-        Therefore a non-filled candidate is expired by TTL only when its
-        origin detector was scheduled this block, or once a bounded hard-TTL
-        (``TRACKER_HARD_TTL_BLOCKS``, default 64 — above every detector's
-        ``block_interval`` and the scheduled-pass interval) finally ages it
-        out; mempool-origin candidates are exempt (their trigger transaction
-        is gone with the block, so absence is meaningful). Callers that do not
-        pass the set keep the legacy unconditional-TTL behaviour.
+        DSS-WO-MI-105 WS-D + R1: detector schedules are thesis-dependent, and a
+        detector invocation does not by itself prove that a particular
+        candidate's route was searched. ``detector_scheduled`` is the set of
+        detector names whose ``on_block()`` actually ran in this block (from
+        ``PipelineResult.scheduled_detectors``); ``searched_pools`` is the
+        invocation's ACTUAL search scope (from ``PipelineResult.searched_pools``
+        — reactive touched pools plus the scheduled slice's seed pools).
 
-        No CLOSE event is ever fabricated: the outcome basis stays the honest
-        tracker absence/TTL heuristic recorded by the shadow recorder."""
+        A non-filled candidate is expired as detector-observed absence ONLY
+        when (a) its origin detector ran in this block AND (b) every route pool
+        was within that invocation's search scope — absence then means the
+        route was genuinely searched and not found. Otherwise the candidate is
+        retained until the bounded hard-TTL (``TRACKER_HARD_TTL_BLOCKS``,
+        default 64 — above every detector's ``block_interval`` and the
+        scheduled-pass interval) ages it out as a TIMEOUT — recorded with a
+        ``tracker_closure_basis`` that distinguishes a hard-TTL timeout from an
+        observed disappearance (a timeout is never labeled as proof that the
+        opportunity disappeared). Mempool-origin candidates are exempt from the
+        scope requirement (their trigger transaction is gone with the block, so
+        absence is meaningful). Callers that pass neither set keep the legacy
+        unconditional-TTL behaviour. No CLOSE is ever fabricated; the outcome
+        basis stays the honest tracker absence/TTL heuristic."""
         with self._lock:
             now = time.time()
             filled_pools = filled_pools or {}
@@ -221,14 +229,28 @@ class OpportunityTracker:
                 matched_pool = next((p.lower() for p in opp.pools if p.lower() in filled_pools), None)
                 is_filled = matched_pool is not None
 
-                # MI-105 WS-D: schedule-aware expiry gate (see process_block docstring)
+                # MI-105 WS-D + R1: schedule-AWARE and SCOPE-AWARE expiry gate
+                # (see process_block docstring). Absence is detector-observed
+                # only when the origin detector ran AND the route was inside
+                # the invocation's actual search scope.
                 if detector_scheduled is None:
                     schedule_ok = True  # legacy callers: unconditional TTL
+                    closure_basis = "tracker_legacy_ttl"
                 else:
                     m = getattr(opp, "metadata", {}) or {}
                     is_mempool = bool(m.get("is_mempool"))
                     origin = str(m.get("detector", "") or "")
-                    schedule_ok = is_mempool or (origin in detector_scheduled)
+                    origin_ran = is_mempool or (origin in detector_scheduled)
+                    scope_ok = False
+                    if origin_ran:
+                        if is_mempool:
+                            scope_ok = True  # trigger tx gone with the block
+                        elif searched_pools is not None and opp.pools:
+                            route = {(p or "").lower() for p in opp.pools}
+                            scope_ok = route.issubset({(p or "").lower() for p in searched_pools})
+                    schedule_ok = scope_ok
+                    closure_basis = ("detector_scope_absence" if schedule_ok
+                                     else "tracker_hard_ttl_timeout")
                 ttl_blocks = MAX_STALE_BLOCKS if schedule_ok else hard_ttl
 
                 # Not filled and not stale yet - keep tracking
@@ -246,6 +268,12 @@ class OpportunityTracker:
                 
                 metadata = opp.metadata.copy()
                 metadata["detector_scheduled_at_close"] = bool(schedule_ok)
+                # MI-105-R1 WS-D: a hard-TTL timeout must be distinguishable
+                # from an observed disappearance — never label an unobserved
+                # timeout as proof the opportunity disappeared.
+                metadata["tracker_closure_basis"] = (
+                    "competitor_overlap" if is_filled else closure_basis)
+                self.last_close_metadata = metadata
                 if is_filled:
                     metadata["outcome"] = "FILLED_BY_COMPETITOR"
                     metadata["tx_hash"] = filled_pools[matched_pool]

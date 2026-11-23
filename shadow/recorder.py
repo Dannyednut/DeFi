@@ -404,16 +404,19 @@ class ShadowRecorder:
         discovery_hash = meta.get("discovery_block_hash") or block_hash or None
         edge_hashes = {e["pool"]: e["state_block_hash"] for e in edge_states if e.get("state_block_hash")}
 
-        # DSS-WO-MI-105 WS-C: real quote-size evidence captured at the
-        # validation boundary (Exec contract's selected input). A known amount
-        # is preserved with its denomination and selection mode; null means no
-        # quote executed — never an inferred or estimated amount.
+        # DSS-WO-MI-105 WS-C + R1: real quote-size evidence captured at the
+        # validation boundary (the Exec contract's resolved Data.amountIn from
+        # yieldOut). A returned amount is preserved with its denomination —
+        # from the returned arb token path: mode 0 → tokens[0] (trade input),
+        # mode 1 → tokens[1] (the BORROWED ROUTE AMOUNT in the second route
+        # token, per Exec.sol `// 0 = borrow token in, 1 = borrow other token`
+        # — NOT a profit target). Both modes are contract-selected optimal
+        # borrows; they differ only in denomination. quote_attempted /
+        # quote_returned distinguish an attempted quote from an obtained one;
+        # null amounts mean no quote was OBTAINED — never an inferred amount.
         quote_amount_in = meta.get("quote_amount_in_raw")
         quote_mode = meta.get("quote_amount_in_mode")
-        size_method = None
-        if quote_amount_in is not None:
-            size_method = ("contract_profit_target" if quote_mode == 1
-                           else "contract_optimal_borrow")
+        size_method = "contract_optimal_borrow" if quote_amount_in is not None else None
         trade_size = quote_amount_in if quote_amount_in is not None else meta.get("optimal_amount_in")
 
         return {
@@ -475,6 +478,8 @@ class ShadowRecorder:
                     "quote_amount_in_raw": quote_amount_in,
                     "quote_amount_in_denomination": meta.get("quote_amount_in_denomination"),
                     "quote_amount_in_mode": quote_mode,
+                    "quote_attempted": bool(meta.get("quote_attempted", False)),
+                    "quote_returned": bool(meta.get("quote_returned", False)),
                 },
                 "quote_method": meta.get("quote_method"),
             },
@@ -513,16 +518,19 @@ class ShadowRecorder:
                 "adversarial_reason": meta.get("adversarial_reason"),
                 "router_decision": None,
             },
-            # DSS-WO-MI-105 WS-B: the actual validation outcome and its reason,
-            # kept separately from execution-support limitations (which remain
-            # in "eligibility"). "performed" distinguishes a candidate that was
-            # never validated (no validation_status in metadata) from one that
-            # was validated and rejected — a missing field is never interpreted
-            # as a rejection reason.
+            # DSS-WO-MI-105 WS-B + R1: the actual validation outcome and its
+            # reason, kept separately from execution-support limitations
+            # (which remain in "eligibility"). "performed" is the EXPLICIT
+            # validation-performed signal set by the validator when the
+            # quote/simulation stages were actually reached — a discovery-time
+            # status value is never interpreted as evidence that validation
+            # ran, and a missing field is never inferred as a rejection reason.
             "validation": {
-                "performed": meta.get("validation_status") is not None,
+                "performed": bool(meta.get("validation_performed", False)),
                 "status": meta.get("validation_status"),
                 "reason": self._sanitize_reason(meta.get("validation_reason")),
+                "stage_failed": meta.get("validation_stage_failed"),
+                "mode_attempts": meta.get("validation_mode_attempts"),
                 "validation_block": meta.get("validation_block"),
                 "validation_block_hash": meta.get("validation_block_hash"),
                 "execution_simulated": bool(meta.get("execution_simulated", False)),

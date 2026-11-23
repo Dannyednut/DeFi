@@ -532,17 +532,19 @@ def refresh_pools_batched(
     addresses: set[str],
     *,
     block_identifier: int | None = None,
-) -> set[str]:
+) -> tuple[set[str], set[str]]:
     """Refresh non-V2/V3 pools (Curve, Balancer, SyncSwap, Aerodrome, ...) in
     as few Multicall3 requests as possible, instead of one eth_call sequence
     per pool. Falls back to the sequential update_pool_reserves() path for
     any pool whose adapter doesn't support batched refresh.
 
-    DSS-WO-MI-105 §2: ``block_identifier`` pins the batched adapter reads to a
-    specific block (same semantics as multicall3_bulk_refresh). The sequential
-    fallback still reads latest state — pools refreshed through it inherit the
-    caller's stamp with the caller's pinned block; the residual
-    latest-vs-pinned gap for that fallback subset is a documented limitation.
+    DSS-WO-MI-105 §2 + R1 WS-A: returns ``(pinned_refreshed, unpinned_refreshed)``.
+    ``pinned_refreshed`` pools were read at exactly ``block_identifier`` (the
+    batched path, only when a block was supplied) — callers may stamp them
+    FRESH at that block. ``unpinned_refreshed`` pools were refreshed by a
+    latest-state read (the sequential fallback, or a batch with no supplied
+    block) — callers must keep the refreshed values but mark their provenance
+    UNCERTAIN / unverified instead of attaching a false block/hash stamp.
 
     This is the "curve/balancer/other adapters should build the calls
     instead" fast path — see ProtocolAdapter.build_refresh_calls() /
@@ -596,7 +598,8 @@ def refresh_pools_batched(
                            e0.fee_bps, dict(e0.metadata or {}))
             batchable.append((ref, adapter, dex_name, protocol, edges))
 
-    updated: set[str] = set()
+    updated_pinned: set[str] = set()
+    updated_unpinned: set[str] = set()
     if batchable:
         pairs = [(ref, adapter) for ref, adapter, _, _, _ in batchable]
         decoded = multicall3_bulk_refresh_adapters(w3, pairs, block_identifier=block_identifier)
@@ -606,16 +609,21 @@ def refresh_pools_batched(
         for addr, state in decoded.items():
             for ref, protocol, dex_name, edges in by_addr.get(addr, []):
                 if apply_adapter_state(graph, cache, addr, dex_name, protocol, edges, state):
-                    updated.add(addr)
+                    # MI-105-R1 WS-A: a batched read counts as pinned ONLY when a
+                    # block was supplied; without one it is a latest-state read.
+                    (updated_pinned if block_identifier is not None
+                     else updated_unpinned).add(addr)
 
     for addr in fallback:
         try:
+            # Sequential fallback reads LATEST state — never pinned to a block
+            # (MI-105-R1 WS-A: such pools must not be stamped FRESH at a block).
             update_pool_reserves(w3, graph, addr, cache)
-            updated.add(addr)
+            updated_unpinned.add(addr)
         except Exception as e:
             log.debug(f"fallback refresh failed {addr}: {e}")
 
-    return updated
+    return updated_pinned, updated_unpinned
 
 
 # ── In-process pair cache to avoid repeat RPC calls ──────────────────────────

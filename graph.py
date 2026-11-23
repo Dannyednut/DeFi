@@ -502,12 +502,42 @@ class TokenGraph:
         protocol = edges[0].protocol or ("uniswap_v3" if edges[0].version == 3 else "uniswap_v2")
         return (self.chain_id, protocol, edges[0].pool_address.lower())
 
-    def mark_pool_state(self, pool_address: str, *, status: str, source: str = "") -> None:
-        """Mark every derived edge for a pool with a common state status."""
+    def mark_pool_state(self, pool_address: str, *, status: str, source: str = "",
+                        clear_read_provenance: bool = False, cache=None) -> None:
+        """Mark every derived edge for a pool with a common state status.
+
+        DSS-WO-MI-105-R2 WS-A: UNCERTAIN transitions must not leave the
+        previous verified provenance standing as if it described the newly
+        refreshed values. With ``clear_read_provenance=True`` (used for every
+        UNCERTAIN mark) the current-read block/hash fields are CLEARED on the
+        edges. With ``cache`` supplied, the same status/source and the cleared
+        provenance are persisted through the existing
+        ``PoolCache.update_pool_state``, so ``warm_graph()`` cannot resurrect
+        the old status after a restart. No other state-management component is
+        introduced."""
         edges = self.get_edges_for_pool(pool_address)
         if not edges:
             return
-        self.upsert_pool_edges([replace(e, state_status=status, state_source=source or e.state_source) for e in edges])
+        updated = []
+        for e in edges:
+            kw = {"state_status": status, "state_source": source or e.state_source}
+            if clear_read_provenance:
+                kw["state_block"] = 0
+                kw["state_block_hash"] = ""
+            updated.append(replace(e, **kw))
+        self.upsert_pool_edges(updated)
+        if cache is not None:
+            first = updated[0]
+            try:
+                cache.update_pool_state(
+                    pool_address,
+                    state_block=first.state_block,
+                    state_block_hash=first.state_block_hash,
+                    state_source=first.state_source,
+                    state_status=first.state_status,
+                )
+            except Exception as exc:
+                log.debug(f"cache state persist skipped for {pool_address}: {exc}")
 
     def has_pool(self, pool_address: str) -> bool:
         """Check if pool exists in graph."""

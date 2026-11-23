@@ -146,7 +146,10 @@ class TestRefreshProvenance(unittest.TestCase):
         e = self.graph.get_edges_for_pool(P1)[0]
         self.assertEqual(e.state_status, "UNCERTAIN")
         self.assertIn("multicall_error", e.state_source)
-        self.assertEqual(e.state_block, 100)  # prior provenance untouched
+        # MI-105-R2 WS-A: the previous verified provenance is CLEARED — it must
+        # not be left standing as if it described the newly refreshed values.
+        self.assertEqual(e.state_block, 0)
+        self.assertEqual(e.state_block_hash, "")
 
     def test_incomplete_adapter_refresh_not_fresh(self):
         import unittest.mock as mock
@@ -184,7 +187,9 @@ class TestRefreshProvenance(unittest.TestCase):
         e = graph.get_edges_for_pool(P1)[0]
         self.assertEqual(e.state_status, "UNCERTAIN")
         self.assertEqual(e.state_source, "adapter_fallback_unpinned")
-        self.assertEqual(e.state_block, 100)  # no false block provenance attached
+        # MI-105-R2 WS-A: read provenance cleared — no stale block standing.
+        self.assertEqual(e.state_block, 0)
+        self.assertEqual(e.state_block_hash, "")
 
     def test_unpinned_adapter_fallback_by_addresses_is_never_fresh(self):
         """MI-105-R1 WS-A: same semantics through refresh_by_addresses."""
@@ -245,6 +250,235 @@ class TestRefreshProvenance(unittest.TestCase):
         self.assertEqual(pinned, set())
         self.assertEqual(unpinned, {P1.lower()})
         upr.assert_called_once()  # the fallback refresh DID run (values kept)
+
+    def test_refresh_pools_batched_empty_input_returns_tuple(self):
+        """MI-105-R2 §3: the empty-input branch returns the same tuple shape
+        as every other execution path."""
+        import registry as registry_mod
+        result = registry_mod.refresh_pools_batched(T.StubW3(), T._graph(), None, set())
+        self.assertEqual(result, (set(), set()))
+
+    def test_cache_reload_keeps_persisted_provenance_and_defaults_unknown(self):
+        import unittest.mock as mock
+        cache = _cache(self.tmp)
+        cache.set_pool(P1.lower(), {"token0": WETH.lower(), "token1": A.lower(),
+                                    "dex": "UniV2", "version": 2,
+                                    "r0": 10**18, "r1": 2 * 10**18,
+                                    "tvl_usd": 250_000.0})
+        cache.set_pool(P2.lower(), {"token0": A.lower(), "token1": B.lower(),
+                                    "dex": "UniV2", "version": 2,
+                                    "r0": 2 * 10**18, "r1": 2 * 10**18,
+                                    "tvl_usd": 250_000.0})
+        cache.update_pool_state(P1.lower(), state_block=500,
+                                state_block_hash="0x" + "cd" * 32,
+                                state_source="onchain:uniswap_v2:block_log",
+                                state_status="FRESH")
+        cache.save()
+
+        cache2 = _cache(self.tmp)
+        self.assertTrue(cache2.load())
+        graph = TokenGraph()
+        with mock.patch("tvl.is_above_min_liquidity", return_value=True):
+            restored = cache2.warm_graph(graph)  # provenance is the test target, not TVL
+        self.assertGreater(restored, 0)
+        e = graph.get_edges_for_pool(P1)[0]
+        self.assertEqual(e.state_status, "FRESH")
+        self.assertEqual(e.state_block, 500)
+
+        # a cache WITHOUT recorded status defaults to UNKNOWN, never STALE
+        entry = cache2._pools.get(P2.lower())
+        if entry is not None:
+            entry.pop("state_status", None)
+            cache2.save()
+            cache3 = _cache(self.tmp)
+            cache3.load()
+            graph3 = TokenGraph()
+            with mock.patch("tvl.is_above_min_liquidity", return_value=True):
+                cache3.warm_graph(graph3)
+            e3 = graph3.get_edges_for_pool(P2)[0]
+            self.assertEqual(e3.state_status, "UNKNOWN")
+
+
+class TestUncertainStatePersistence(unittest.TestCase):
+    """DSS-WO-MI-105-R2 WS-A: every UNCERTAIN transition must reach the CACHE,
+    not only the live graph. The decisive assertion is the save/reload round
+    trip: after reload + warm_graph none of the marked pools may reappear as
+    FRESH. Covers both synchronizer paths."""
+
+    def _fresh_cache(self, cache_dir: Path) -> PoolCache:
+        cache = PoolCache(1, str(cache_dir))
+        derived = {WETH: 1.0, A: 0.5, B: 0.25}
+
+        def rec(t0, t1, r0, r1):
+            return {"token0": t0.lower(), "token1": t1.lower(), "dex": "UniswapV2",
+                    "protocol": "uniswap_v2", "version": 2, "fee_bps": 30,
+                    "r0": r0, "r1": r1, "last_updated": 1.0,
+                    "tvl_usd": T.TVL,
+                    "token0_meta": {"symbol": "T0", "decimals": 18,
+                                    "derivedETH": derived.get(t0.lower(), 0.0)},
+                    "token1_meta": {"symbol": "T1", "decimals": 18,
+                                    "derivedETH": derived.get(t1.lower(), 0.0)}}
+
+        cache.set_pool(P1.lower(), rec(WETH, A, 10**18, 2 * 10**18))
+        cache.set_pool(P2.lower(), rec(A, B, 2 * 10**18, 2 * 10**18))
+        # previously PINNED reads: the cache says both pools were FRESH at 90
+        cache.update_pool_state(P1.lower(), state_block=90, state_block_hash=STATE_HASH,
+                                state_source="onchain:uniswap_v2:block_log", state_status="FRESH")
+        cache.update_pool_state(P2.lower(), state_block=90, state_block_hash=STATE_HASH,
+                                state_source="onchain:uniswap_v2:block_log", state_status="FRESH")
+        cache.save()
+        return cache
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="mi105_r2_wsa_"))
+        self.cache_dir = self.tmp / "cache"
+        self.cache = self._fresh_cache(self.cache_dir)
+        self.graph = TokenGraph()
+        self.assertEqual(self._warm(self.cache, self.graph), 2)
+        # precondition: both pools start FRESH (from the cache)
+        for addr in (P1, P2):
+            for e in self.graph.get_edges_for_pool(addr):
+                self.assertEqual(e.state_status, "FRESH")
+
+    @staticmethod
+    def _warm(cache, graph):
+        # offline pricing has no token-price source; pin the TVL estimate the
+        # same way the MI-103 replay fixtures do
+        import tvl as tvl_mod
+        import unittest.mock as mock
+        with mock.patch.object(tvl_mod, "estimate_tvl_v2", return_value=T.TVL), \
+             mock.patch.object(tvl_mod, "estimate_tvl_v3", return_value=T.TVL):
+            return cache.warm_graph(graph)
+
+    def _reload_and_warm(self):
+        cache2 = PoolCache(1, str(self.cache_dir))
+        self.assertTrue(cache2.load())
+        g2 = TokenGraph()
+        loaded = self._warm(cache2, g2)
+        return cache2, g2, loaded
+
+    def _assert_uncertain_everywhere(self, cache, graph, addr, source, *, block=0):
+        for e in graph.get_edges_for_pool(addr):
+            self.assertEqual(e.state_status, "UNCERTAIN")
+            self.assertEqual(e.state_source, source)
+            self.assertEqual(e.state_block, block)          # read provenance cleared
+            self.assertEqual(e.state_block_hash, "")
+        entry = cache._pools[addr.lower()]
+        self.assertEqual(entry["state_status"], "UNCERTAIN")
+        self.assertEqual(entry["state_source"], source)
+        self.assertEqual(entry["state_block"], block)
+        self.assertEqual(entry["state_block_hash"], "")
+
+    def _assert_not_fresh_after_reload(self, marked: set):
+        """Reload the saved cache and warm a NEW graph: none of the pools that
+        underwent an UNCERTAIN transition may reappear as FRESH (unmarked
+        pools legitimately keep their own untouched status)."""
+        cache2, g2, _ = self._reload_and_warm()
+        for addr in (P1, P2):
+            statuses = {e.state_status for e in g2.get_edges_for_pool(addr)}
+            entry = cache2._pools[addr.lower()]
+            if addr in marked:
+                self.assertEqual(statuses, {"UNCERTAIN"})
+                self.assertEqual(entry["state_status"], "UNCERTAIN")
+                self.assertNotIn("FRESH", statuses)   # never resurrected
+                self.assertNotEqual(entry["state_status"], "FRESH")
+
+    # ── unpinned successful ADAPTER fallback (refresh path) ─────────────────
+    def test_unpinned_adapter_fallback_persists_uncertain_refresh_path(self):
+        import unittest.mock as mock
+        for e in self.graph.get_edges_for_pool(P1):
+            e.protocol = "curve"   # not batchable via v2v3 → adapter bucket
+        sync = ProtocolStateSynchronizer(T.StubW3(), self.graph, self.cache)
+        sync._refresh_multicall3 = lambda a, *, block_identifier=None: set()
+        with mock.patch("registry.refresh_pools_batched",
+                        return_value=(set(), {P1.lower()})):
+            refreshed = sync.refresh(_ctx(number=501, pools=(P1,)))
+        self.assertEqual(refreshed, set())
+        self._assert_uncertain_everywhere(self.cache, self.graph, P1,
+                                          "adapter_fallback_unpinned")
+        self.cache.save()
+        self._assert_not_fresh_after_reload({P1})
+
+    # ── unpinned successful ADAPTER fallback (refresh_by_addresses path) ────
+    def test_unpinned_adapter_fallback_persists_uncertain_by_addresses(self):
+        import unittest.mock as mock
+        for e in self.graph.get_edges_for_pool(P1):
+            e.protocol = "curve"
+        sync = ProtocolStateSynchronizer(T.StubW3(), self.graph, self.cache)
+        sync._refresh_multicall3 = lambda a, *, block_identifier=None: set()
+        with mock.patch("registry.refresh_pools_batched",
+                        return_value=(set(), {P1.lower()})):
+            refreshed = sync.refresh_by_addresses({P1}, _ctx(number=502, pools=(P1,)))
+        self.assertEqual(refreshed, set())
+        self._assert_uncertain_everywhere(self.cache, self.graph, P1,
+                                          "adapter_fallback_unpinned")
+        self.cache.save()
+        self._assert_not_fresh_after_reload({P1})
+
+    # ── unpinned latest-state V2/V3 refresh (refresh_by_addresses, ctx=None) ─
+    def test_unpinned_v2v3_refresh_persists_uncertain(self):
+        import unittest.mock as mock
+        sync = ProtocolStateSynchronizer(T.StubW3(), self.graph, self.cache)
+        captured = {}
+
+        def fake_mc(addresses, *, block_identifier=None):
+            captured["block_identifier"] = block_identifier
+            return set(addresses)   # batch "succeeded" — but as a LATEST read
+
+        sync._refresh_multicall3 = fake_mc
+        refreshed = sync.refresh_by_addresses({P2}, None)   # ctx=None → unpinned
+        self.assertEqual(refreshed, {P2})
+        self.assertIsNone(captured["block_identifier"])
+        self._assert_uncertain_everywhere(self.cache, self.graph, P2,
+                                          "multicall_unpinned_latest")
+        self.cache.save()
+        self._assert_not_fresh_after_reload({P2})
+
+    # ── FAILED batch (refresh path) ──────────────────────────────────────────
+    def test_failed_batch_persists_uncertain(self):
+        import unittest.mock as mock
+        sync = ProtocolStateSynchronizer(T.StubW3(), self.graph, self.cache)
+        with mock.patch.object(sync, "_refresh_multicall3",
+                               side_effect=RuntimeError("rpc down")):
+            refreshed = sync.refresh(_ctx(number=503, pools=(P2,)))
+        self.assertEqual(refreshed, set())
+        self._assert_uncertain_everywhere(self.cache, self.graph, P2,
+                                          "multicall_error:RuntimeError")
+        self.cache.save()
+        self._assert_not_fresh_after_reload({P2})
+
+    # ── INCOMPLETE per-pool/V3 refresh (refresh_by_addresses, ctx pinned) ────
+    def test_incomplete_v2v3_refresh_persists_uncertain(self):
+        """A 'successful' aggregate whose per-pool results failed (allowFailure
+        per-call failures, incomplete V3 reads, decode/encode failures) leaves
+        the pool out of the returned set — the synchronizer must mark it
+        UNCERTAIN in graph AND cache."""
+        import unittest.mock as mock
+        sync = ProtocolStateSynchronizer(T.StubW3(), self.graph, self.cache)
+        sync._refresh_multicall3 = lambda a, *, block_identifier=None: set()
+        refreshed = sync.refresh_by_addresses({P2}, _ctx(number=504, pools=(P2,)))
+        self.assertEqual(refreshed, set())
+        self._assert_uncertain_everywhere(self.cache, self.graph, P2,
+                                          "multicall_incomplete")
+        self.cache.save()
+        self._assert_not_fresh_after_reload({P2})
+
+    # ── both paths, mixed: P1 unpinned fallback + P2 incomplete in one call ──
+    def test_mixed_scenarios_round_trip_both_paths(self):
+        import unittest.mock as mock
+        for e in self.graph.get_edges_for_pool(P1):
+            e.protocol = "curve"
+        sync = ProtocolStateSynchronizer(T.StubW3(), self.graph, self.cache)
+        sync._refresh_multicall3 = lambda a, *, block_identifier=None: set()
+        with mock.patch("registry.refresh_pools_batched",
+                        return_value=(set(), {P1.lower()})):
+            sync.refresh_by_addresses({P1, P2}, _ctx(number=505, pools=(P1, P2)))
+        self._assert_uncertain_everywhere(self.cache, self.graph, P1,
+                                          "adapter_fallback_unpinned")
+        self._assert_uncertain_everywhere(self.cache, self.graph, P2,
+                                          "multicall_incomplete")
+        self.cache.save()
+        self._assert_not_fresh_after_reload({P1, P2})
 
     def test_batched_reads_are_pinned_to_the_given_block(self):
         captured = {}
@@ -323,46 +557,6 @@ class TestRefreshProvenance(unittest.TestCase):
                               "enc": "_encode_get_reserves",
                               "dec": "_decode_get_reserves"}[k], v)
         self.assertEqual(updated, set())  # partial read must not count as refreshed
-
-    def test_cache_reload_keeps_persisted_provenance_and_defaults_unknown(self):
-        import unittest.mock as mock
-        cache = _cache(self.tmp)
-        cache.set_pool(P1.lower(), {"token0": WETH.lower(), "token1": A.lower(),
-                                    "dex": "UniV2", "version": 2,
-                                    "r0": 10**18, "r1": 2 * 10**18,
-                                    "tvl_usd": 250_000.0})
-        cache.set_pool(P2.lower(), {"token0": A.lower(), "token1": B.lower(),
-                                    "dex": "UniV2", "version": 2,
-                                    "r0": 2 * 10**18, "r1": 2 * 10**18,
-                                    "tvl_usd": 250_000.0})
-        cache.update_pool_state(P1.lower(), state_block=500,
-                                state_block_hash="0x" + "cd" * 32,
-                                state_source="onchain:uniswap_v2:block_log",
-                                state_status="FRESH")
-        cache.save()
-
-        cache2 = _cache(self.tmp)
-        self.assertTrue(cache2.load())
-        graph = TokenGraph()
-        with mock.patch("tvl.is_above_min_liquidity", return_value=True):
-            restored = cache2.warm_graph(graph)  # provenance is the test target, not TVL
-        self.assertGreater(restored, 0)
-        e = graph.get_edges_for_pool(P1)[0]
-        self.assertEqual(e.state_status, "FRESH")
-        self.assertEqual(e.state_block, 500)
-
-        # a cache WITHOUT recorded status defaults to UNKNOWN, never STALE
-        entry = cache2._pools.get(P2.lower())
-        if entry is not None:
-            entry.pop("state_status", None)
-            cache2.save()
-            cache3 = _cache(self.tmp)
-            cache3.load()
-            graph3 = TokenGraph()
-            with mock.patch("tvl.is_above_min_liquidity", return_value=True):
-                cache3.warm_graph(graph3)
-            e3 = graph3.get_edges_for_pool(P2)[0]
-            self.assertEqual(e3.state_status, "UNKNOWN")
 
 
 class TestEngineRouteAggregation(unittest.TestCase):
@@ -749,6 +943,7 @@ class TestQuoteSizeEvidence(RecorderBase):
         self.assertTrue(result.quote_attempted)   # the quote WAS attempted…
         self.assertFalse(result.quote_returned)   # …but never OBTAINED
         self.assertIsNone(result.amount_in_raw)   # no amount evidence
+        self.assertEqual(result.quote_method, "")  # MI-105-R2 §2: no quote returned → no method claim
         self.assertEqual(result.mode_attempts[0]["status"], "quote_rejected")
         self.assertEqual(result.mode_attempts[0]["stage_failed"], "quote_call")
         self.assertEqual(result.mode_attempts[1]["status"], "quote_rejected")
@@ -779,6 +974,11 @@ class TestQuoteSizeEvidence(RecorderBase):
         det = self._record(T._engine(T._graph()), opp)
         self.assertTrue(det["validation"]["performed"])
         self.assertEqual(det["validation"]["stage_failed"], "simulation_call")
+        # MI-105-R2 §2: a quote that RETURNED keeps its method provenance on
+        # the final result AND in the serialized detection record, even when a
+        # later simulation stage failed.
+        self.assertEqual(result.quote_method, "exec_yieldOut")
+        self.assertEqual(det["market_inputs"]["quote_method"], "exec_yieldOut")
         self.assertEqual(det["market_inputs"]["quote_inputs"]["quote_amount_in_raw"], 2_500_000)
         self.assertEqual(det["size_and_profit"]["trade_size_amount_in"], 2_500_000)
 

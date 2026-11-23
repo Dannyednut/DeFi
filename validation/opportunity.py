@@ -136,12 +136,15 @@ class OpportunityValidator:
                 return replace(result, mode_attempts=tuple(mode_evidence))
             attempts.append(f"{lender}: {result.reason}")
 
-        # MI-105-R1 WS-C: aggregate the attempted/obtained evidence across both
-        # lender modes — a quote that was ATTEMPTED (even if it reverted) means
-        # validation WAS performed, the amount evidence only exists for a quote
-        # that actually RETURNED, and the most recent RETURNED quote's evidence
-        # survives on the final result even when a later simulation step failed
-        # (per-mode detail is preserved in mode_attempts).
+        # MI-105-R1 WS-C + R2 §2: aggregate the attempted/obtained evidence
+        # across both lender modes — a quote that was ATTEMPTED (even if it
+        # reverted) means validation WAS performed, the amount evidence only
+        # exists for a quote that actually RETURNED, and the most recent
+        # RETURNED quote's evidence — INCLUDING its quote_method — survives on
+        # the final result even when a later simulation step failed (per-mode
+        # detail is preserved in mode_attempts). When no quote was returned,
+        # quote_method stays empty so the recorder never reports a method for
+        # a quote that was not obtained.
         final_quote = next((e for e in reversed(mode_evidence) if e["quote_returned"]), None)
         return ValidationResult(False, "rejected", "; ".join(attempts),
                                 quote_attempted=any(e["quote_attempted"] for e in mode_evidence),
@@ -150,6 +153,7 @@ class OpportunityValidator:
                                 amount_in_token=(final_quote["amount_in_token"] or "") if final_quote else "",
                                 amount_in_mode=final_quote["mode"] if final_quote else None,
                                 quote_profit_wei=final_quote["quote_profit_wei"] or 0 if final_quote else 0,
+                                quote_method="exec_yieldOut" if final_quote else "",
                                 stage_failed=(mode_evidence[-1]["stage_failed"] or "") if mode_evidence else "",
                                 mode_attempts=tuple(mode_evidence))
 

@@ -553,8 +553,10 @@ def refresh_pools_batched(
     from protocols import ProtocolRegistry
     from utils.multicall3 import multicall3_bulk_refresh_adapters
 
+    # DSS-WO-MI-105-R2 §3: the empty-input branch must return the SAME
+    # (pinned, unpinned) tuple shape as every other execution path.
     if not addresses:
-        return set()
+        return set(), set()
 
     registry = ProtocolRegistry(w3)
     chain = get_chain()

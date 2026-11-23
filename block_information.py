@@ -281,14 +281,26 @@ class ProtocolStateSynchronizer:
 
         read_number = int(ctx.number)
         read_hash = ctx.block_hash or ""
+        multicall_exc: Exception | None = None
+        done: set[str] = set()
         if v2v3:
             try:
                 done = self._refresh_multicall3(v2v3, block_identifier=read_number) or set()
                 refreshed.update(done)
             except Exception as exc:
+                multicall_exc = exc
                 log.warning("Multicall3 state refresh failed for %d pools: %s", len(v2v3), exc)
-                for address in v2v3:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"multicall_error:{type(exc).__name__}")
+            # DSS-WO-MI-105-R2 WS-A: a successful aggregate batch does NOT imply
+            # every requested pool refreshed — per-call allowFailure failures,
+            # incomplete V3 reads, decode/encode failures and whole-chunk
+            # failures all leave a pool out of ``done``. Every requested-but-
+            # not-refreshed pool becomes UNCERTAIN in graph AND cache
+            # (persisted, read provenance cleared) — never left standing at a
+            # prior FRESH/STALE status.
+            reason = (f"multicall_error:{type(multicall_exc).__name__}" if multicall_exc
+                      else "multicall_incomplete")
+            for address in v2v3 - done:
+                self._mark_uncertain(address, reason)
 
         if other:
             try:
@@ -297,16 +309,19 @@ class ProtocolStateSynchronizer:
                                                          block_identifier=read_number)
                 refreshed.update(pinned)
                 for address in other - pinned - unpinned:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_refresh_incomplete")
+                    self._mark_uncertain(address, "adapter_refresh_incomplete")
                 # MI-105-R1 WS-A: fallback reads are LATEST-state reads. Keep the
                 # refreshed values, but never attach the context block/hash or a
                 # FRESH label to provenance that is not pinned to that block.
+                # MI-105-R2 WS-A: the UNCERTAIN transition is persisted to the
+                # cache with its read provenance CLEARED, so a reload+warm
+                # cannot resurrect the old FRESH status.
                 for address in unpinned:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_fallback_unpinned")
+                    self._mark_uncertain(address, "adapter_fallback_unpinned")
             except Exception as exc:
                 log.warning("Batched adapter refresh failed for %d pools: %s", len(other), exc)
                 for address in other:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"refresh_error:{type(exc).__name__}")
+                    self._mark_uncertain(address, f"refresh_error:{type(exc).__name__}")
 
         # Stamp only pools whose read was PINNED to read_number. Because the
         # batch reads are pinned, the stamped state block/hash identify the
@@ -335,6 +350,8 @@ class ProtocolStateSynchronizer:
         log.info("refresh_by_addresses: v2v3=%d other=%d", len(v2v3), len(other))
         read_number = int(ctx.number) if ctx is not None else None
         read_hash = (ctx.block_hash or "") if ctx is not None else ""
+        multicall_exc: Exception | None = None
+        done: set[str] = set()
         if v2v3:
             try:
                 done = self._refresh_multicall3(v2v3, block_identifier=read_number) or set()
@@ -342,12 +359,19 @@ class ProtocolStateSynchronizer:
                 if read_number is None:
                     # MI-105-R1 WS-A: an unpinned latest-state read must not
                     # leave a prior FRESH label standing over new values.
+                    # MI-105-R2 WS-A: persisted to the cache, provenance cleared.
                     for address in done:
-                        self.graph.mark_pool_state(address, status="UNCERTAIN", source="multicall_unpinned_latest")
+                        self._mark_uncertain(address, "multicall_unpinned_latest")
             except Exception as exc:
+                multicall_exc = exc
                 log.warning("Multicall3 state refresh failed for %d pools: %s", len(v2v3), exc)
-                for address in v2v3:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"multicall_error:{type(exc).__name__}")
+            # DSS-WO-MI-105-R2 WS-A: same requested-vs-refreshed semantics as
+            # refresh() — partial failures and unpinned reads both end UNCERTAIN
+            # in graph AND cache, on both synchronizer paths (ctx present or not).
+            reason = (f"multicall_error:{type(multicall_exc).__name__}" if multicall_exc
+                      else "multicall_incomplete")
+            for address in v2v3 - done:
+                self._mark_uncertain(address, reason)
 
         if other:
             try:
@@ -356,15 +380,16 @@ class ProtocolStateSynchronizer:
                                                          block_identifier=read_number)
                 refreshed.update(pinned)
                 for address in other - pinned - unpinned:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_refresh_incomplete")
+                    self._mark_uncertain(address, "adapter_refresh_incomplete")
                 # MI-105-R1 WS-A: fallback reads are LATEST-state reads — keep the
                 # values, never stamp FRESH provenance for them.
+                # MI-105-R2 WS-A: persisted to the cache, provenance cleared.
                 for address in unpinned:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_fallback_unpinned")
+                    self._mark_uncertain(address, "adapter_fallback_unpinned")
             except Exception as exc:
                 log.warning("Batched adapter refresh failed for %d pools: %s", len(other), exc)
                 for address in other:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"refresh_error:{type(exc).__name__}")
+                    self._mark_uncertain(address, f"refresh_error:{type(exc).__name__}")
 
         # Stamp FRESH only pools whose read was PINNED to the context block —
         # and only when an explicit block context was supplied (MI-105 §2:
@@ -374,6 +399,22 @@ class ProtocolStateSynchronizer:
             for address in refreshed:
                 self._stamp(address, read_number, read_hash, self._protocol(address))
         return refreshed
+
+    def _mark_uncertain(self, address: str, source: str) -> None:
+        """DSS-WO-MI-105-R2 WS-A: mark a pool UNCERTAIN in the live graph AND
+        persist the transition through the existing PoolCache.
+
+        The current-read block/hash fields are CLEARED (an unpinned or failed
+        read has no block it can claim), so the previous verified provenance
+        never survives as if it described newly refreshed values, and a cache
+        reload + warm_graph cannot resurrect the old FRESH status."""
+        self.graph.mark_pool_state(
+            address,
+            status="UNCERTAIN",
+            source=source,
+            clear_read_provenance=True,
+            cache=getattr(self, "cache", None),
+        )
 
     def _version(self, address: str) -> int:
         edges = self.graph._pool_index.get(address.lower(), [])

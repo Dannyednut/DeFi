@@ -242,7 +242,11 @@ def process_block(
             return current_hash
         if router:
             router.process_results()
-        tracker.process_block(block_number, [], filled_pools=filled_pools)
+        # No detector ran against an unknown/stale state view (MI-105 WS-D):
+        # pass an EMPTY scheduled set so tracked candidates are not falsely
+        # expired on the basis of a block whose detection never ran.
+        tracker.process_block(block_number, [], filled_pools=filled_pools,
+                              detector_scheduled=set())
         return current_hash
 
     # The OpportunityEngine schedules detectors according to their thesis:
@@ -265,7 +269,6 @@ def process_block(
         all_opps = list(result.ready)
         if result.rejected:
             log.debug(f"[PIPELINE] block={block_number} rejected {len(result.rejected)} candidates")
-
         if router and not sync_only:
             source_map = {
                 "cycles": OppSource.DETECTOR_CYCLES,
@@ -285,7 +288,24 @@ def process_block(
     if router:
         router.process_results()
     
-    tracker.process_block(block_number, all_opps, filled_pools=filled_pools)
+    # DSS-WO-MI-105 WS-D + R1: the tracker observes EVERY candidate leaving the
+    # pipeline (execution-ready or not) so lifecycle CLOSE evidence exists for
+    # non-ready candidates too. Router submission stays ready-only.
+    # detector_scheduled (which detectors ran) + searched_pools (the
+    # invocation's ACTUAL search scope) prevent false EXPIRED closures: a
+    # candidate is only expired as detector-observed absence when its own
+    # route was inside the searched scope; otherwise it is retained until the
+    # bounded hard-TTL, with the closure basis recorded either way.
+    if opportunity_engine is not None:
+        tracker.process_block(
+            block_number,
+            list(result.candidates),
+            filled_pools=filled_pools,
+            detector_scheduled=set(result.scheduled_detectors),
+            searched_pools=set(result.searched_pools),
+        )
+    else:
+        tracker.process_block(block_number, all_opps, filled_pools=filled_pools)
     log.info("[BLOCK] complete block=%s elapsed_ms=%.1f opportunities_ready=%d",
              block_number, (time.perf_counter() - block_started) * 1000.0, len(all_opps))
 

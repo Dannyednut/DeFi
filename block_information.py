@@ -262,6 +262,12 @@ class ProtocolStateSynchronizer:
         decode_refresh_result() (see registry.refresh_pools_batched and
         protocols/base.py) — previously these were refreshed one pool at a
         time via individual RPC round-trips.
+
+        DSS-WO-MI-105 §2: every eth_call in the refresh batch is PINNED to the
+        triggering block (``ctx.number``), so ``state_block``/``state_block_hash``
+        stamped on refreshed edges identify the state actually read — not
+        merely the event that triggered the read. A read that cannot be served
+        at that block fails and the pool is stamped UNCERTAIN (never FRESH).
         """
         refreshed: set[str] = set()
         v2v3: set[str] = set()
@@ -273,33 +279,57 @@ class ProtocolStateSynchronizer:
             else:
                 other.add(address)
 
+        read_number = int(ctx.number)
+        read_hash = ctx.block_hash or ""
+        multicall_exc: Exception | None = None
+        done: set[str] = set()
         if v2v3:
             try:
-                done = self._refresh_multicall3(v2v3) or set()
+                done = self._refresh_multicall3(v2v3, block_identifier=read_number) or set()
                 refreshed.update(done)
             except Exception as exc:
+                multicall_exc = exc
                 log.warning("Multicall3 state refresh failed for %d pools: %s", len(v2v3), exc)
-                for address in v2v3:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"multicall_error:{type(exc).__name__}")
+            # DSS-WO-MI-105-R2 WS-A: a successful aggregate batch does NOT imply
+            # every requested pool refreshed — per-call allowFailure failures,
+            # incomplete V3 reads, decode/encode failures and whole-chunk
+            # failures all leave a pool out of ``done``. Every requested-but-
+            # not-refreshed pool becomes UNCERTAIN in graph AND cache
+            # (persisted, read provenance cleared) — never left standing at a
+            # prior FRESH/STALE status.
+            reason = (f"multicall_error:{type(multicall_exc).__name__}" if multicall_exc
+                      else "multicall_incomplete")
+            for address in v2v3 - done:
+                self._mark_uncertain(address, reason)
 
         if other:
             try:
                 from registry import refresh_pools_batched
-                done = refresh_pools_batched(self.w3, self.graph, self.cache, other)
-                refreshed.update(done)
-                for address in other - done:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_refresh_incomplete")
+                pinned, unpinned = refresh_pools_batched(self.w3, self.graph, self.cache, other,
+                                                         block_identifier=read_number)
+                refreshed.update(pinned)
+                for address in other - pinned - unpinned:
+                    self._mark_uncertain(address, "adapter_refresh_incomplete")
+                # MI-105-R1 WS-A: fallback reads are LATEST-state reads. Keep the
+                # refreshed values, but never attach the context block/hash or a
+                # FRESH label to provenance that is not pinned to that block.
+                # MI-105-R2 WS-A: the UNCERTAIN transition is persisted to the
+                # cache with its read provenance CLEARED, so a reload+warm
+                # cannot resurrect the old FRESH status.
+                for address in unpinned:
+                    self._mark_uncertain(address, "adapter_fallback_unpinned")
             except Exception as exc:
                 log.warning("Batched adapter refresh failed for %d pools: %s", len(other), exc)
                 for address in other:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"refresh_error:{type(exc).__name__}")
+                    self._mark_uncertain(address, f"refresh_error:{type(exc).__name__}")
 
-        # Stamp only pools that actually refreshed. The state block is the block
-        # whose event triggered the refresh, while Multicall3 supplies a single
-        # coherent RPC read context for the batch.
+        # Stamp only pools whose read was PINNED to read_number. Because the
+        # batch reads are pinned, the stamped state block/hash identify the
+        # state actually read (MI-105 §2); a successful refresh now also
+        # produces the explicit, truthful FRESH status.
         for address in refreshed:
             protocol = self._protocol(address)
-            self._stamp(address, ctx, protocol)
+            self._stamp(address, read_number, read_hash, protocol)
         return refreshed
 
     def refresh_by_addresses(self, addresses: set[str], ctx: BlockContext | None = None) -> set[str]:
@@ -318,34 +348,73 @@ class ProtocolStateSynchronizer:
             else:
                 other.add(address)
         log.info("refresh_by_addresses: v2v3=%d other=%d", len(v2v3), len(other))
+        read_number = int(ctx.number) if ctx is not None else None
+        read_hash = (ctx.block_hash or "") if ctx is not None else ""
+        multicall_exc: Exception | None = None
+        done: set[str] = set()
         if v2v3:
             try:
-                done = self._refresh_multicall3(v2v3) or set()
+                done = self._refresh_multicall3(v2v3, block_identifier=read_number) or set()
                 refreshed.update(done)
+                if read_number is None:
+                    # MI-105-R1 WS-A: an unpinned latest-state read must not
+                    # leave a prior FRESH label standing over new values.
+                    # MI-105-R2 WS-A: persisted to the cache, provenance cleared.
+                    for address in done:
+                        self._mark_uncertain(address, "multicall_unpinned_latest")
             except Exception as exc:
+                multicall_exc = exc
                 log.warning("Multicall3 state refresh failed for %d pools: %s", len(v2v3), exc)
-                for address in v2v3:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"multicall_error:{type(exc).__name__}")
+            # DSS-WO-MI-105-R2 WS-A: same requested-vs-refreshed semantics as
+            # refresh() — partial failures and unpinned reads both end UNCERTAIN
+            # in graph AND cache, on both synchronizer paths (ctx present or not).
+            reason = (f"multicall_error:{type(multicall_exc).__name__}" if multicall_exc
+                      else "multicall_incomplete")
+            for address in v2v3 - done:
+                self._mark_uncertain(address, reason)
 
         if other:
             try:
                 from registry import refresh_pools_batched
-                done = refresh_pools_batched(self.w3, self.graph, self.cache, other)
-                refreshed.update(done)
-                for address in other - done:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source="adapter_refresh_incomplete")
+                pinned, unpinned = refresh_pools_batched(self.w3, self.graph, self.cache, other,
+                                                         block_identifier=read_number)
+                refreshed.update(pinned)
+                for address in other - pinned - unpinned:
+                    self._mark_uncertain(address, "adapter_refresh_incomplete")
+                # MI-105-R1 WS-A: fallback reads are LATEST-state reads — keep the
+                # values, never stamp FRESH provenance for them.
+                # MI-105-R2 WS-A: persisted to the cache, provenance cleared.
+                for address in unpinned:
+                    self._mark_uncertain(address, "adapter_fallback_unpinned")
             except Exception as exc:
                 log.warning("Batched adapter refresh failed for %d pools: %s", len(other), exc)
                 for address in other:
-                    self.graph.mark_pool_state(address, status="UNCERTAIN", source=f"refresh_error:{type(exc).__name__}")
+                    self._mark_uncertain(address, f"refresh_error:{type(exc).__name__}")
 
-        # Stamp only pools that actually refreshed. The state block is the block
-        # whose event triggered the refresh, while Multicall3 supplies a single
-        # coherent RPC read context for the batch.
+        # Stamp FRESH only pools whose read was PINNED to the context block —
+        # and only when an explicit block context was supplied (MI-105 §2:
+        # no provenance claim without a pinned read block; MI-105-R1 WS-A:
+        # unpinned fallback pools are refreshed but marked UNCERTAIN above).
         if ctx is not None:
             for address in refreshed:
-                self._stamp(address, ctx, self._protocol(address))
+                self._stamp(address, read_number, read_hash, self._protocol(address))
         return refreshed
+
+    def _mark_uncertain(self, address: str, source: str) -> None:
+        """DSS-WO-MI-105-R2 WS-A: mark a pool UNCERTAIN in the live graph AND
+        persist the transition through the existing PoolCache.
+
+        The current-read block/hash fields are CLEARED (an unpinned or failed
+        read has no block it can claim), so the previous verified provenance
+        never survives as if it described newly refreshed values, and a cache
+        reload + warm_graph cannot resurrect the old FRESH status."""
+        self.graph.mark_pool_state(
+            address,
+            status="UNCERTAIN",
+            source=source,
+            clear_read_provenance=True,
+            cache=getattr(self, "cache", None),
+        )
 
     def _version(self, address: str) -> int:
         edges = self.graph._pool_index.get(address.lower(), [])
@@ -355,14 +424,15 @@ class ProtocolStateSynchronizer:
         edges = self.graph._pool_index.get(address.lower(), [])
         return edges[0].protocol if edges else ""
 
-    def _refresh_multicall3(self, addresses: set[str]) -> set[str]:
+    def _refresh_multicall3(self, addresses: set[str], *, block_identifier: int | None = None) -> set[str]:
         """Refresh V2/V3 pools using Multicall3.
 
         Multicall3 is the canonical batch reader for V2/V3 pools.  It is not
         used for other protocols because their state shape is not reducible to
         the V2/V3 reserve ABI.
         """
-        return multicall3_bulk_refresh(self.w3, self.graph, self.cache, addresses) or set()
+        return multicall3_bulk_refresh(self.w3, self.graph, self.cache, addresses,
+                                       block_identifier=block_identifier) or set()
     
     def _refresh_one(self, address: str, ctx: BlockContext) -> None:
         address = address.lower()
@@ -374,7 +444,19 @@ class ProtocolStateSynchronizer:
         from registry import update_pool_reserves
         update_pool_reserves(self.w3, self.graph, address, self.cache)
 
-    def _stamp(self, address: str, ctx: BlockContext, protocol: str) -> None:
+    def _stamp(self, address: str, read_number: int | None, read_hash: str, protocol: str) -> None:
+        """Stamp refreshed edges with the provenance of the state ACTUALLY read.
+
+        DSS-WO-MI-105 §2: the caller pinned every batch eth_call to
+        ``read_number``, so this stamp identifies the read state — and a
+        successful refresh now produces the explicit, truthful FRESH status
+        (previously the prior status, e.g. STALE from a cache load, survived a
+        successful refresh and contradicted the new block/hash stamp). The
+        same state fields are persisted into the pool cache so a reload keeps
+        the truthful provenance instead of falling back to a default.
+        """
+        if read_number is None:
+            return
         edges = self.graph._pool_index.get(address.lower(), [])
         if not edges:
             return
@@ -385,9 +467,22 @@ class ProtocolStateSynchronizer:
         for e in edges:
             stamped.append(replace(
                 e,
-                state_block=ctx.number,
-                state_block_hash=ctx.block_hash,
+                state_block=int(read_number),
+                state_block_hash=read_hash or "",
                 state_source=f"onchain:{protocol}:block_log",
+                state_status="FRESH",
             ))
         if stamped:
             self.graph.upsert_pool_edges(stamped)
+        cache = getattr(self, "cache", None)
+        if cache is not None:
+            try:
+                cache.update_pool_state(
+                    address,
+                    state_block=int(read_number),
+                    state_block_hash=read_hash or "",
+                    state_source=f"onchain:{protocol}:block_log",
+                    state_status="FRESH",
+                )
+            except Exception as exc:
+                log.debug("cache state stamp skipped for %s: %s", address, exc)

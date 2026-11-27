@@ -33,10 +33,37 @@ from mempool.outcome import OutcomeResolver
 # from utils.graph_client import GraphClient
 from registry import discover_from_swap
 from execution_router import OppSource
-from config import CHAIN_ID, NATIVE_PRICE_USD, RPC_WS, get_ws_rpc
+from config import (
+    CHAIN_ID,
+    NATIVE_PRICE_USD,
+    RPC_WS,
+    get_ws_rpc,
+    MEMPOOL_MAX_FETCHES_PER_SECOND,
+    MEMPOOL_QUEUE_SIZE,
+    MEMPOOL_MAX_INFLIGHT_FETCHES,
+)
 
 from log import get_logger
 log = get_logger("pipeline")
+
+
+def resolve_mempool_settings(env=None):
+    """DSS-WO-MI-106 WS-A §2C: the ONE authoritative mempool configuration
+    path — config.py's MEMPOOL_* settings. The legacy ``MEMPOOL_FETCHES_PER_
+    SECOND`` env var is honoured only when explicitly set (operator override,
+    backward compatibility justified: operators may have tuned the old name),
+    and the effective values plus their source are reported by the caller."""
+    env = os.environ if env is None else env
+    fps = MEMPOOL_MAX_FETCHES_PER_SECOND
+    source = "config.MEMPOOL_MAX_FPS"
+    legacy = env.get("MEMPOOL_FETCHES_PER_SECOND")
+    if legacy:
+        try:
+            fps = float(legacy)
+            source = "legacy env MEMPOOL_FETCHES_PER_SECOND (operator override)"
+        except ValueError:
+            log.warning("Ignoring invalid legacy MEMPOOL_FETCHES_PER_SECOND=%r", legacy)
+    return fps, MEMPOOL_QUEUE_SIZE, MEMPOOL_MAX_INFLIGHT_FETCHES, source
 
 
 class MempoolPipeline:
@@ -62,13 +89,29 @@ class MempoolPipeline:
         configured_targets = {d.router.lower() for d in get_chain(active_chain_id).dexes if d.router}
         router_addrs |= configured_targets
         router_map    = build_router_map(active_chain_id)
+        # DSS-WO-MI-106 WS-A §2C: ONE authoritative configuration path — the
+        # config.py mempool settings are read here and PASSED into the
+        # watcher (the old code read a different env-var name for the fetch
+        # rate — defaulting to 20/s, above the documented ~5 CU-safe rate —
+        # and never passed the configured queue size at all). The legacy
+        # MEMPOOL_FETCHES_PER_SECOND env var is honoured only when explicitly
+        # set, and the effective values are reported at startup.
+        self._mempool_fps, self._mempool_queue_size, self._mempool_max_inflight, \
+            self._mempool_config_source = resolve_mempool_settings()
         self._watcher   = MempoolWatcher(
             rpc_ws_url=RPC_WS,
             w3=w3,
             router_addresses=router_addrs,
-            max_fetches_per_second=float(os.getenv("MEMPOOL_FETCHES_PER_SECOND", "20")),
+            max_fetches_per_second=self._mempool_fps,
+            queue_size=self._mempool_queue_size,
+            max_inflight_fetches=self._mempool_max_inflight,
             on_hash_callback=self.mark_seen,
             chain_id=active_chain_id,
+        )
+        log.info(
+            "Mempool config effective: fetch_rate=%.2f/s queue_size=%d max_inflight_fetches=%d (source=%s)",
+            self._mempool_fps, self._mempool_queue_size, self._mempool_max_inflight,
+            self._mempool_config_source,
         )
         # self._graph_client = GraphClient() # Dead dependency (Spec 5.x)
         self._decoder   = SwapDecoder(router_map)
@@ -151,6 +194,7 @@ class MempoolPipeline:
         rs = self._resolver.stats
         return {
             "watcher":  ws,
+            "watcher_stage": self._watcher.status()["stage"],
             "resolver": rs,
             "pipeline": {
                 "decoded":   self._decoded_count,
@@ -158,6 +202,22 @@ class MempoolPipeline:
                 "opps_found": self._opps_found,
             },
         }
+
+    def status_snapshot(self) -> dict:
+        """DSS-WO-MI-106 §2D: compact evidence snapshot combining the watcher
+        stage classification with the pipeline counters — one object for the
+        heartbeat and the delivery report."""
+        snap = self._watcher.status()
+        snap["pipeline_decoded"] = self._decoded_count
+        snap["pipeline_simulated"] = self._simulated_count
+        snap["pipeline_opps_found"] = self._opps_found
+        snap["mempool_config"] = {
+            "fetch_rate_per_second": self._mempool_fps,
+            "queue_size": self._mempool_queue_size,
+            "max_inflight_fetches": self._mempool_max_inflight,
+            "source": self._mempool_config_source,
+        }
+        return snap
 
     @property
     def recent_pending(self) -> list[PendingOpportunity]:
@@ -360,14 +420,23 @@ class MempoolPipeline:
             now = time.time()
             self._touched_pools = {addr: ts for addr, ts in self._touched_pools.items() if now - ts < 60}
             hot_count = len(self._touched_pools)
-            
+
             # Snapshot active cycles count to avoid race condition with tracker
             active_count = len(list(self._tracker._active))
-            
+
+            # DSS-WO-MI-106 §2D: the heartbeat carries the subscription stage
+            # and the loss/overflow counters so a silently-degraded stream is
+            # visible without reading debug logs.
+            snap = self._watcher.status()
             log.debug(
-                f"[mempool] Activity: {ws['hashes_received']} received | "
+                f"[mempool] {snap['stage']} | {ws['hashes_received']} received | "
                 f"{self._decoded_count} decoded | {hot_count} pools 'hot' | "
-                f"{active_count} active cycles | Stalking {ws['stalked_count']} bots"
+                f"{active_count} active cycles | Stalking {ws['stalked_count']} bots | "
+                f"queued={ws['transactions_queued']} rate_drops={ws['fetches_dropped']} "
+                f"fetch_fails={ws['fetches_failed']} filtered={ws['fetches_filtered']} "
+                f"q_full={ws['queue_full_drops']} inflight={ws['inflight_fetches']}"
+                f"/{ws['inflight_fetches_max']} | "
+                f"since_notif={ws['seconds_since_last_notification']}s"
             )
 
     def _load_alpha_bots(self) -> None:

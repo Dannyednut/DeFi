@@ -959,9 +959,15 @@ MAX_PENDING_BLOCKS = int(os.getenv("MAX_PENDING_BLOCKS", "20"))
 MAX_RPC_REQUESTS_PER_SECOND = float(os.getenv("MAX_RPC_RPS", "10.0"))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "50"))
 
-# Mempool settings
+# Mempool settings (DSS-WO-MI-106 WS-A: one authoritative configuration path.
+# MempoolPipeline reads THESE values and passes them into MempoolWatcher; the
+# legacy MEMPOOL_FETCHES_PER_SECOND env var is honoured as an explicit
+# operator override only when set, and the effective values are logged at
+# startup. MEMPOOL_MAX_FPS=5 keeps eth_getTransactionByHash (~20 CU) inside
+# the documented ~115 CU/s sustained budget.)
 MEMPOOL_MAX_FETCHES_PER_SECOND = float(os.getenv("MEMPOOL_MAX_FPS", "5.0"))
 MEMPOOL_QUEUE_SIZE = int(os.getenv("MEMPOOL_QUEUE_SIZE", "500"))
+MEMPOOL_MAX_INFLIGHT_FETCHES = int(os.getenv("MEMPOOL_MAX_INFLIGHT_FETCHES", "100"))
 
 # Price oracle settings
 PRICE_CACHE_TTL = float(os.getenv("PRICE_CACHE_TTL", "60.0"))

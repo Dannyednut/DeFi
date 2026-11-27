@@ -59,10 +59,33 @@ class PoolCrawler:
         self._graph_client = GraphClient()
         self._subgraph_providers = get_subgraph_providers(CHAIN_ID)
         self._event_discovery_queue: queue.Queue[dict] = queue.Queue(maxsize=1000)
+        # DSS-WO-MI-106 WS-B: in-flight deduplication state. A key is added
+        # when a hint is QUEUED and released on EVERY terminal outcome
+        # (registered / already registered / no candidate / verification
+        # failure / batch crash / cancellation). It never accumulates the
+        # lifetime history of every address ever observed: a failed discovery
+        # must not poison the set against a later retry.
         self._event_discovery_seen: set[tuple[str, str]] = set()
+        self._event_discovery_enqueued_at: dict[tuple[str, str], float] = {}
+        self._event_discovery_high_water = 0
         self.event_discovery_enqueued = 0
         self.event_discovery_processed = 0
         self.event_discovery_dropped = 0
+        self.event_discovery_invalid = 0
+        self.event_discovery_coalesced = 0
+        self.event_discovery_already_registered = 0
+        self.event_discovery_batches = 0
+        self.event_discovery_batch_hints = 0
+        self.event_discovery_generic_hints = 0
+        self.event_discovery_specialized_hints = 0
+        self.event_discovery_fallback_hints = 0
+        self.event_discovery_registrations = 0
+        self.event_discovery_verification_failures = 0
+        self.event_discovery_released_registered = 0
+        self.event_discovery_released_retry = 0
+        self.event_discovery_batch_errors = 0
+        self.event_discovery_batch_seconds = 0.0
+        self.event_discovery_last_batch = {}
     
     async def start(self) -> list[asyncio.Task]:
         """Launch all crawler workers."""
@@ -146,26 +169,93 @@ class PoolCrawler:
 
         The block processor only records the event; all RPC/API work happens
         on the crawler event loop. Duplicate (protocol, pool) hints are
-        coalesced so a busy pool cannot create a discovery stampede.
-        """
+        coalesced while pending, and already-registered pools are skipped
+        (graph.has_pool is the durable protection). Every disposition is
+        counted: accepted, coalesced, already-registered, invalid, dropped.
+
+        DSS-WO-MI-106 WS-B: the queue stays bounded; the queue-full path
+        remains explicit and measurable."""
         added = 0
         for hint in hints or []:
             address = str(hint.get("pool_address", "")).lower()
             protocol = str(hint.get("protocol", "")).lower()
             if not address.startswith("0x") or not protocol:
+                self.event_discovery_invalid += 1
                 continue
             key = (protocol, address)
-            if key in self._event_discovery_seen or self._graph.has_pool(address):
+            if key in self._event_discovery_seen:
+                # duplicate hint coalesced while the earlier one is still
+                # queued/in-flight — NOT a permanent "seen forever" mark
+                self.event_discovery_coalesced += 1
+                continue
+            if self._graph.has_pool(address):
+                self.event_discovery_already_registered += 1
                 continue
             try:
-                self._event_discovery_queue.put_nowait(dict(hint))
+                hint = dict(hint)
+                hint["_enqueued_at"] = time.time()
+                self._event_discovery_queue.put_nowait(hint)
                 self._event_discovery_seen.add(key)
+                self._event_discovery_enqueued_at[key] = hint["_enqueued_at"]
                 self.event_discovery_enqueued += 1
                 added += 1
+                depth = self._event_discovery_queue.qsize()
+                if depth > self._event_discovery_high_water:
+                    self._event_discovery_high_water = depth
             except queue.Full:
                 self.event_discovery_dropped += 1
-                log.warning("Event discovery queue full; dropping pool=%s protocol=%s", address[:10], protocol)
+                log.warning("Event discovery queue full; dropping pool=%s protocol=%s (dropped=%d)",
+                            address[:10], protocol, self.event_discovery_dropped)
         return added
+
+    @property
+    def event_discovery_oldest_pending_age(self) -> float:
+        """Age (seconds) of the oldest hint currently queued/in-flight."""
+        stamps = self._event_discovery_enqueued_at.values()
+        if not stamps:
+            return 0.0
+        return max(0.0, time.time() - min(stamps))
+
+    def _release_event_key(self, key: tuple[str, str], *, registered: bool) -> None:
+        """Release ONE in-flight dedup key (DSS-WO-MI-106 WS-B).
+
+        `registered=True` — the pool is in the graph; graph.has_pool() is the
+        durable protection against re-registration. `registered=False` — the
+        attempt failed or found nothing; the key is dropped so a LATER event
+        can retry the discovery (no permanent poisoning)."""
+        self._event_discovery_seen.discard(key)
+        self._event_discovery_enqueued_at.pop(key, None)
+        if registered:
+            self.event_discovery_released_registered += 1
+        else:
+            self.event_discovery_released_retry += 1
+
+    def event_discovery_stats(self) -> dict:
+        """Aggregate queue/worker accounting (DSS-WO-MI-106 §3B metrics)."""
+        return {
+            "enqueued": self.event_discovery_enqueued,
+            "processed_registered": self.event_discovery_processed,
+            "dropped_queue_full": self.event_discovery_dropped,
+            "invalid": self.event_discovery_invalid,
+            "coalesced_duplicates": self.event_discovery_coalesced,
+            "already_registered": self.event_discovery_already_registered,
+            "queued_now": self._event_discovery_queue.qsize(),
+            "queue_high_water": self._event_discovery_high_water,
+            "in_flight_keys": len(self._event_discovery_seen),
+            "oldest_pending_age_s": round(self.event_discovery_oldest_pending_age, 2),
+            "batches": self.event_discovery_batches,
+            "batch_hints": self.event_discovery_batch_hints,
+            "generic_hints": self.event_discovery_generic_hints,
+            "specialized_hints": self.event_discovery_specialized_hints,
+            "fallback_hints": self.event_discovery_fallback_hints,
+            "registrations": self.event_discovery_registrations,
+            "verification_failures": self.event_discovery_verification_failures,
+            "released_registered": self.event_discovery_released_registered,
+            "released_for_retry": self.event_discovery_released_retry,
+            "batch_errors": self.event_discovery_batch_errors,
+            "batch_seconds_total": round(self.event_discovery_batch_seconds, 3),
+            "last_batch": dict(self.event_discovery_last_batch),
+        }
 
     async def _event_discovery_worker(self) -> None:
         """Low-priority discovery consumer with batched on-chain verification."""
@@ -189,155 +279,338 @@ class PoolCrawler:
                         await asyncio.sleep(0)
                         break
 
-                generic = [h for h in batch if str(h.get("protocol", "")).lower() in {"uniswap_v2", "uniswap_v3"}]
-                handled = set()
-                if generic:
-                    try:
-                        from utils.multicall3 import multicall3_discover_event_hints
-                        candidates = await asyncio.get_running_loop().run_in_executor(
-                            None, multicall3_discover_event_hints, self._w3, generic
-                        )
-                        for c in candidates:
-                            h = c["hint"]
-                            key = (str(h.get("protocol", "")).lower(), str(h.get("pool_address", "")).lower())
-                            if key in handled or self._graph.has_pool(key[1]):
-                                continue
-                            handled.add(key)
-                            await register_new_pool(
-                                self._w3, self._graph, self._cache, self._graph_client,
-                                c["pool_address"], c["dex"].name, c["dex"].version,
-                                c["fee"] // 100 if c["fee"] is not None and c["dex"].version == 3 else c["dex"].fee_bps,
-                                token0=c["token0"], token1=c["token1"],
-                                protocol=c["dex"].protocol, metadata={"event_discovered": True},
-                                expand_related=False,
-                            )
-                            if self._graph.has_pool(c["pool_address"]):
-                                self.event_discovery_processed += 1
-                    except Exception as exc:
-                        log.debug("Batched generic event discovery failed: %s", exc)
-
-                # Specialized protocols: batch-verify via Multicall3 first
-                # (Curve/Balancer/SyncSwap/Aerodrome), same idea as the
-                # generic v2/v3 path above — previously every hint here went
-                # through discover_from_event() one at a time, each costing
-                # 2-5 sequential RPC round-trips.
-                from protocols import ProtocolRegistry, PoolRef
-                from utils.multicall3 import multicall3_batch_discover_specialized
-                registry = ProtocolRegistry(self._w3)
-                chain = self._chain
-                batchable = []       # (ref, adapter)
-                unbatchable = []     # hints needing the sequential fallback
-                for hint in batch:
-                    protocol = str(hint.get("protocol", "")).lower()
-                    address = str(hint.get("pool_address", "")).lower()
-                    key = (protocol, address)
-                    if key in handled or self._graph.has_pool(address):
-                        continue
-                    dex = next((d for d in chain.dexes if d.enabled and d.protocol == protocol), None)
-                    if dex is None:
-                        unbatchable.append(hint)
-                        continue
-                    adapter = registry.get(dex)
-                    if adapter is None or not adapter.supports_batched_discovery():
-                        unbatchable.append(hint)
-                        continue
-                    metadata = {}
-                    try:
-                        if protocol == "curve":
-                            topics = hint.get("topics") or []
-                            if len(topics) < 4:
-                                unbatchable.append(hint)
-                                continue
-                            metadata = {"i": int(topics[2], 16), "j": int(topics[3], 16)}
-                        elif protocol == "balancer_v2":
-                            topics = hint.get("topics") or []
-                            if len(topics) < 2:
-                                unbatchable.append(hint)
-                                continue
-                            metadata = {"pool_id": topics[1]}
-                    except Exception:
-                        unbatchable.append(hint)
-                        continue
-                    ref = PoolRef(address, protocol, dex.name, None, None, dex.fee_bps, metadata)
-                    batchable.append((ref, adapter, hint, dex))
-
-                if batchable:
-                    try:
-                        pairs = [(ref, adapter) for ref, adapter, _, _ in batchable]
-                        verified = await asyncio.get_running_loop().run_in_executor(
-                            None, multicall3_batch_discover_specialized, self._w3, pairs
-                        )
-                        for ref, adapter, hint, dex in batchable:
-                            state = verified.get(ref.address)
-                            key = (ref.protocol, ref.address)
-                            if key in handled or self._graph.has_pool(ref.address):
-                                continue
-                            if not state:
-                                continue
-                            handled.add(key)
-                            if ref.protocol == "balancer_v2":
-                                # Balancer pools can have >2 tokens — there is
-                                # no single token0/token1, so every direction
-                                # needs its own register_new_pool() call, same
-                                # as discover_from_event()'s non-batched path.
-                                tokens = state.get("tokens") or []
-                                for a in tokens:
-                                    for b in tokens:
-                                        if a == b:
-                                            continue
-                                        await register_new_pool(
-                                            self._w3, self._graph, self._cache, self._graph_client,
-                                            ref.address, dex.name, 2, 0,
-                                            token0=a, token1=b, protocol=ref.protocol,
-                                            metadata=state, expand_related=False,
-                                        )
-                            else:
-                                await register_new_pool(
-                                    self._w3, self._graph, self._cache, self._graph_client,
-                                    ref.address, dex.name, 2,
-                                    dex.fee_bps if ref.protocol != "curve" else 0,
-                                    token0=state.get("token0"), token1=state.get("token1"),
-                                    protocol=ref.protocol, metadata=state, expand_related=False,
-                                )
-                            if self._graph.has_pool(ref.address):
-                                self.event_discovery_processed += 1
-                    except Exception as exc:
-                        log.debug("Batched specialized event discovery failed: %s", exc)
-                        unbatchable.extend(h for _, _, h, _ in batchable)
-
-                # Sequential fallback: anything with no matching dex/adapter,
-                # or that failed batched verification above.
-                from registry import discover_from_event
-                for hint in unbatchable:
-                    protocol = str(hint.get("protocol", "")).lower()
-                    key = (protocol, str(hint.get("pool_address", "")).lower())
-                    try:
-                        if key in handled or self._graph.has_pool(key[1]):
-                            continue
-                        ok = await discover_from_event(
-                            self._w3, self._graph, self._cache, self._graph_client, hint,
-                        )
-                        if ok:
-                            self.event_discovery_processed += 1
-                        elif not self._graph.has_pool(key[1]):
-                            self._event_discovery_seen.discard(key)
-                    except Exception as exc:
-                        self._event_discovery_seen.discard(key)
-                        log.debug("Event discovery failed pool=%s: %s", key[1][:10], exc)
-
-                for _ in batch:
-                    self._event_discovery_queue.task_done()
+                await self._process_event_batch(batch)
             except asyncio.CancelledError:
-                for _ in batch:
-                    try: self._event_discovery_queue.task_done()
-                    except Exception: pass
+                # DSS-WO-MI-106 WS-B: cancellation releases every claimed
+                # in-flight key and completes the queue bookkeeping — a
+                # shutdown must not leave items unaccounted for.
+                self._finish_event_batch(batch, reason="cancelled")
                 return
             except Exception as exc:
-                for _ in batch:
-                    try: self._event_discovery_queue.task_done()
-                    except Exception: pass
-                log.debug("Event discovery worker error: %s", exc)
-                await asyncio.sleep(0.05)
+                log.debug("Event discovery batch crashed: %s", exc)
+                self.event_discovery_batch_errors += 1
+                self._finish_event_batch(batch, reason="crashed")
+
+    async def _process_event_batch(self, batch: list[dict]) -> None:
+        """Verify and register ONE drained batch of hints.
+
+        DSS-WO-MI-106 WS-B: every outcome path releases the claimed in-flight
+        dedup keys and completes task_done() bookkeeping exactly once per
+        item — registration success, already-registered, verification finding
+        nothing, verification failures, per-candidate registration exceptions
+        (isolated so ONE bad pool no longer discards the whole batch), and
+        unexpected crashes. Registrations inside a batch run concurrently
+        (bounded by register_new_pool's existing registration semaphore)."""
+        started = time.monotonic()
+        claimed: list[tuple[str, str]] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for hint in batch:
+            key = (str(hint.get("protocol", "")).lower(), str(hint.get("pool_address", "")).lower())
+            claimed.append(key)
+            seen_keys.add(key)
+        self.event_discovery_batches += 1
+        self.event_discovery_batch_hints += len(batch)
+
+        generic = [h for h in batch if str(h.get("protocol", "")).lower() in {"uniswap_v2", "uniswap_v3"}]
+        self.event_discovery_generic_hints += len(generic)
+        terminal: set[tuple[str, str]] = set()   # keys fully dispositioned
+        registered_keys: set[tuple[str, str]] = set()
+
+        try:
+            # ── Generic V2/V3 hints: batch-verify via Multicall3 ────────────
+            if generic:
+                candidates: list[dict] = []
+                try:
+                    from utils.multicall3 import multicall3_discover_event_hints
+                    candidates = await asyncio.get_running_loop().run_in_executor(
+                        None, multicall3_discover_event_hints, self._w3, generic
+                    ) or []
+                except Exception as exc:
+                    # Batch-level failure: count it and leave the keys claimed
+                    # — the finally-block releases them so a LATER event can
+                    # retry (the old code kept them in the dedup set forever).
+                    self.event_discovery_verification_failures += len(generic)
+                    log.debug("Batched generic event discovery failed: %s", exc)
+
+                async def _register_generic(c: dict) -> tuple[tuple[str, str], bool]:
+                    """Register one verified candidate. Returns (key, ok)."""
+                    h = c["hint"]
+                    key = (str(h.get("protocol", "")).lower(), str(c["pool_address"]).lower())
+                    try:
+                        await register_new_pool(
+                            self._w3, self._graph, self._cache, self._graph_client,
+                            c["pool_address"], c["dex"].name, c["dex"].version,
+                            c["fee"] // 100 if c["fee"] is not None and c["dex"].version == 3 else c["dex"].fee_bps,
+                            token0=c["token0"], token1=c["token1"],
+                            protocol=c["dex"].protocol, metadata={"event_discovered": True},
+                            expand_related=False,
+                        )
+                    except Exception as exc:
+                        # Per-candidate isolation: ONE bad registration no
+                        # longer discards the remaining candidates of the batch.
+                        log.debug("Event-hint registration failed pool=%s: %s", key[1][:10], exc)
+                        return key, False
+                    if self._graph.has_pool(c["pool_address"]):
+                        self.event_discovery_processed += 1
+                        self.event_discovery_registrations += 1
+                        return key, True
+                    return key, False
+
+                # Skip candidates whose pool got registered meanwhile.
+                to_register = [
+                    c for c in candidates
+                    if self._hint_key(c.get("hint")) not in terminal
+                    and not self._graph.has_pool(str(c.get("pool_address", "")).lower())
+                ]
+                for c in candidates:
+                    key = self._hint_key(c.get("hint"))
+                    if self._graph.has_pool(str(c.get("pool_address", "")).lower()):
+                        terminal.add(key)
+                        registered_keys.add(key)
+                if to_register:
+                    results = await asyncio.gather(
+                        *(_register_generic(c) for c in to_register), return_exceptions=True
+                    )
+                    for res in results:
+                        if isinstance(res, BaseException):
+                            # gather-level safety net (should not happen with
+                            # return_exceptions=True + internal isolation)
+                            self.event_discovery_verification_failures += 1
+                            continue
+                        key, ok = res
+                        terminal.add(key)
+                        if ok:
+                            registered_keys.add(key)
+
+                # Hints with NO verified candidate (introspection found
+                # nothing / verification negative): release for a later retry.
+                for h in generic:
+                    key = self._hint_key(h)
+                    if key not in terminal and not self._graph.has_pool(key[1]):
+                        terminal.add(key)
+                        self._release_event_key(key, registered=False)
+
+            # ── Specialized protocols: batch-verify via Multicall3 first ────
+            # (Curve/Balancer/SyncSwap/Aerodrome), same idea as the generic
+            # v2/v3 path above.
+            from protocols import ProtocolRegistry, PoolRef
+            from utils.multicall3 import multicall3_batch_discover_specialized
+            registry = ProtocolRegistry(self._w3)
+            chain = self._chain
+            batchable = []       # (ref, adapter, hint, dex)
+            unbatchable = []     # hints needing the sequential fallback
+            self.event_discovery_specialized_hints += len(batch) - len(generic)
+            for hint in batch:
+                protocol = str(hint.get("protocol", "")).lower()
+                address = str(hint.get("pool_address", "")).lower()
+                key = (protocol, address)
+                if key in terminal or self._graph.has_pool(address):
+                    if self._graph.has_pool(address) and key not in terminal:
+                        terminal.add(key)
+                        registered_keys.add(key)
+                    continue
+                if protocol in {"uniswap_v2", "uniswap_v3"}:
+                    continue  # handled by the generic stage above
+                dex = next((d for d in chain.dexes if d.enabled and d.protocol == protocol), None)
+                if dex is None:
+                    unbatchable.append(hint)
+                    continue
+                adapter = registry.get(dex)
+                if adapter is None or not adapter.supports_batched_discovery():
+                    unbatchable.append(hint)
+                    continue
+                metadata = {}
+                try:
+                    if protocol == "curve":
+                        topics = hint.get("topics") or []
+                        if len(topics) < 4:
+                            unbatchable.append(hint)
+                            continue
+                        metadata = {"i": int(topics[2], 16), "j": int(topics[3], 16)}
+                    elif protocol == "balancer_v2":
+                        topics = hint.get("topics") or []
+                        if len(topics) < 2:
+                            unbatchable.append(hint)
+                            continue
+                        metadata = {"pool_id": topics[1]}
+                except Exception:
+                    unbatchable.append(hint)
+                    continue
+                ref = PoolRef(address, protocol, dex.name, None, None, dex.fee_bps, metadata)
+                batchable.append((ref, adapter, hint, dex))
+
+            if batchable:
+                verified: dict = {}
+                try:
+                    pairs = [(ref, adapter) for ref, adapter, _, _ in batchable]
+                    verified = await asyncio.get_running_loop().run_in_executor(
+                        None, multicall3_batch_discover_specialized, self._w3, pairs
+                    ) or {}
+                except Exception as exc:
+                    log.debug("Batched specialized event discovery failed: %s", exc)
+                    unbatchable.extend(h for _, _, h, _ in batchable)
+
+                async def _register_specialized(ref, dex, state) -> tuple[tuple[str, str], bool]:
+                    key = (ref.protocol, ref.address)
+                    try:
+                        if ref.protocol == "balancer_v2":
+                            # Balancer pools can have >2 tokens — every
+                            # direction needs its own register_new_pool()
+                            # call, same as discover_from_event()'s
+                            # non-batched path.
+                            tokens = state.get("tokens") or []
+                            for a in tokens:
+                                for b in tokens:
+                                    if a == b:
+                                        continue
+                                    await register_new_pool(
+                                        self._w3, self._graph, self._cache, self._graph_client,
+                                        ref.address, dex.name, 2, 0,
+                                        token0=a, token1=b, protocol=ref.protocol,
+                                        metadata=state, expand_related=False,
+                                    )
+                        else:
+                            await register_new_pool(
+                                self._w3, self._graph, self._cache, self._graph_client,
+                                ref.address, dex.name, 2,
+                                dex.fee_bps if ref.protocol != "curve" else 0,
+                                token0=state.get("token0"), token1=state.get("token1"),
+                                protocol=ref.protocol, metadata=state, expand_related=False,
+                            )
+                    except Exception as exc:
+                        log.debug("Specialized registration failed pool=%s: %s", ref.address[:10], exc)
+                        return key, False
+                    if self._graph.has_pool(ref.address):
+                        self.event_discovery_processed += 1
+                        self.event_discovery_registrations += 1
+                        return key, True
+                    return key, False
+
+                reg_jobs = []
+                for ref, adapter, hint, dex in batchable:
+                    key = (ref.protocol, ref.address)
+                    if key in terminal or self._graph.has_pool(ref.address):
+                        if self._graph.has_pool(ref.address) and key not in terminal:
+                            terminal.add(key)
+                            registered_keys.add(key)
+                        continue
+                    state = verified.get(ref.address)
+                    if not state:
+                        # Verification returned no state: release the key so a
+                        # LATER event can retry (was: poisoned forever).
+                        terminal.add(key)
+                        self._release_event_key(key, registered=False)
+                        continue
+                    terminal.add(key)
+                    reg_jobs.append((ref, dex, state))
+                if reg_jobs:
+                    results = await asyncio.gather(
+                        *(_register_specialized(ref, dex, state) for ref, dex, state in reg_jobs),
+                        return_exceptions=True,
+                    )
+                    for res in results:
+                        if isinstance(res, BaseException):
+                            self.event_discovery_verification_failures += 1
+                            continue
+                        key, ok = res
+                        if ok:
+                            registered_keys.add(key)
+
+            # ── Sequential fallback: anything with no matching dex/adapter,
+            # or that failed batched verification above. ────────────────────
+            from registry import discover_from_event
+            for hint in unbatchable:
+                protocol = str(hint.get("protocol", "")).lower()
+                key = (protocol, str(hint.get("pool_address", "")).lower())
+                self.event_discovery_fallback_hints += 1
+                try:
+                    if key in terminal or self._graph.has_pool(key[1]):
+                        if self._graph.has_pool(key[1]) and key not in terminal:
+                            terminal.add(key)
+                            registered_keys.add(key)
+                        continue
+                    terminal.add(key)
+                    ok = await discover_from_event(
+                        self._w3, self._graph, self._cache, self._graph_client, hint,
+                    )
+                    if ok and self._graph.has_pool(key[1]):
+                        self.event_discovery_processed += 1
+                        self.event_discovery_registrations += 1
+                        self._release_event_key(key, registered=True)
+                    else:
+                        # failed, or succeeded without taking effect in the
+                        # graph — either way a later event may retry
+                        self._release_event_key(key, registered=False)
+                except Exception as exc:
+                    log.debug("Event discovery failed pool=%s: %s", key[1][:10], exc)
+                    self.event_discovery_verification_failures += 1
+
+        finally:
+            self._finish_event_batch(
+                batch, terminal=terminal, registered_keys=registered_keys,
+                seen_keys=seen_keys, started=started,
+            )
+
+    @staticmethod
+    def _hint_key(hint: dict | None) -> tuple[str, str]:
+        if not hint:
+            return ("", "")
+        return (str(hint.get("protocol", "")).lower(), str(hint.get("pool_address", "")).lower())
+
+    def _finish_event_batch(
+        self,
+        batch: list[dict],
+        *,
+        terminal=None,
+        registered_keys=None,
+        seen_keys=None,
+        started: float | None = None,
+        reason: str = "normal",
+    ) -> None:
+        """Single accounting path for EVERY batch outcome (normal, crash,
+        cancellation): release any claimed key that did not reach a terminal
+        disposition and call task_done() exactly once per dequeued item."""
+        if terminal is None:
+            terminal = set()
+        if registered_keys is None:
+            registered_keys = set()
+        claimed = seen_keys if seen_keys is not None else {
+            (str(h.get("protocol", "")).lower(), str(h.get("pool_address", "")).lower())
+            for h in batch
+        }
+        for key in claimed:
+            if key in self._event_discovery_seen and key not in registered_keys:
+                # Never reached a terminal disposition (crash/cancel/partial):
+                # release for a later retry instead of poisoning the set.
+                self._release_event_key(key, registered=False)
+        for key in registered_keys:
+            # Registered pools stay out of the in-flight set permanently —
+            # graph.has_pool() is the durable protection; releasing keeps the
+            # set bounded (the old code kept them forever).
+            self._release_event_key(key, registered=True)
+        for _ in batch:
+            try:
+                self._event_discovery_queue.task_done()
+            except ValueError:
+                pass
+        duration = time.monotonic() - started if started is not None else 0.0
+        self.event_discovery_batch_seconds += duration
+        self.event_discovery_last_batch = {
+            "size": len(batch),
+            "seconds": round(duration, 3),
+            "registered": len(registered_keys),
+            "reason": reason,
+            "queue_depth": self._event_discovery_queue.qsize(),
+        }
+        if batch:
+            log.debug(
+                "Event discovery batch: size=%d registered=%d released_retry=%d "
+                "in_flight=%d depth=%d oldest=%.1fs took=%.3fs",
+                len(batch), self.event_discovery_registrations,
+                self.event_discovery_released_retry, len(self._event_discovery_seen),
+                self._event_discovery_queue.qsize(), self.event_discovery_oldest_pending_age,
+                duration,
+            )
 
     async def _bootstrap_from_subgraph(self, dex) -> None:
         """
